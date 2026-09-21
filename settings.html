@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentTrade — Settings</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap');
+:root {
+  --bg:#080c10; --surface:#0d1419; --surface2:#121b22; --border:#1e2d3a;
+  --accent:#00e5ff; --green:#00ff88; --red:#ff4060; --yellow:#ffb800;
+  --purple:#b06aff; --orange:#ff8c42; --text:#c8d8e8; --muted:#4a6070;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:'Space Mono',monospace;font-size:13px;min-height:100vh}
+body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.04) 2px,rgba(0,0,0,.04) 4px);pointer-events:none;z-index:9999}
+
+header{display:flex;align-items:center;justify-content:space-between;padding:16px 28px;border-bottom:1px solid var(--border);background:var(--surface)}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-hex{width:32px;height:32px;background:var(--accent);clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%)}
+.logo h1{font-family:'Syne',sans-serif;font-size:17px;font-weight:800;letter-spacing:.08em;color:#fff}
+.logo h1 span{color:var(--accent)}
+.nav-links{display:flex;gap:8px}
+.nav-btn{padding:6px 14px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:3px;cursor:pointer;font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;transition:all .2s;text-decoration:none;display:inline-flex;align-items:center;gap:5px}
+.nav-btn:hover{border-color:var(--accent);color:var(--accent)}
+.nav-btn.active{border-color:var(--accent);color:var(--accent);background:rgba(0,229,255,.08)}
+
+/* Server status banner */
+.server-banner{padding:10px 28px;font-size:11px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)}
+.server-banner.connected{background:rgba(0,255,136,.05);color:var(--green)}
+.server-banner.disconnected{background:rgba(255,64,96,.05);color:var(--red)}
+.server-banner.checking{background:rgba(255,184,0,.05);color:var(--yellow)}
+.sdot{width:7px;height:7px;border-radius:50%;background:currentColor;flex-shrink:0}
+
+.page{max-width:860px;margin:0 auto;padding:32px 24px}
+
+/* Section cards */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-bottom:20px;overflow:hidden}
+.card-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
+.card-title{display:flex;align-items:center;gap:10px}
+.card-icon{font-size:18px}
+.card-name{font-family:'Syne',sans-serif;font-weight:800;font-size:14px;color:#fff}
+.card-desc{font-size:11px;color:var(--muted);margin-top:2px}
+.card-status{display:flex;align-items:center;gap:6px;font-size:11px;padding:4px 10px;border-radius:10px;white-space:nowrap}
+.card-status.ok{background:rgba(0,255,136,.12);color:var(--green);border:1px solid rgba(0,255,136,.2)}
+.card-status.err{background:rgba(255,64,96,.12);color:var(--red);border:1px solid rgba(255,64,96,.2)}
+.card-status.untested{background:rgba(74,96,112,.12);color:var(--muted);border:1px solid var(--border)}
+.card-status.testing{background:rgba(255,184,0,.08);color:var(--yellow);border:1px solid rgba(255,184,0,.2)}
+.status-dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
+
+.card-body{padding:18px 20px}
+
+/* Field groups */
+.field-group{margin-bottom:16px}
+.field-label{font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);margin-bottom:6px;display:flex;align-items:center;justify-content:space-between}
+.field-label a{color:var(--accent);text-decoration:none;font-size:10px}
+.field-label a:hover{text-decoration:underline}
+.field-row{display:flex;gap:8px;align-items:stretch}
+.field-input{flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:9px 12px;color:var(--text);font-family:'Space Mono',monospace;font-size:12px;outline:none;transition:border-color .2s}
+.field-input:focus{border-color:var(--accent)}
+.field-input::placeholder{color:var(--muted)}
+.field-input.has-value{border-color:rgba(0,229,255,.3)}
+
+.toggle-vis{padding:8px 12px;background:transparent;border:1px solid var(--border);border-radius:4px;color:var(--muted);cursor:pointer;font-size:13px;transition:all .2s;flex-shrink:0}
+.toggle-vis:hover{border-color:var(--accent);color:var(--accent)}
+
+.save-key-btn{padding:9px 16px;background:transparent;border:1px solid var(--accent);color:var(--accent);border-radius:4px;cursor:pointer;font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;transition:all .2s;white-space:nowrap}
+.save-key-btn:hover{background:rgba(0,229,255,.1)}
+.save-key-btn:disabled{opacity:.4;cursor:not-allowed}
+
+.test-btn{padding:9px 14px;background:transparent;border:1px solid var(--border);color:var(--muted);border-radius:4px;cursor:pointer;font-family:'Space Mono',monospace;font-size:11px;letter-spacing:.08em;text-transform:uppercase;transition:all .2s;white-space:nowrap}
+.test-btn:hover{border-color:var(--green);color:var(--green)}
+.test-btn:disabled{opacity:.4;cursor:not-allowed}
+
+.test-result{margin-top:8px;padding:8px 12px;border-radius:4px;font-size:11px;line-height:1.6;display:none}
+.test-result.ok{background:rgba(0,255,136,.08);border:1px solid rgba(0,255,136,.2);color:var(--green)}
+.test-result.err{background:rgba(255,64,96,.08);border:1px solid rgba(255,64,96,.2);color:var(--red)}
+
+/* Select */
+.field-select{flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:9px 12px;color:var(--text);font-family:'Space Mono',monospace;font-size:12px;outline:none;cursor:pointer;appearance:none;-webkit-appearance:none}
+.field-select:focus{border-color:var(--accent)}
+.field-select option{background:var(--surface2)}
+
+/* Inline hint */
+.hint{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.6}
+.hint a{color:var(--accent)}
+
+/* Save all button */
+.save-all-wrap{display:flex;align-items:center;gap:12px;margin-bottom:32px}
+.save-all-btn{padding:10px 24px;background:var(--accent);border:none;color:#000;border-radius:4px;cursor:pointer;font-family:'Syne',sans-serif;font-weight:700;font-size:13px;letter-spacing:.08em;text-transform:uppercase;transition:all .2s}
+.save-all-btn:hover{background:#33ecff}
+.save-all-btn:disabled{opacity:.5;cursor:not-allowed}
+.save-msg{font-size:12px;color:var(--green);display:none}
+.save-msg.err{color:var(--red)}
+
+/* Server offline notice */
+.offline-notice{background:rgba(255,184,0,.06);border:1px solid rgba(255,184,0,.25);border-radius:6px;padding:16px 20px;margin-bottom:24px;font-size:12px;line-height:1.8;color:var(--yellow);display:none}
+.offline-notice code{color:var(--accent);font-family:'Space Mono',monospace}
+
+/* LLM mode grid */
+.mode-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:16px}
+.mode-opt{padding:12px 14px;background:var(--surface2);border:1px solid var(--border);border-radius:4px;cursor:pointer;transition:all .2s}
+.mode-opt:hover{border-color:rgba(0,229,255,.3)}
+.mode-opt.selected{border-color:var(--accent);background:rgba(0,229,255,.06)}
+.mode-opt.selected.gpt{border-color:var(--green);background:rgba(0,255,136,.06)}
+.mode-opt.selected.dual{border-color:var(--purple);background:rgba(176,106,255,.06)}
+.mode-opt-name{font-weight:700;font-size:12px;margin-bottom:3px}
+.mode-opt-name.gpt{color:var(--green)}.mode-opt-name.dual{color:var(--purple)}.mode-opt-name.yellow{color:var(--yellow)}
+.mode-opt-desc{font-size:10px;color:var(--muted);line-height:1.5}
+
+/* Budget slider */
+.slider-wrap{display:flex;align-items:center;gap:14px}
+input[type=range]{flex:1;accent-color:var(--accent)}
+.slider-val{font-family:'Syne',sans-serif;font-weight:700;color:var(--accent);min-width:80px;text-align:right}
+
+/* Gitignore note */
+.security-note{background:rgba(176,106,255,.06);border-left:3px solid var(--purple);padding:12px 16px;border-radius:0 4px 4px 0;font-size:11px;color:var(--muted);line-height:1.7;margin-bottom:24px}
+.security-note b{color:var(--text)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-hex"></div>
+    <h1>AGENT<span>TRADE</span> <span style="font-size:12px;font-weight:400;color:var(--muted);margin-left:4px">Settings</span></h1>
+  </div>
+  <div class="nav-links">
+    <a href="./" class="nav-btn">← Dashboard</a>
+    <button class="nav-btn active">⚙ Settings</button>
+  </div>
+</header>
+
+<!-- Server connection banner -->
+<div id="server-banner" class="server-banner checking">
+  <span class="sdot"></span>
+  <span id="server-msg">Connecting to local config server at http://127.0.0.1:5111 …</span>
+</div>
+
+<div class="page">
+
+  <!-- Offline notice -->
+  <div class="offline-notice" id="offline-notice">
+    ⚠️ <b>Config server is not running.</b> Key saving and testing require it.<br>
+    Start it by running: <code>python config_server.py</code> in your project folder,
+    then refresh this page. You can still edit keys and use
+    <b>Export .env</b> to save them manually.
+  </div>
+
+  <div class="security-note">
+    🔒 <b>Keys are stored locally</b> in <code style="color:var(--accent)">config.json</code>
+    in your project folder and synced to <code style="color:var(--accent)">.env</code>.
+    They never leave your machine. Add both files to <code style="color:var(--accent)">.gitignore</code>
+    before committing to any repository.
+  </div>
+
+  <!-- ── Alpaca ── -->
+  <div class="card" id="card-alpaca">
+    <div class="card-header">
+      <div class="card-title">
+        <span class="card-icon">📈</span>
+        <div>
+          <div class="card-name">Alpaca Markets</div>
+          <div class="card-desc">Brokerage API — executes all trades · FREE paper trading account</div>
+        </div>
+      </div>
+      <div class="card-status untested" id="status-alpaca"><span class="status-dot"></span>Not tested</div>
+    </div>
+    <div class="card-body">
+      <div class="field-group">
+        <div class="field-label">
+          API Key ID
+          <a href="https://app.alpaca.markets/paper/dashboard/overview" target="_blank">Get keys ↗</a>
+        </div>
+        <div class="field-row">
+          <input class="field-input" type="password" id="ALPACA_API_KEY" placeholder="PKXXXXXXXXXXXXXXXX" oninput="markDirty('alpaca')">
+          <button class="toggle-vis" onclick="toggleVis('ALPACA_API_KEY')">👁</button>
+          <button class="save-key-btn" onclick="saveKey('ALPACA_API_KEY')">Save</button>
+        </div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Secret Key</div>
+        <div class="field-row">
+          <input class="field-input" type="password" id="ALPACA_SECRET_KEY" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" oninput="markDirty('alpaca')">
+          <button class="toggle-vis" onclick="toggleVis('ALPACA_SECRET_KEY')">👁</button>
+          <button class="save-key-btn" onclick="saveKey('ALPACA_SECRET_KEY')">Save</button>
+        </div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Mode</div>
+        <div class="field-row">
+          <select class="field-select" id="ALPACA_PAPER" onchange="saveKey('ALPACA_PAPER')">
+            <option value="true">Paper Trading (virtual money — recommended to start)</option>
+            <option value="false">⚠️  Live Trading (real money)</option>
+          </select>
+        </div>
+        <div class="hint">Always start with Paper Trading until you trust the agent completely.</div>
+      </div>
+      <div class="field-row" style="gap:8px;margin-top:4px">
+        <button class="test-btn" id="test-alpaca" onclick="testAlpaca()">🔌 Test Connection</button>
+      </div>
+      <div class="test-result" id="tr-alpaca"></div>
+    </div>
+  </div>
+
+  <!-- ── Anthropic ── -->
+  <div class="card" id="card-anthropic">
+    <div class="card-header">
+      <div class="card-title">
+        <span class="card-icon">🤖</span>
+        <div>
+          <div class="card-name">Anthropic (Claude)</div>
+          <div class="card-desc">Powers Claude Haiku + Sonnet + Opus · Used for research &amp; analysis agents</div>
+        </div>
+      </div>
+      <div class="card-status untested" id="status-anthropic"><span class="status-dot"></span>Not tested</div>
+    </div>
+    <div class="card-body">
+      <div class="field-group">
+        <div class="field-label">
+          API Key
+          <a href="https://console.anthropic.com/settings/keys" target="_blank">Get key ↗</a>
+        </div>
+        <div class="field-row">
+          <input class="field-input" type="password" id="ANTHROPIC_API_KEY" placeholder="sk-ant-api03-…">
+          <button class="toggle-vis" onclick="toggleVis('ANTHROPIC_API_KEY')">👁</button>
+          <button class="save-key-btn" onclick="saveKey('ANTHROPIC_API_KEY')">Save</button>
+        </div>
+        <div class="hint">Required for Claude modes (tiered, claude_haiku, claude_sonnet, claude_opus, dual).</div>
+      </div>
+      <button class="test-btn" onclick="testAnthropic()">🔌 Test Connection</button>
+      <div class="test-result" id="tr-anthropic"></div>
+    </div>
+  </div>
+
+  <!-- ── OpenAI ── -->
+  <div class="card" id="card-openai">
+    <div class="card-header">
+      <div class="card-title">
+        <span class="card-icon">💬</span>
+        <div>
+          <div class="card-name">OpenAI (ChatGPT)</div>
+          <div class="card-desc">Powers GPT-4o-mini + GPT-4o · Used in gpt4o, tiered, and dual modes</div>
+        </div>
+      </div>
+      <div class="card-status untested" id="status-openai"><span class="status-dot"></span>Not tested</div>
+    </div>
+    <div class="card-body">
+      <div class="field-group">
+        <div class="field-label">
+          API Key
+          <a href="https://platform.openai.com/api-keys" target="_blank">Get key ↗</a>
+        </div>
+        <div class="field-row">
+          <input class="field-input" type="password" id="OPENAI_API_KEY" placeholder="sk-…">
+          <button class="toggle-vis" onclick="toggleVis('OPENAI_API_KEY')">👁</button>
+          <button class="save-key-btn" onclick="saveKey('OPENAI_API_KEY')">Save</button>
+        </div>
+        <div class="hint">Only required for gpt4o_mini, gpt4o, dual, and tiered modes.</div>
+      </div>
+      <button class="test-btn" onclick="testOpenAI()">🔌 Test Connection</button>
+      <div class="test-result" id="tr-openai"></div>
+    </div>
+  </div>
+
+
+
+  <!-- ── Google Gemini ── -->
+  <div class="card" id="card-gemini">
+    <div class="card-header"><div class="card-title"><span class="card-icon">🔷</span><div><div class="card-name">Google Gemini</div><div class="card-desc">Powers Gemini Flash + Pro modes</div></div></div><div class="card-status untested" id="status-gemini"><span class="status-dot"></span>Not tested</div></div>
+    <div class="card-body"><div class="field-group"><div class="field-label">API Key <a href="https://aistudio.google.com/app/apikey" target="_blank">Get key ↗</a></div><div class="field-row"><input class="field-input" type="password" id="GEMINI_API_KEY" placeholder="AIza…"><button class="toggle-vis" onclick="toggleVis('GEMINI_API_KEY')">👁</button><button class="save-key-btn" onclick="saveKey('GEMINI_API_KEY')">Save</button></div><div class="hint">Required for gemini_flash and gemini_pro modes.</div></div><button class="test-btn" onclick="testGemini()">🔌 Test Connection</button><div class="test-result" id="tr-gemini"></div></div>
+  </div>
+
+  <!-- ── Mistral AI ── -->
+  <div class="card" id="card-mistral">
+    <div class="card-header"><div class="card-title"><span class="card-icon">🌬️</span><div><div class="card-name">Mistral AI</div><div class="card-desc">Powers Mistral Small + Large modes</div></div></div><div class="card-status untested" id="status-mistral"><span class="status-dot"></span>Not tested</div></div>
+    <div class="card-body"><div class="field-group"><div class="field-label">API Key <a href="https://console.mistral.ai/api-keys" target="_blank">Get key ↗</a></div><div class="field-row"><input class="field-input" type="password" id="MISTRAL_API_KEY" placeholder="…"><button class="toggle-vis" onclick="toggleVis('MISTRAL_API_KEY')">👁</button><button class="save-key-btn" onclick="saveKey('MISTRAL_API_KEY')">Save</button></div><div class="hint">Required for mistral_small and mistral_large modes.</div></div><button class="test-btn" onclick="testMistral()">🔌 Test Connection</button><div class="test-result" id="tr-mistral"></div></div>
+  </div>
+
+  <!-- ── DeepSeek / Deepspeak ── -->
+  <div class="card" id="card-deepseek">
+    <div class="card-header"><div class="card-title"><span class="card-icon">🧠</span><div><div class="card-name">DeepSeek</div><div class="card-desc">Powers DeepSeek Chat + Reasoner modes</div></div></div><div class="card-status untested" id="status-deepseek"><span class="status-dot"></span>Not tested</div></div>
+    <div class="card-body"><div class="field-group"><div class="field-label">API Key <a href="https://platform.deepseek.com/api_keys" target="_blank">Get key ↗</a></div><div class="field-row"><input class="field-input" type="password" id="DEEPSEEK_API_KEY" placeholder="sk-…"><button class="toggle-vis" onclick="toggleVis('DEEPSEEK_API_KEY')">👁</button><button class="save-key-btn" onclick="saveKey('DEEPSEEK_API_KEY')">Save</button></div><div class="hint">Required for deepseek_chat and deepseek_reasoner. If you meant “Deepspeak,” this is the likely provider.</div></div><button class="test-btn" onclick="testDeepSeek()">🔌 Test Connection</button><div class="test-result" id="tr-deepseek"></div></div>
+  </div>
+
+  <!-- ── Groq ── -->
+  <div class="card" id="card-groq">
+    <div class="card-header"><div class="card-title"><span class="card-icon">⚡</span><div><div class="card-name">Groq</div><div class="card-desc">Fast hosted inference for Llama/Qwen modes</div></div></div><div class="card-status untested" id="status-groq"><span class="status-dot"></span>Not tested</div></div>
+    <div class="card-body"><div class="field-group"><div class="field-label">API Key <a href="https://console.groq.com/keys" target="_blank">Get key ↗</a></div><div class="field-row"><input class="field-input" type="password" id="GROQ_API_KEY" placeholder="gsk_…"><button class="toggle-vis" onclick="toggleVis('GROQ_API_KEY')">👁</button><button class="save-key-btn" onclick="saveKey('GROQ_API_KEY')">Save</button></div><div class="hint">Required for groq_llama and groq_qwen modes.</div></div><button class="test-btn" onclick="testGroq()">🔌 Test Connection</button><div class="test-result" id="tr-groq"></div></div>
+  </div>
+
+
+
+  <!-- ── NVIDIA NIM ── -->
+  <div class="card" id="card-nvidia">
+    <div class="card-header"><div class="card-title"><span class="card-icon">🟩</span><div><div class="card-name">NVIDIA NIM</div><div class="card-desc">OpenAI-compatible NVIDIA-hosted inference for Llama/Qwen/DeepSeek models</div></div></div><div class="card-status untested" id="status-nvidia"><span class="status-dot"></span>Not tested</div></div>
+    <div class="card-body">
+      <div class="field-group"><div class="field-label">API Key <a href="https://build.nvidia.com/" target="_blank">Get key ↗</a></div><div class="field-row"><input class="field-input" type="password" id="NVIDIA_API_KEY" placeholder="nvapi-…"><button class="toggle-vis" onclick="toggleVis('NVIDIA_API_KEY')">👁</button><button class="save-key-btn" onclick="saveKey('NVIDIA_API_KEY')">Save</button></div><div class="hint">NVIDIA NIM uses an OpenAI-compatible endpoint. Default base URL: https://integrate.api.nvidia.com/v1</div></div>
+      <div class="field-group"><div class="field-label">Base URL</div><div class="field-row"><input class="field-input" id="NVIDIA_BASE_URL" placeholder="https://integrate.api.nvidia.com/v1"><button class="save-key-btn" onclick="saveKey('NVIDIA_BASE_URL')">Save</button></div></div>
+      <button class="test-btn" onclick="testNvidia()">🔌 Test Connection</button><div class="test-result" id="tr-nvidia"></div>
+    </div>
+  </div>
+
+  <!-- ── LLM Mode & Budget ── -->
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">
+        <span class="card-icon">⚡</span>
+        <div>
+          <div class="card-name">LLM Mode &amp; Token Budget</div>
+          <div class="card-desc">Controls which AI model(s) the agent uses and how much it can spend per day</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="field-group">
+        <div class="field-label">Active Mode</div>
+        <div class="mode-grid">
+          <div class="mode-opt yellow" id="mode-tiered" onclick="selectMode('tiered')">
+            <div class="mode-opt-name yellow">Tiered</div>
+            <div class="mode-opt-desc">Cheap models for screening, smart for decisions. ~70% cheaper.</div>
+          </div>
+          <div class="mode-opt" id="mode-claude_sonnet" onclick="selectMode('claude_sonnet')">
+            <div class="mode-opt-name" style="color:var(--accent)">Claude Sonnet</div>
+            <div class="mode-opt-desc">Balanced Claude for all calls. Good default.</div>
+          </div>
+          <div class="mode-opt" id="mode-claude_haiku" onclick="selectMode('claude_haiku')">
+            <div class="mode-opt-name" style="color:var(--accent)">Claude Haiku</div>
+            <div class="mode-opt-desc">Cheapest Claude. Fast. High-frequency use.</div>
+          </div>
+          <div class="mode-opt" id="mode-gpt4o_mini" onclick="selectMode('gpt4o_mini')">
+            <div class="mode-opt-name gpt">GPT-4o Mini</div>
+            <div class="mode-opt-desc">Cheapest overall (~$0.15/M). OpenAI only.</div>
+          </div>
+          <div class="mode-opt" id="mode-gpt4o" onclick="selectMode('gpt4o')">
+            <div class="mode-opt-name gpt">GPT-4o</div>
+            <div class="mode-opt-desc">Full GPT-4o. Strong reasoning. OpenAI only.</div>
+          </div>
+          <div class="mode-opt" id="mode-dual" onclick="selectMode('dual')">
+            <div class="mode-opt-name dual">Dual ✓✓</div>
+            <div class="mode-opt-desc">Both must agree to trade. Most conservative.</div>
+          </div>
+
+          <div class="mode-opt" id="mode-gemini_flash" onclick="selectMode('gemini_flash')"><div class="mode-opt-name gpt">Gemini Flash</div><div class="mode-opt-desc">Fast/cheap Gemini for all calls.</div></div>
+          <div class="mode-opt" id="mode-gemini_pro" onclick="selectMode('gemini_pro')"><div class="mode-opt-name gpt">Gemini Pro</div><div class="mode-opt-desc">Stronger Gemini reasoning.</div></div>
+          <div class="mode-opt" id="mode-mistral_small" onclick="selectMode('mistral_small')"><div class="mode-opt-name yellow">Mistral Small</div><div class="mode-opt-desc">Low-cost Mistral mode.</div></div>
+          <div class="mode-opt" id="mode-mistral_large" onclick="selectMode('mistral_large')"><div class="mode-opt-name yellow">Mistral Large</div><div class="mode-opt-desc">Higher-capability Mistral.</div></div>
+          <div class="mode-opt" id="mode-deepseek_chat" onclick="selectMode('deepseek_chat')"><div class="mode-opt-name dual">DeepSeek Chat</div><div class="mode-opt-desc">General DeepSeek chat model.</div></div>
+          <div class="mode-opt" id="mode-deepseek_reasoner" onclick="selectMode('deepseek_reasoner')"><div class="mode-opt-name dual">DeepSeek Reasoner</div><div class="mode-opt-desc">Reasoning-focused DeepSeek.</div></div>
+          <div class="mode-opt" id="mode-groq_llama" onclick="selectMode('groq_llama')"><div class="mode-opt-name gpt">Groq Llama</div><div class="mode-opt-desc">Fast Groq-hosted Llama.</div></div>
+          <div class="mode-opt" id="mode-groq_qwen" onclick="selectMode('groq_qwen')"><div class="mode-opt-name gpt">Groq Qwen</div><div class="mode-opt-desc">Fast/cheap Groq Qwen.</div></div>
+          <div class="mode-opt" id="mode-nvidia_llama" onclick="selectMode('nvidia_llama')"><div class="mode-opt-name gpt">NVIDIA Llama</div><div class="mode-opt-desc">NVIDIA NIM hosted Llama.</div></div>
+          <div class="mode-opt" id="mode-nvidia_qwen" onclick="selectMode('nvidia_qwen')"><div class="mode-opt-name gpt">NVIDIA Qwen</div><div class="mode-opt-desc">NVIDIA NIM hosted Qwen.</div></div>
+          <div class="mode-opt" id="mode-nvidia_deepseek" onclick="selectMode('nvidia_deepseek')"><div class="mode-opt-name dual">NVIDIA DeepSeek</div><div class="mode-opt-desc">NVIDIA NIM hosted DeepSeek.</div></div>
+        </div>
+        <input type="hidden" id="LLM_MODE" value="tiered">
+      </div>
+      <div class="field-group">
+        <div class="field-label">Daily Token Budget <span id="budget-display" style="color:var(--accent)">200,000</span></div>
+        <div class="slider-wrap">
+          <input type="range" id="budget-slider" min="50000" max="1000000" step="25000" value="200000"
+            oninput="updateBudget(this.value)" onchange="saveKey('DAILY_TOKEN_BUDGET')">
+          <span class="slider-val" id="budget-cost">~$0.18/day</span>
+        </div>
+        <input type="hidden" id="DAILY_TOKEN_BUDGET" value="200000">
+        <div class="hint">
+          Agent auto-downgrades to cheapest models at 80% and stops AI calls at 100%.
+          Resets at midnight. 200k tokens ≈ $0.02–$0.18/day depending on mode.
+        </div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Max Trades Per Day</div>
+        <div class="field-row">
+          <select class="field-select" id="MAX_DAILY_TRADES" onchange="saveKey('MAX_DAILY_TRADES')">
+            <option value="1">1 trade / day</option>
+            <option value="2">2 trades / day</option>
+            <option value="3">3 trades / day</option>
+            <option value="5" selected>5 trades / day (default)</option>
+            <option value="10">10 trades / day</option>
+          </select>
+        </div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Hard Rebalance</div>
+        <div class="field-row">
+          <select class="field-select" id="HARD_REBALANCE" onchange="saveKey('HARD_REBALANCE')">
+            <option value="false">Off — soft rebalance only (default)</option>
+            <option value="true">On — sell overweight buckets</option>
+          </select>
+        </div>
+        <div class="hint">When a bucket exceeds target by ≥ drift threshold, sells smallest position(s) to trim ~50% of excess. Counts toward daily trade limit.</div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Hard Rebalance Drift Threshold</div>
+        <div class="field-row">
+          <select class="field-select" id="HARD_REBALANCE_DRIFT_PCT" onchange="saveKey('HARD_REBALANCE_DRIFT_PCT')">
+            <option value="0.05">5% of portfolio</option>
+            <option value="0.10" selected>10% of portfolio (default)</option>
+            <option value="0.15">15% of portfolio</option>
+            <option value="0.20">20% of portfolio</option>
+          </select>
+        </div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Screener Cache</div>
+        <div class="field-row">
+          <select class="field-select" id="SCREENER_CACHE" onchange="saveKey('SCREENER_CACHE')">
+            <option value="true" selected>On — reuse screener results (default)</option>
+            <option value="false">Off — full screener every cycle</option>
+          </select>
+        </div>
+        <div class="hint">Skips yFinance, Reddit, NewsAPI, TradingView, and Alpaca screener calls when a fresh cached universe exists for each bucket.</div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Screener Cache TTL</div>
+        <div class="field-row">
+          <select class="field-select" id="SCREENER_CACHE_TTL_MINUTES" onchange="saveKey('SCREENER_CACHE_TTL_MINUTES')">
+            <option value="30">30 minutes</option>
+            <option value="60">1 hour</option>
+            <option value="240" selected>4 hours (default)</option>
+            <option value="480">8 hours</option>
+            <option value="1440">24 hours</option>
+          </select>
+        </div>
+        <button type="button" class="save-key-btn" style="margin-top:8px" onclick="clearScreenerCache()">Clear Screener Cache</button>
+      </div>
+      <button class="save-key-btn" style="margin-top:4px" onclick="saveLLMConfig()">💾 Save LLM Config</button>
+    </div>
+  </div>
+
+  <!-- ── Optional: Reddit ── -->
+  <div class="card" id="card-reddit">
+    <div class="card-header">
+      <div class="card-title">
+        <span class="card-icon">🟠</span>
+        <div>
+          <div class="card-name">Reddit API <span style="font-size:11px;color:var(--muted);font-weight:400">(optional)</span></div>
+          <div class="card-desc">VADER sentiment screener · r/stocks · r/wallstreetbets · r/dividends</div>
+        </div>
+      </div>
+      <div class="card-status untested" id="status-reddit"><span class="status-dot"></span>Not tested</div>
+    </div>
+    <div class="card-body">
+      <div class="field-group">
+        <div class="field-label">
+          Client ID
+          <a href="https://www.reddit.com/prefs/apps" target="_blank">Create app ↗</a>
+        </div>
+        <div class="field-row">
+          <input class="field-input" type="password" id="REDDIT_CLIENT_ID" placeholder="aFMsYONVi3Ky9mi…">
+          <button class="toggle-vis" onclick="toggleVis('REDDIT_CLIENT_ID')">👁</button>
+          <button class="save-key-btn" onclick="saveKey('REDDIT_CLIENT_ID')">Save</button>
+        </div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Client Secret</div>
+        <div class="field-row">
+          <input class="field-input" type="password" id="REDDIT_CLIENT_SECRET" placeholder="ynEhqZsHBfshy7c_5gAo_DrU…">
+          <button class="toggle-vis" onclick="toggleVis('REDDIT_CLIENT_SECRET')">👁</button>
+          <button class="save-key-btn" onclick="saveKey('REDDIT_CLIENT_SECRET')">Save</button>
+        </div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">User Agent</div>
+        <div class="field-row">
+          <input class="field-input" type="text" id="REDDIT_USER_AGENT" placeholder="trading_agent_bot/1.0">
+          <button class="save-key-btn" onclick="saveKey('REDDIT_USER_AGENT')">Save</button>
+        </div>
+        <div class="hint">At reddit.com/prefs/apps → Create App → choose "script" type → copy the ID under the app name and the secret below it.</div>
+      </div>
+      <button class="test-btn" onclick="testReddit()">🔌 Test Connection</button>
+      <div class="test-result" id="tr-reddit"></div>
+    </div>
+  </div>
+
+  <!-- ── Optional: NewsAPI ── -->
+  <div class="card" id="card-newsapi">
+    <div class="card-header">
+      <div class="card-title">
+        <span class="card-icon">📰</span>
+        <div>
+          <div class="card-name">NewsAPI <span style="font-size:11px;color:var(--muted);font-weight:400">(optional · 100 req/day free)</span></div>
+          <div class="card-desc">News sentiment screener — financial headlines pipeline</div>
+        </div>
+      </div>
+      <div class="card-status untested" id="status-newsapi"><span class="status-dot"></span>Not tested</div>
+    </div>
+    <div class="card-body">
+      <div class="field-group">
+        <div class="field-label">
+          API Key
+          <a href="https://newsapi.org/register" target="_blank">Get free key ↗</a>
+        </div>
+        <div class="field-row">
+          <input class="field-input" type="password" id="NEWS_API_KEY" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+          <button class="toggle-vis" onclick="toggleVis('NEWS_API_KEY')">👁</button>
+          <button class="save-key-btn" onclick="saveKey('NEWS_API_KEY')">Save</button>
+        </div>
+      </div>
+      <button class="test-btn" onclick="testNewsAPI()">🔌 Test Connection</button>
+      <div class="test-result" id="tr-newsapi"></div>
+    </div>
+  </div>
+
+  <!-- ── Optional: Quiver Quant ── -->
+  <div class="card" id="card-quiver">
+    <div class="card-header">
+      <div class="card-title">
+        <span class="card-icon">🏛️</span>
+        <div>
+          <div class="card-name">Quiver Quantitative <span style="font-size:11px;color:var(--muted);font-weight:400">(optional · 500 req/day free)</span></div>
+          <div class="card-desc">Congressional trades screener — follow lawmakers' disclosed stock purchases</div>
+        </div>
+      </div>
+      <div class="card-status untested" id="status-quiver"><span class="status-dot"></span>Not tested</div>
+    </div>
+    <div class="card-body">
+      <div class="field-group">
+        <div class="field-label">
+          API Token
+          <a href="https://api.quiverquant.com" target="_blank">Get free token ↗</a>
+        </div>
+        <div class="field-row">
+          <input class="field-input" type="password" id="QUIVER_API_KEY" placeholder="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx">
+          <button class="toggle-vis" onclick="toggleVis('QUIVER_API_KEY')">👁</button>
+          <button class="save-key-btn" onclick="saveKey('QUIVER_API_KEY')">Save</button>
+        </div>
+      </div>
+      <button class="test-btn" onclick="testQuiver()">🔌 Test Connection</button>
+      <div class="test-result" id="tr-quiver"></div>
+    </div>
+  </div>
+
+  <!-- Save all + export -->
+  <div class="save-all-wrap">
+    <button class="save-all-btn" id="save-all-btn" onclick="saveAll()">💾 Save All Settings</button>
+    <button class="nav-btn" onclick="exportEnv()" title="Download a .env file you can drop into your project folder">⬇ Export .env</button>
+    <span class="save-msg" id="save-msg"></span>
+  </div>
+
+</div><!-- /page -->
+
+<script>
+function apiUrl(path) {
+  path = (path || '').replace(/^\//, '');
+  if (window.location.protocol === 'file:') {
+    return 'http://127.0.0.1:5111/' + path;
+  }
+  const pagePath = window.location.pathname || '';
+  const dir = pagePath.includes('/') ? pagePath.replace(/\/[^/]*$/, '') : '';
+  return `${dir}/api.php?_path=${encodeURIComponent(path)}`;
+}
+
+let serverOnline = false;
+let config = {};
+let dirty   = {};
+
+// ── Server check ──────────────────────────────────────────────────────────────
+async function checkServer() {
+  try {
+    const r = await fetch(apiUrl('config'), { signal: AbortSignal.timeout(2500) });
+    if (r.ok) {
+      const d = await r.json();
+      serverOnline = true;
+      config = d.config || {};
+      setBanner(true);
+      populateFields();
+      return;
+    }
+  } catch(e) {}
+  serverOnline = false;
+  setBanner(false);
+  document.getElementById('offline-notice').style.display = 'block';
+}
+
+function setBanner(online) {
+  const b = document.getElementById('server-banner');
+  const m = document.getElementById('server-msg');
+  b.className = 'server-banner ' + (online ? 'connected' : 'disconnected');
+  m.textContent = online
+    ? '✓ Config server connected at http://127.0.0.1:5111 — keys save directly to config.json'
+    : '✗ Config server offline — ensure the trading-agent-config service is running on your server';
+}
+
+// ── Input normalization helpers ──────────────────────────────────────────────
+function looksMasked(val) {
+  return typeof val === 'string' && /[•*●○·]/.test(val);
+}
+
+function cleanToken(val) {
+  if (typeof val !== 'string') return '';
+  return val
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[\u0000-\u001F\u007F]/g, '')
+    .replace(/\s+/g, '')
+    .replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, '');
+}
+
+function fieldVal(id) {
+  const el = document.getElementById(id);
+  if (!el) return '';
+  const raw = el.value || '';
+  return looksMasked(raw) ? '' : cleanToken(raw);
+}
+
+// ── Populate form fields from loaded config ───────────────────────────────────
+function populateFields() {
+  const textFields = [
+    'ALPACA_API_KEY','ALPACA_SECRET_KEY','ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL',
+    'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT',
+    'NEWS_API_KEY','QUIVER_API_KEY',
+  ];
+  textFields.forEach(k => {
+    const el = document.getElementById(k);
+    if (el && config[k]) {
+      el.value = config[k];
+      el.classList.add('has-value');
+    }
+  });
+
+  // Select fields
+  const paper = document.getElementById('ALPACA_PAPER');
+  if (paper && config.ALPACA_PAPER !== undefined) paper.value = config.ALPACA_PAPER;
+
+  const maxTrades = document.getElementById('MAX_DAILY_TRADES');
+  if (maxTrades && config.MAX_DAILY_TRADES) maxTrades.value = config.MAX_DAILY_TRADES;
+
+  const hardReb = document.getElementById('HARD_REBALANCE');
+  if (hardReb && config.HARD_REBALANCE !== undefined) hardReb.value = String(config.HARD_REBALANCE).toLowerCase() === 'true' ? 'true' : 'false';
+
+  const hardDrift = document.getElementById('HARD_REBALANCE_DRIFT_PCT');
+  if (hardDrift && config.HARD_REBALANCE_DRIFT_PCT) hardDrift.value = config.HARD_REBALANCE_DRIFT_PCT;
+
+  const scCache = document.getElementById('SCREENER_CACHE');
+  if (scCache && config.SCREENER_CACHE !== undefined) scCache.value = String(config.SCREENER_CACHE).toLowerCase() === 'false' ? 'false' : 'true';
+
+  const scTtl = document.getElementById('SCREENER_CACHE_TTL_MINUTES');
+  if (scTtl && config.SCREENER_CACHE_TTL_MINUTES) scTtl.value = config.SCREENER_CACHE_TTL_MINUTES;
+
+  // LLM mode
+  const mode = config.LLM_MODE || 'tiered';
+  selectMode(mode, false);
+
+  // Budget
+  const budget = parseInt(config.DAILY_TOKEN_BUDGET || 200000);
+  document.getElementById('budget-slider').value = budget;
+  document.getElementById('DAILY_TOKEN_BUDGET').value = budget;
+  updateBudget(budget);
+}
+
+// ── Dirty tracking ────────────────────────────────────────────────────────────
+function markDirty(section) { dirty[section] = true; }
+
+// ── Field visibility toggle ───────────────────────────────────────────────────
+function toggleVis(id) {
+  const el = document.getElementById(id);
+  if (el) el.type = el.type === 'password' ? 'text' : 'password';
+}
+
+// ── Save single key ───────────────────────────────────────────────────────────
+async function saveKey(key) {
+  const el  = document.getElementById(key);
+  if (!el) return;
+  const raw = el.value;
+  if (looksMasked(raw)) {
+    showSaveMsg(`${key}: masked placeholder kept; real saved value not overwritten ✓`);
+    return;
+  }
+  const val = (key === 'LLM_MODE') ? String(raw).trim() : cleanToken(raw);
+  el.value = val;
+  el.classList.toggle('has-value', !!val);
+
+  if (!serverOnline) {
+    showSaveMsg('Server offline — use Export .env instead', true);
+    return;
+  }
+  try {
+    const r = await fetch(apiUrl('config/key'), {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({key, value: val}),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      config[key] = val;
+      showSaveMsg(`${key} saved ✓`);
+    } else {
+      showSaveMsg(d.message, true);
+    }
+  } catch(e) {
+    showSaveMsg('Save failed: '+e.message, true);
+  }
+}
+
+// ── Save all ──────────────────────────────────────────────────────────────────
+async function saveAll() {
+  const allKeys = [
+    'ALPACA_API_KEY','ALPACA_SECRET_KEY','ALPACA_PAPER',
+    'ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL',
+    'LLM_MODE','DAILY_TOKEN_BUDGET','MAX_DAILY_TRADES','HARD_REBALANCE','HARD_REBALANCE_DRIFT_PCT','SCREENER_CACHE','SCREENER_CACHE_TTL_MINUTES',
+    'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT',
+    'NEWS_API_KEY','QUIVER_API_KEY',
+  ];
+  const payload = {};
+  allKeys.forEach(k => {
+    const el = document.getElementById(k);
+    if (!el || !el.value || looksMasked(el.value)) return;
+    payload[k] = cleanToken(el.value);
+  });
+
+  if (!serverOnline) { exportEnv(payload); return; }
+
+  try {
+    const r = await fetch(apiUrl('config'), {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    showSaveMsg(d.ok ? 'All settings saved ✓' : d.message, !d.ok);
+  } catch(e) {
+    showSaveMsg('Save failed: '+e.message, true);
+  }
+}
+
+// ── LLM mode selection ────────────────────────────────────────────────────────
+function selectMode(mode, save=true) {
+  document.querySelectorAll('.mode-opt').forEach(el => {
+    el.classList.remove('selected','gpt','dual');
+  });
+  const el = document.getElementById('mode-'+mode);
+  if (el) {
+    el.classList.add('selected');
+    if (mode.startsWith('gpt') || mode.startsWith('gemini') || mode.startsWith('groq')) el.classList.add('gpt');
+    if (mode === 'dual' || mode.startsWith('deepseek')) el.classList.add('dual');
+  }
+  document.getElementById('LLM_MODE').value = mode;
+  config.LLM_MODE = mode;
+  if (save) saveKey('LLM_MODE');
+}
+
+// ── Budget slider ─────────────────────────────────────────────────────────────
+const COST_PER_TOK = { tiered:0.0000009, claude_sonnet:0.000009, claude_haiku:0.0000012,
+  gpt4o_mini:0.00000038, gpt4o:0.00000625, dual:0.0000045, gemini_flash:0.0000007, gemini_pro:0.0000045, mistral_small:0.0000004, mistral_large:0.000004, deepseek_chat:0.0000007, deepseek_reasoner:0.0000025, groq_llama:0.0000006, groq_qwen:0.0000004 };
+
+function updateBudget(val) {
+  val = parseInt(val);
+  document.getElementById('DAILY_TOKEN_BUDGET').value = val;
+  document.getElementById('budget-display').textContent = val.toLocaleString();
+  const mode = document.getElementById('LLM_MODE').value || 'tiered';
+  const cost = (val * (COST_PER_TOK[mode] || 0.0000009)).toFixed(2);
+  document.getElementById('budget-cost').textContent = `~$${cost}/day`;
+}
+
+// ── Save LLM config block ─────────────────────────────────────────────────────
+function saveLLMConfig() {
+  saveKey('LLM_MODE');
+  saveKey('DAILY_TOKEN_BUDGET');
+  saveKey('MAX_DAILY_TRADES');
+  saveKey('HARD_REBALANCE');
+  saveKey('HARD_REBALANCE_DRIFT_PCT');
+  saveKey('SCREENER_CACHE');
+  saveKey('SCREENER_CACHE_TTL_MINUTES');
+}
+
+async function clearScreenerCache() {
+  if (!serverOnline) {
+    showSaveMsg('Server offline — cannot clear cache', true);
+    return;
+  }
+  try {
+    const r = await fetch(apiUrl('screener/cache/clear'), {method: 'POST'});
+    const d = await r.json();
+    showSaveMsg(d.ok ? (d.message || 'Screener cache cleared ✓') : (d.message || 'Clear failed'), !d.ok);
+  } catch (e) {
+    showSaveMsg('Clear failed: ' + e.message, true);
+  }
+}
+
+// ── Test connections ──────────────────────────────────────────────────────────
+async function runTest(endpoint, payload, resultId, statusId) {
+  const tr  = document.getElementById(resultId);
+  const st  = document.getElementById(statusId);
+  tr.style.display = 'none';
+  if (st) { st.className='card-status testing'; st.innerHTML='<span class="status-dot"></span>Testing…'; }
+
+  if (!serverOnline) {
+    showResult(resultId, false, 'Config server offline. Run: python config_server.py');
+    if (st) { st.className='card-status err'; st.innerHTML='<span class="status-dot"></span>Server offline'; }
+    return;
+  }
+
+  try {
+    const r = await fetch(apiUrl('test/' + endpoint), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    showResult(resultId, d.ok, d.message);
+    if (st) {
+      st.className = 'card-status '+(d.ok?'ok':'err');
+      st.innerHTML = `<span class="status-dot"></span>${d.ok ? 'Connected ✓' : 'Failed'}`;
+    }
+  } catch(e) {
+    showResult(resultId, false, e.message);
+    if (st) { st.className='card-status err'; st.innerHTML='<span class="status-dot"></span>Error'; }
+  }
+}
+
+function testAlpaca()    { runTest('alpaca',    {api_key:fieldVal('ALPACA_API_KEY'), secret_key:fieldVal('ALPACA_SECRET_KEY'), paper: v('ALPACA_PAPER')==='true'}, 'tr-alpaca',   'status-alpaca');   }
+function testAnthropic() { runTest('anthropic', {api_key:fieldVal('ANTHROPIC_API_KEY')},                                                                   'tr-anthropic','status-anthropic'); }
+function testOpenAI()    { runTest('openai',    {api_key:fieldVal('OPENAI_API_KEY')},                                                                      'tr-openai',   'status-openai');   }
+function testGemini()    { runTest('gemini',    {api_key:fieldVal('GEMINI_API_KEY')},                                                                      'tr-gemini',   'status-gemini');   }
+function testMistral()   { runTest('mistral',   {api_key:fieldVal('MISTRAL_API_KEY')},                                                                     'tr-mistral',  'status-mistral');  }
+function testDeepSeek()  { runTest('deepseek',  {api_key:fieldVal('DEEPSEEK_API_KEY')},                                                                    'tr-deepseek', 'status-deepseek'); }
+function testGroq()      { runTest('groq',      {api_key:fieldVal('GROQ_API_KEY')},                                                                        'tr-groq',     'status-groq');     }
+function testNvidia()    { runTest('nvidia',    {api_key:fieldVal('NVIDIA_API_KEY')},                                                                     'tr-nvidia',   'status-nvidia');  }
+function testReddit()    { runTest('reddit',    {client_id:fieldVal('REDDIT_CLIENT_ID'), client_secret:fieldVal('REDDIT_CLIENT_SECRET'), user_agent:v('REDDIT_USER_AGENT')}, 'tr-reddit', 'status-reddit'); }
+function testNewsAPI()   { runTest('newsapi',   {api_key:fieldVal('NEWS_API_KEY')},                                                                        'tr-newsapi',  'status-newsapi');  }
+function testQuiver()    { runTest('quiver',    {api_key:fieldVal('QUIVER_API_KEY')},                                                                      'tr-quiver',   'status-quiver');   }
+
+function v(id) { const el=document.getElementById(id); return el ? el.value : ''; }
+
+function showResult(id, ok, msg) {
+  const el = document.getElementById(id);
+  el.className = 'test-result '+(ok?'ok':'err');
+  el.textContent = (ok ? '✓ ' : '✗ ') + msg;
+  el.style.display = 'block';
+}
+
+// ── Export .env ───────────────────────────────────────────────────────────────
+function exportEnv(overridePayload) {
+  const keys = [
+    'ALPACA_API_KEY','ALPACA_SECRET_KEY','ALPACA_PAPER',
+    'ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL',
+    'LLM_MODE','DAILY_TOKEN_BUDGET','MAX_DAILY_TRADES','HARD_REBALANCE','HARD_REBALANCE_DRIFT_PCT','SCREENER_CACHE','SCREENER_CACHE_TTL_MINUTES',
+    'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT',
+    'NEWS_API_KEY','QUIVER_API_KEY',
+  ];
+  const src = overridePayload || {};
+  let lines = `# AgentTrade .env — generated ${new Date().toISOString()}\n# Add to .gitignore!\n\n`;
+  keys.forEach(k => {
+    const el  = document.getElementById(k);
+    const raw = src[k] || (el ? el.value : '') || '';
+    const val = looksMasked(raw) ? '' : cleanToken(raw);
+    lines += `${k}=${val}\n`;
+  });
+  const blob = new Blob([lines], {type:'text/plain'});
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(blob);
+  a.download = '.env';
+  a.click();
+  showSaveMsg('.env downloaded — place it in your project folder ✓');
+}
+
+// ── Save message ──────────────────────────────────────────────────────────────
+let saveTimer;
+function showSaveMsg(msg, isErr=false) {
+  const el = document.getElementById('save-msg');
+  el.textContent = msg;
+  el.className   = 'save-msg' + (isErr ? ' err' : '');
+  el.style.display = 'inline';
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => { el.style.display='none'; }, 4000);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+checkServer();
+</script>
+</body>
+</html>

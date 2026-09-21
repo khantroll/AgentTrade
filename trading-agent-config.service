@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# trading-agent-config.service
+#
+# Systemd service that keeps config_server.py running persistently so
+# settings.html can read/write API keys at any time via http://127.0.0.1:5111.
+#
+# Install:
+#   sudo cp trading-agent-config.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable trading-agent-config
+#   sudo systemctl start trading-agent-config
+#
+# Check status:
+#   sudo systemctl status trading-agent-config
+#   sudo journalctl -u trading-agent-config -f
+# ─────────────────────────────────────────────────────────────────────────────
+
+[Unit]
+Description=AgentTrade Config Server (API key management UI)
+After=network.target
+# Start after YunoHost nginx is up so the web dashboard is reachable
+After=nginx.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/trading-agent
+Environment=TRADING_AGENT_DIR=/opt/trading-agent
+Environment=PUBLIC_DASHBOARD_DIR=/var/www/my_webapp__3/www
+ExecStart=/opt/trading-agent/.venv/bin/python /opt/trading-agent/config_server.py
+Restart=on-failure
+RestartSec=10
+
+# Keep logs in journald (view with: journalctl -u trading-agent-config)
+StandardOutput=journal
+StandardError=journal
+
+# Security: only binds to localhost, never exposed to internet
+# config_server.py already enforces host=127.0.0.1
+
+[Install]
+WantedBy=multi-user.target

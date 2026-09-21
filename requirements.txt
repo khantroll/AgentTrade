@@ -1,0 +1,15 @@
+# Core
+anthropic>=0.40.0
+openai>=1.30.0
+yfinance>=0.2.40
+requests>=2.31.0
+# New LLM providers (Gemini, Mistral, DeepSeek, Groq) use REST through requests.
+python-dotenv>=1.0.0
+schedule>=1.2.0
+
+# Screener
+vaderSentiment>=3.3.2
+
+# Config server (for settings.html UI)
+flask>=3.0.0
+flask-cors>=4.0.0
