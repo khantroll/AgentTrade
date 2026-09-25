@@ -5,6 +5,7 @@ Loaded once at startup; refreshed via refresh_config() at each cycle.
 """
 
 import json
+import logging
 import os
 from datetime import datetime
 
@@ -20,6 +21,12 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(APP_DIR, "agent_state.json")
 PUBLIC_DASHBOARD_DIR = os.getenv("PUBLIC_DASHBOARD_DIR", "/var/www/my_webapp__3/www")
 PUBLIC_STATE_FILE = os.path.join(PUBLIC_DASHBOARD_DIR, "agent_state.json")
+
+# Dashboard projection cap. Nested escape bloat once wrote a ~1.4GB agent_state.json.
+# Refuse that publish instead of replacing the file. SQLite is not involved here
+# (a multi-GB sqlite OOM is a separate host/ops follow-up).
+# Override with AGENT_STATE_MAX_BYTES. Default is 8 MiB, not gigabytes.
+DEFAULT_AGENT_STATE_MAX_BYTES = 8 * 1024 * 1024
 
 # Research funnel: screener → research picks N → confidence filter → analysis on top M
 RESEARCH_TOP_N = 5
@@ -157,6 +164,43 @@ def reset_daily_counters() -> None:
 
 def env_bool(key: str, default: str = "false") -> bool:
     return os.getenv(key, default).lower() in ("1", "true", "yes", "on")
+
+
+def agent_state_max_bytes() -> int:
+    """Configured max serialized size for agent_state.json. Default 8 MiB."""
+    raw = os.getenv("AGENT_STATE_MAX_BYTES", "").strip()
+    if not raw:
+        return DEFAULT_AGENT_STATE_MAX_BYTES
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_AGENT_STATE_MAX_BYTES
+    if n <= 0:
+        return DEFAULT_AGENT_STATE_MAX_BYTES
+    return n
+
+
+def dumps_agent_state(state: dict) -> str | None:
+    """Serialize the dashboard projection, or None if it exceeds the size cap.
+
+    Callers must not replace agent_state.json (or the public copy) when this
+    returns None. This does not read or write SQLite.
+    """
+    payload = json.dumps(state, indent=2)
+    size = len(payload.encode("utf-8"))
+    limit = agent_state_max_bytes()
+    if size > limit:
+        logging.getLogger("agent_state").error(
+            "[State] Refusing agent_state.json write: %s bytes exceeds max %s "
+            "(AGENT_STATE_MAX_BYTES, default %s bytes / %s MiB). "
+            "Existing projection left unchanged. SQLite history is not modified.",
+            f"{size:,}",
+            f"{limit:,}",
+            f"{DEFAULT_AGENT_STATE_MAX_BYTES:,}",
+            DEFAULT_AGENT_STATE_MAX_BYTES // (1024 * 1024),
+        )
+        return None
+    return payload
 
 
 def hard_rebalance_drift_pct() -> float:

@@ -182,26 +182,34 @@ def load_state_file() -> dict:
         return {}
 
 
-def save_state_file(state: dict) -> None:
-    """Persist state to backend + public dashboard copy."""
-    fd, tmp_path = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.APP_DIR)
+def _atomic_write_json(directory: str, dest: str, payload: str) -> None:
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp_path, cfg.STATE_FILE)
+            f.write(payload)
+        os.replace(tmp_path, dest)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+
+def save_state_file(state: dict) -> bool:
+    """Persist state to backend + public dashboard copy.
+
+    Returns False and writes neither file when the serialized payload exceeds
+    AGENT_STATE_MAX_BYTES (default 8 MiB). Does not touch SQLite.
+    """
+    payload = cfg.dumps_agent_state(state)
+    if payload is None:
+        return False
+    _atomic_write_json(cfg.APP_DIR, cfg.STATE_FILE, payload)
     try:
-        os.makedirs(cfg.PUBLIC_DASHBOARD_DIR, exist_ok=True)
-        fd, pub_tmp = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.PUBLIC_DASHBOARD_DIR)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(pub_tmp, cfg.PUBLIC_STATE_FILE)
+        _atomic_write_json(cfg.PUBLIC_DASHBOARD_DIR, cfg.PUBLIC_STATE_FILE, payload)
         os.chmod(cfg.PUBLIC_STATE_FILE, 0o644)
     except OSError as e:
         log.warning("[AccountSync] Could not publish state: %s", e)
+    return True
 
 
 def refresh_and_persist_state(existing: Optional[dict] = None, *, source: str = "cycle") -> dict:
