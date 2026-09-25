@@ -845,14 +845,47 @@ def _dual_analysis(prompt: str, agent_tag: str) -> dict:
 
 
 # ── JSON parser / repair ─────────────────────────────────────────────────────
+# Gemini often prefixes research JSON with prose ("Here is the JSON requested")
+# and/or a ```json fence. Strip both before json.loads. A greedy \{.*\} match
+# swallows a later brace in the trailing prose and the parse returns no picks.
+_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\r?\n?(.*?)```", re.IGNORECASE | re.DOTALL)
+_PREAMBLE_RE = re.compile(
+    r"(?is)^(?:sure[,!]?\s+)?here(?:'s| is)\s+the\s+json(?:\s+requested)?\b\s*[:\-]?\s*"
+)
+
+
 def _strip_code_fences(text: str) -> str:
+    """Remove markdown code fences, including when prose precedes the fence."""
     clean = (text or "").strip()
+    if "```" not in clean:
+        return clean
+    blocks = [b.strip() for b in _FENCE_RE.findall(clean) if b and b.strip()]
+    if blocks:
+        return "\n".join(blocks)
     if clean.startswith("```"):
         lines = clean.splitlines()
         clean = "\n".join(lines[1:])
     if clean.endswith("```"):
         clean = "\n".join(clean.splitlines()[:-1])
     return clean.strip()
+
+
+def _strip_common_preamble(text: str) -> str:
+    """Drop a leading 'Here is the JSON requested' line and other prose before JSON."""
+    s = (text or "").strip()
+    s = _PREAMBLE_RE.sub("", s, count=1).strip()
+    lines = s.splitlines()
+    start = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("```") or "{" in stripped or "[" in stripped:
+            start = i
+            break
+    else:
+        return s
+    return "\n".join(lines[start:]).strip()
 
 
 def _extract_balanced_json(text: str) -> str:
@@ -908,24 +941,69 @@ def _salvage_research_json(text: str) -> Optional[dict]:
     return {"selected": picks, "json_repaired": True}
 
 
+def _loads_relaxed(clean: str):
+    """json.loads, then the existing single-quote / trailing-comma repair."""
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+    try:
+        fixed = re.sub(r"(?<!\\)'([^']*)'", r'"\1"', clean)
+        fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
+        return json.loads(fixed)
+    except Exception:
+        return None
+
+
+def _json_candidates(text: str) -> list[str]:
+    """Balanced JSON slices after preamble and fence stripping."""
+    prepared = _strip_common_preamble(_strip_code_fences(text or "")).strip()
+    if not prepared:
+        return []
+    out: list[str] = []
+    rest = prepared
+    for _ in range(20):
+        if "{" not in rest and "[" not in rest:
+            break
+        extracted = _extract_balanced_json(rest).strip()
+        if not extracted or extracted in out:
+            break
+        out.append(extracted)
+        idx = rest.find(extracted)
+        if idx < 0:
+            break
+        nxt = rest[idx + len(extracted):]
+        if not nxt or nxt == rest:
+            break
+        rest = nxt
+    return out or [prepared]
+
+
+def _sanitize_llm_json_text(text: str) -> str:
+    """Strip Gemini-style preambles and ```json fences; return JSON text.
+
+    Clean JSON is unchanged aside from surrounding whitespace. The first
+    balanced value that parses wins, so trailing prose with its own braces
+    is not included in the payload.
+    """
+    candidates = _json_candidates(text)
+    for candidate in candidates:
+        if _loads_relaxed(candidate) is not None:
+            return candidate
+    if candidates:
+        return candidates[0]
+    return (text or "").strip()
+
+
 def _parse_json(text: str):
     """Robust JSON extractor — handles fences, leading text, single quotes, trailing commas."""
-    if not text: return None
-    clean = text.strip()
-    # Strip markdown fences
-    fence = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", clean, re.DOTALL)
-    if fence:
-        clean = fence.group(1)
-    else:
-        if clean.startswith("```"):
-            clean = "\n".join(clean.split("\n")[1:])
-        if clean.endswith("```"):
-            clean = "\n".join(clean.split("\n")[:-1])
-    obj_match = re.search(r"(\{.*\})", clean, re.DOTALL)
-    if obj_match: clean = obj_match.group(1)
-    clean = clean.strip()
-    try: return json.loads(clean)
-    except json.JSONDecodeError: pass
+    if not text:
+        return None
+    clean = _sanitize_llm_json_text(text)
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
     try:
         fixed = re.sub(r"(?<!\\)'([^']*)'", r'"\1"', clean)
         fixed = re.sub(r",\s*([}\]])", r"\1", fixed)

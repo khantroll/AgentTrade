@@ -14,6 +14,8 @@ A multi-agent paper trading system powered by Claude + Alpaca with a **dynamic s
 
 Credentials stay in `config.json` / `.env`. They are never stored in SQLite.
 
+`agent_state.json` and the public dashboard copy are replaced only when the serialized payload is within `AGENT_STATE_MAX_BYTES` (default **8 MiB**, 8388608). Set that env var, or the same key in `config.json`, to change the cap. An oversized publish is refused and the previous projection is left in place; SQLite is not modified. Nested escape bloat previously grew this file to about 1.4GB. A multi-gigabyte `agenttrade.sqlite3` OOM is a separate host/ops follow-up and is not handled by this cap.
+
 `bucket_tags.json` remains the bucket-ownership file (not migrated).
 
 ---

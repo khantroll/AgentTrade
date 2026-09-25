@@ -1,6 +1,5 @@
 """Trading cycle orchestration — one full agent pipeline run."""
 
-import json
 import logging
 import os
 import tempfile
@@ -40,6 +39,15 @@ except ImportError:
     apply_calibration_to_decisions = None  # type: ignore
 
 log = logging.getLogger(__name__)
+
+
+def format_signed_amount(value) -> str:
+    """Signed, thousands-separated number for logs.
+
+    ``%+,.0f`` raises ValueError because ',' is not a printf format character.
+    ``format(n, '+,.0f')`` is the supported equivalent (for example ``-12,345``).
+    """
+    return format(float(value), "+,.0f")
 
 
 def _pipeline_counts(sources: dict) -> dict:
@@ -96,23 +104,30 @@ def get_cycle_run_id() -> int | None:
     return _CYCLE_RUN_ID
 
 
-def _save_state(state: dict) -> None:
-    """Write state atomically in backend folder and publish beside the dashboard."""
-    fd, tmp_path = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.APP_DIR)
+def _atomic_write_json(directory: str, dest: str, payload: str) -> None:
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp_path, cfg.STATE_FILE)
+            f.write(payload)
+        os.replace(tmp_path, dest)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+
+def _save_state(state: dict) -> None:
+    """Write state atomically in backend folder and publish beside the dashboard.
+
+    Refuses both writes when the serialized payload exceeds AGENT_STATE_MAX_BYTES
+    (default 8 MiB). Does not touch SQLite.
+    """
+    payload = cfg.dumps_agent_state(state)
+    if payload is None:
+        return
+    _atomic_write_json(cfg.APP_DIR, cfg.STATE_FILE, payload)
     try:
-        os.makedirs(cfg.PUBLIC_DASHBOARD_DIR, exist_ok=True)
-        fd, pub_tmp = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.PUBLIC_DASHBOARD_DIR)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(pub_tmp, cfg.PUBLIC_STATE_FILE)
+        _atomic_write_json(cfg.PUBLIC_DASHBOARD_DIR, cfg.PUBLIC_STATE_FILE, payload)
         os.chmod(cfg.PUBLIC_STATE_FILE, 0o644)
         log.info("[State] Published dashboard state to %s", cfg.PUBLIC_STATE_FILE)
     except Exception as pub_e:
@@ -253,8 +268,12 @@ def run_trading_cycle() -> None:
         log.info("[Buckets] Rebalance:")
         for name, r in rebalance.items():
             log.info(
-                "  %s: target=%s%% current=%s%% drift=$%+,.0f → %s",
-                name, r["target_pct"], r["current_pct"], r["drift_$"], r["action"],
+                "  %s: target=%s%% current=%s%% drift=$%s → %s",
+                name,
+                r["target_pct"],
+                r["current_pct"],
+                format_signed_amount(r["drift_$"]),
+                r["action"],
             )
 
         hard_orders, hard_plans = hard_rebalance_agent(rebalance, positions, pv, market_open)
