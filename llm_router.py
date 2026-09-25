@@ -374,6 +374,25 @@ def _is_proactive_tiered(mode: str) -> bool:
     return mode in ("tiered", "adaptive", "auto") and os.getenv("LLM_TIERED_PROACTIVE", "1").lower() not in ("0", "false", "no")
 
 
+# Appended once when a tiered research model returns parseable JSON with an empty
+# selected list (or salvage finds nothing). One retry, then move on.
+_STRICT_RESEARCH_JSON_INSTRUCTION = (
+    "JSON only. No prose and no markdown. "
+    "selected must be a non-empty array of objects with ticker, reason, and confidence."
+)
+
+
+def _strict_research_prompt(prompt: str) -> str:
+    return (prompt or "").rstrip() + "\n\n" + _STRICT_RESEARCH_JSON_INSTRUCTION
+
+
+def _selected_picks(parsed) -> list:
+    if not isinstance(parsed, dict):
+        return []
+    selected = parsed.get("selected")
+    return selected if isinstance(selected, list) else []
+
+
 def _tiered_research(prompt: str, agent_tag: str = "research") -> Optional[dict]:
     """Proactive tiered research: several authenticated models screen independently, then we merge votes."""
     choices = _tiered_choices("research", prompt)
@@ -387,9 +406,21 @@ def _tiered_research(prompt: str, agent_tag: str = "research") -> Optional[dict]
         try:
             text = _call_provider(provider, model, prompt, max_tokens=_max_tokens_for(provider, "research"), agent_tag=f"{agent_tag}_{alias}")
             parsed = _parse_json(text) or {}
-            picks = parsed.get("selected", []) if isinstance(parsed, dict) else []
+            picks = _selected_picks(parsed)
             if not picks:
-                log.warning(f"[LLM/TieredResearch] {alias} returned no selected picks.")
+                log.warning(
+                    "[LLM/TieredResearch] %s returned no selected picks — one strict JSON retry.",
+                    alias,
+                )
+                text = _call_provider(
+                    provider, model, _strict_research_prompt(prompt),
+                    max_tokens=_max_tokens_for(provider, "research"),
+                    agent_tag=f"{agent_tag}_{alias}_strict",
+                )
+                parsed = _parse_json(text) or {}
+                picks = _selected_picks(parsed)
+            if not picks:
+                log.warning("[LLM/TieredResearch] %s returned no selected picks.", alias)
                 continue
             successful.append(alias)
             for pick in picks:
@@ -1043,19 +1074,56 @@ def _payload_from_fragment(fragment: str):
     return _coerce_llm_payload(_prefer_llm_payload(_scan_top_level_json(fragment)))
 
 
+def _parsed_payload_is_usable(parsed) -> bool:
+    """Non-empty research picks, or an analysis decision. Empty selected is not usable."""
+    if not isinstance(parsed, dict):
+        return False
+    if _selected_picks(parsed):
+        return True
+    return bool(parsed.get("action") or parsed.get("decision"))
+
+
+def _should_salvage_research(text: str, parsed) -> bool:
+    """Salvage after a hard failure, or when selected is empty but ticker fields remain.
+
+    A finished analysis object (action/decision) is left alone. Clean research JSON
+    with a non-empty selected array is left alone.
+    """
+    if _parsed_payload_is_usable(parsed):
+        return False
+    if isinstance(parsed, dict):
+        return bool(re.search(r'"ticker"\s*:\s*"[A-Z]{1,6}"', text or ""))
+    return True
+
+
 def _parse_json(text: str):
-    """Parse an LLM reply. Clean JSON is unchanged; preambles and fences are stripped first."""
+    """Parse an LLM reply. Clean JSON is unchanged; preambles and fences are stripped first.
+
+    If loads, balanced extract, and single-quote/trailing-comma repair all fail,
+    `_salvage_research_json` pulls ticker/reason pairs out of the raw text.
+    The same salvage runs when parse succeeds but `selected` is missing or empty
+    and the text still looks like broken research JSON.
+    """
     if not text:
         return None
     parsed = _payload_from_fragment(_prepare_llm_json_text(text))
-    if isinstance(parsed, dict):
+    if not isinstance(parsed, dict):
+        repaired = _repair_json_text(_extract_balanced_json(text))
+        try:
+            parsed = _payload_from_fragment(repaired)
+        except Exception as e:
+            log.error("[LLM] JSON parse failed: %s | text[:150]: %r", e, (text or "")[:150])
+            parsed = None
+    if _parsed_payload_is_usable(parsed):
         return parsed
-    repaired = _repair_json_text(_extract_balanced_json(text))
-    try:
-        parsed = _payload_from_fragment(repaired)
-    except Exception as e:
-        log.error("[LLM] JSON parse failed: %s | text[:150]: %r", e, (text or "")[:150])
-        return None
+    if _should_salvage_research(text, parsed):
+        salvaged = _salvage_research_json(text)
+        if salvaged and salvaged.get("selected"):
+            log.warning(
+                "[LLM] Salvaged %d research ticker(s) from malformed JSON",
+                len(salvaged["selected"]),
+            )
+            return salvaged
     if isinstance(parsed, dict):
         return parsed
     log.error("[LLM] JSON parse failed: text[:150]: %r", (text or "")[:150])
