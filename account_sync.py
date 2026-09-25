@@ -16,6 +16,13 @@ log = logging.getLogger(__name__)
 
 EQUITY_MISMATCH_THRESHOLD = 5.0
 
+# Dashboard projection cap. The public agent_state.json once grew to ~1.4GB
+# from nested escape bloat. Refuse that write instead of replacing the file.
+# Default is 8 MiB — a few megabytes, not gigabytes. Override with
+# AGENT_STATE_MAX_BYTES. This does not delete or rewrite the SQLite ledger.
+# A multi-gigabyte sqlite file that OOMs the host is a separate ops follow-up.
+DEFAULT_AGENT_STATE_MAX_BYTES = 8 * 1024 * 1024
+
 
 def _fetch_open_orders(limit: int = 200) -> list:
     """Open orders via alpaca_get — avoids requiring get_open_orders on stale deploys."""
@@ -173,6 +180,62 @@ def merge_snapshot_into_state(state: dict, snapshot: dict, *, source: str = "cyc
     return state
 
 
+def agent_state_max_bytes() -> int:
+    """Configured max UTF-8 size for agent_state.json. Default 8 MiB."""
+    raw = os.getenv("AGENT_STATE_MAX_BYTES")
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_AGENT_STATE_MAX_BYTES
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        log.warning(
+            "[State] Invalid AGENT_STATE_MAX_BYTES=%r; using default %d",
+            raw,
+            DEFAULT_AGENT_STATE_MAX_BYTES,
+        )
+        return DEFAULT_AGENT_STATE_MAX_BYTES
+    if value < 1:
+        return DEFAULT_AGENT_STATE_MAX_BYTES
+    return value
+
+
+def dumps_dashboard_projection(state: dict) -> Optional[str]:
+    """Serialize the dashboard projection, or None if it exceeds the write cap.
+
+    Callers must skip both the private agent_state.json replace and the public
+    copy when this returns None. SQLite is not touched here.
+    """
+    payload = json.dumps(state, indent=2)
+    size = len(payload.encode("utf-8"))
+    limit = agent_state_max_bytes()
+    if size > limit:
+        log.error(
+            "[State] Refusing agent_state.json write: %d bytes exceeds "
+            "AGENT_STATE_MAX_BYTES=%d. Existing projection left in place. "
+            "SQLite ledger was not modified.",
+            size,
+            limit,
+        )
+        return None
+    return payload
+
+
+def atomic_write_text(path: str, payload: str, chmod: Optional[int] = None) -> None:
+    """Atomically replace path with payload. Temp file is created beside path."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp_path, path)
+        if chmod is not None:
+            os.chmod(path, chmod)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def load_state_file() -> dict:
     """NON-AUTHORITATIVE: read dashboard projection cache if present."""
     try:
@@ -184,22 +247,12 @@ def load_state_file() -> dict:
 
 def save_state_file(state: dict) -> None:
     """Persist state to backend + public dashboard copy."""
-    fd, tmp_path = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.APP_DIR)
+    payload = dumps_dashboard_projection(state)
+    if payload is None:
+        return
+    atomic_write_text(cfg.STATE_FILE, payload)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp_path, cfg.STATE_FILE)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-    try:
-        os.makedirs(cfg.PUBLIC_DASHBOARD_DIR, exist_ok=True)
-        fd, pub_tmp = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.PUBLIC_DASHBOARD_DIR)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(pub_tmp, cfg.PUBLIC_STATE_FILE)
-        os.chmod(cfg.PUBLIC_STATE_FILE, 0o644)
+        atomic_write_text(cfg.PUBLIC_STATE_FILE, payload, chmod=0o644)
     except OSError as e:
         log.warning("[AccountSync] Could not publish state: %s", e)
 

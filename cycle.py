@@ -1,13 +1,16 @@
 """Trading cycle orchestration — one full agent pipeline run."""
 
-import json
 import logging
 import os
-import tempfile
 from datetime import datetime
 
 import agent_config as cfg
-from account_sync import merge_snapshot_into_state, refresh_alpaca_snapshot
+from account_sync import (
+    atomic_write_text,
+    dumps_dashboard_projection,
+    merge_snapshot_into_state,
+    refresh_alpaca_snapshot,
+)
 from agents.analysis import analysis_agent
 from agents.execution import execution_agent, hard_rebalance_agent
 from agents.position_review import review_positions
@@ -96,24 +99,23 @@ def get_cycle_run_id() -> int | None:
     return _CYCLE_RUN_ID
 
 
+def format_signed_drift(amount) -> str:
+    """Signed, comma-grouped dollars for the rebalance log.
+
+    %-formatting rejects a ',' grouping flag (``%+,.0f`` raises ValueError:
+    unsupported format character ','). format() supports the flag.
+    """
+    return format(float(amount), "+,.0f")
+
+
 def _save_state(state: dict) -> None:
     """Write state atomically in backend folder and publish beside the dashboard."""
-    fd, tmp_path = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.APP_DIR)
+    payload = dumps_dashboard_projection(state)
+    if payload is None:
+        return
+    atomic_write_text(cfg.STATE_FILE, payload)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp_path, cfg.STATE_FILE)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-    try:
-        os.makedirs(cfg.PUBLIC_DASHBOARD_DIR, exist_ok=True)
-        fd, pub_tmp = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.PUBLIC_DASHBOARD_DIR)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(pub_tmp, cfg.PUBLIC_STATE_FILE)
-        os.chmod(cfg.PUBLIC_STATE_FILE, 0o644)
+        atomic_write_text(cfg.PUBLIC_STATE_FILE, payload, chmod=0o644)
         log.info("[State] Published dashboard state to %s", cfg.PUBLIC_STATE_FILE)
     except Exception as pub_e:
         log.warning("[State] Could not publish dashboard state to %s: %s", cfg.PUBLIC_STATE_FILE, pub_e)
@@ -253,8 +255,12 @@ def run_trading_cycle() -> None:
         log.info("[Buckets] Rebalance:")
         for name, r in rebalance.items():
             log.info(
-                "  %s: target=%s%% current=%s%% drift=$%+,.0f → %s",
-                name, r["target_pct"], r["current_pct"], r["drift_$"], r["action"],
+                "  %s: target=%s%% current=%s%% drift=$%s → %s",
+                name,
+                r["target_pct"],
+                r["current_pct"],
+                format_signed_drift(r["drift_$"]),
+                r["action"],
             )
 
         hard_orders, hard_plans = hard_rebalance_agent(rebalance, positions, pv, market_open)

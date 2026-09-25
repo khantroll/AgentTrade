@@ -845,8 +845,34 @@ def _dual_analysis(prompt: str, agent_tag: str) -> dict:
 
 
 # ── JSON parser / repair ─────────────────────────────────────────────────────
+# Gemini often prefixes research JSON with prose ("Here is the JSON requested")
+# and/or a ```json fence. json.loads rejects that whole string, so bucket
+# research returns no picks. Strip those wrappers before parsing.
+_PREAMBLE_LINE = re.compile(
+    r"^(?:sure[,!]?\s+|okay[,!]?\s+|ok[,!]?\s+)?"
+    r"here(?:['’]s| is)(?: the| your)? json(?: requested)?\b",
+    re.IGNORECASE,
+)
+_FENCE_BLOCK = re.compile(
+    r"```[ \t]*(?:json)?[ \t]*\r?\n(.*?)```",
+    re.IGNORECASE | re.DOTALL,
+)
+_FENCE_INLINE = re.compile(
+    r"```[ \t]*(?:json)?[ \t]+(.*?)```",
+    re.IGNORECASE | re.DOTALL,
+)
+_LLM_PAYLOAD_KEYS = ("selected", "action", "decision")
+
+
 def _strip_code_fences(text: str) -> str:
+    """Return the inside of a ``` / ```json fence, or text with edge fences removed."""
     clean = (text or "").strip()
+    match = _FENCE_BLOCK.search(clean)
+    if match:
+        return match.group(1).strip()
+    match = _FENCE_INLINE.search(clean)
+    if match:
+        return match.group(1).strip()
     if clean.startswith("```"):
         lines = clean.splitlines()
         clean = "\n".join(lines[1:])
@@ -855,9 +881,45 @@ def _strip_code_fences(text: str) -> str:
     return clean.strip()
 
 
+def _later_lines_have_json(lines: list) -> bool:
+    for line in lines:
+        stripped = line.strip()
+        if "{" in stripped or "[" in stripped or stripped.startswith("```"):
+            return True
+    return False
+
+
+def _strip_llm_preamble(text: str) -> str:
+    """Drop a leading 'Here is the JSON requested' line so json.loads sees JSON."""
+    s = (text or "").replace("\ufeff", "").strip()
+    if not s:
+        return s
+    lines = s.splitlines()
+    while lines:
+        line = lines[0].strip()
+        if not line:
+            lines.pop(0)
+            continue
+        match = _PREAMBLE_LINE.match(line)
+        if not match:
+            break
+        tail = line[match.end():].lstrip(" \t:.-")
+        tail_has_payload = bool(tail) and (tail[0] in "{[" or "```" in tail)
+        if tail_has_payload and not _later_lines_have_json(lines[1:]):
+            lines[0] = tail
+            break
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _prepare_llm_json_text(text: str) -> str:
+    """Strip common Gemini preambles and markdown fences before json.loads."""
+    return _strip_llm_preamble(_strip_code_fences(_strip_llm_preamble(text or "")))
+
+
 def _extract_balanced_json(text: str) -> str:
     """Extract the first balanced JSON object or array from a messy LLM response."""
-    s = _strip_code_fences(text)
+    s = _prepare_llm_json_text(text)
     start_positions = [i for i in (s.find("{"), s.find("[")) if i >= 0]
     if not start_positions:
         return s
@@ -888,6 +950,63 @@ def _extract_balanced_json(text: str) -> str:
     return s[start:]
 
 
+def _repair_json_text(clean: str) -> str:
+    fixed = re.sub(r"(?<!\\)'([^']*)'", r'"\1"', clean or "")
+    return re.sub(r",\s*([}\]])", r"\1", fixed)
+
+
+def _scan_top_level_json(text: str) -> list:
+    """Decode successive top-level JSON values. Do not walk into a broken value."""
+    decoder = json.JSONDecoder()
+    found = []
+    idx = 0
+    s = text or ""
+    while True:
+        while idx < len(s) and s[idx] not in "{[":
+            idx += 1
+        if idx >= len(s):
+            break
+        try:
+            obj, end = decoder.raw_decode(s, idx)
+        except json.JSONDecodeError:
+            break
+        found.append(obj)
+        idx = end
+    return found
+
+
+def _prefer_llm_payload(found: list):
+    """Prefer the last object that looks like a research or analysis reply."""
+    if not found:
+        return None
+    preferred = [
+        value for value in found
+        if isinstance(value, dict) and any(key in value for key in _LLM_PAYLOAD_KEYS)
+    ]
+    if preferred:
+        return preferred[-1]
+    last = found[-1]
+    if isinstance(last, (dict, list)):
+        return last
+    return None
+
+
+def _coerce_llm_payload(value):
+    """Callers expect an object. A one-item array unwraps; ticker arrays become selected."""
+    if isinstance(value, dict) or value is None:
+        return value
+    if not isinstance(value, list):
+        return None
+    dicts = [item for item in value if isinstance(item, dict)]
+    if len(dicts) == 1:
+        return dicts[0]
+    if dicts and all("ticker" in item for item in dicts) and not any(
+        "action" in item or "decision" in item for item in dicts
+    ):
+        return {"selected": dicts}
+    return None
+
+
 def _salvage_research_json(text: str) -> Optional[dict]:
     """Best-effort salvage for truncated research JSON: pull ticker symbols and reasons."""
     raw = text or ""
@@ -908,31 +1027,39 @@ def _salvage_research_json(text: str) -> Optional[dict]:
     return {"selected": picks, "json_repaired": True}
 
 
-def _parse_json(text: str):
-    """Robust JSON extractor — handles fences, leading text, single quotes, trailing commas."""
-    if not text: return None
-    clean = text.strip()
-    # Strip markdown fences
-    fence = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", clean, re.DOTALL)
-    if fence:
-        clean = fence.group(1)
-    else:
-        if clean.startswith("```"):
-            clean = "\n".join(clean.split("\n")[1:])
-        if clean.endswith("```"):
-            clean = "\n".join(clean.split("\n")[:-1])
-    obj_match = re.search(r"(\{.*\})", clean, re.DOTALL)
-    if obj_match: clean = obj_match.group(1)
-    clean = clean.strip()
-    try: return json.loads(clean)
-    except json.JSONDecodeError: pass
-    try:
-        fixed = re.sub(r"(?<!\\)'([^']*)'", r'"\1"', clean)
-        fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
-        return json.loads(fixed)
-    except Exception as e:
-        log.error(f"[LLM] JSON parse failed: {e} | text[:150]: {(text or '')[:150]!r}")
+def _payload_from_fragment(fragment: str):
+    """json.loads a prepared fragment, or the last research/analysis object in it."""
+    fragment = (fragment or "").strip()
+    if not fragment:
         return None
+    try:
+        loaded = json.loads(fragment)
+    except json.JSONDecodeError:
+        loaded = None
+    else:
+        coerced = _coerce_llm_payload(loaded)
+        if isinstance(coerced, dict):
+            return coerced
+    return _coerce_llm_payload(_prefer_llm_payload(_scan_top_level_json(fragment)))
+
+
+def _parse_json(text: str):
+    """Parse an LLM reply. Clean JSON is unchanged; preambles and fences are stripped first."""
+    if not text:
+        return None
+    parsed = _payload_from_fragment(_prepare_llm_json_text(text))
+    if isinstance(parsed, dict):
+        return parsed
+    repaired = _repair_json_text(_extract_balanced_json(text))
+    try:
+        parsed = _payload_from_fragment(repaired)
+    except Exception as e:
+        log.error("[LLM] JSON parse failed: %s | text[:150]: %r", e, (text or "")[:150])
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    log.error("[LLM] JSON parse failed: text[:150]: %r", (text or "")[:150])
+    return None
 
 
 # ── Status summary ────────────────────────────────────────────────────────────

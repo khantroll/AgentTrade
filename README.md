@@ -131,6 +131,8 @@ Open `dashboard.html` in any browser. The dashboard can load a generated `agent_
 
 `bucket_tags.json` is still the bucket-ownership source. Credentials stay in `config.json` / `.env`. `agent_state.json` is a generated projection. `performance_history.jsonl`, `trade_log.jsonl`, and LLM router JSON files are auxiliary logs, not broker or risk authority.
 
+Publish refuses to replace `agent_state.json` or the public copy when the serialized UTF-8 payload is larger than `AGENT_STATE_MAX_BYTES` (default **8 MiB**). The previous projection files stay in place. This check does not delete or rewrite the SQLite ledger. A multi-gigabyte `agenttrade.sqlite3` that OOMs the host is a separate ops follow-up and is not handled here.
+
 ---
 
 ## Tests

@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 from typing import Optional
 
 import agent_config as cfg
-from account_sync import load_state_file, merge_snapshot_into_state, refresh_alpaca_snapshot
+from account_sync import (
+    atomic_write_text,
+    dumps_dashboard_projection,
+    load_state_file,
+    merge_snapshot_into_state,
+    refresh_alpaca_snapshot,
+)
 from agenttrade import db as ledger
 
 log = logging.getLogger(__name__)
@@ -412,7 +417,15 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
 
 
 def publish_dashboard_state(state: dict) -> None:
-    """Write cache JSON for dashboard (non-authoritative)."""
+    """Write cache JSON for dashboard (non-authoritative).
+
+    Refuses the replace when the serialized payload exceeds
+    AGENT_STATE_MAX_BYTES (default 8 MiB). The previous projection files stay
+    in place. SQLite is not modified.
+    """
+    payload = dumps_dashboard_projection(state)
+    if payload is None:
+        return
     ss = state.get("screener_sources") or {}
     log.info(
         "[Publish] Writing agent_state.json — signal_attributions=%d reddit_trends=%d "
@@ -422,21 +435,8 @@ def publish_dashboard_state(state: dict) -> None:
         list(ss.keys()) if isinstance(ss, dict) else [],
         state.get("pipeline_totals") or {},
     )
-    fd, tmp_path = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.APP_DIR)
+    atomic_write_text(cfg.STATE_FILE, payload)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp_path, cfg.STATE_FILE)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-    try:
-        os.makedirs(cfg.PUBLIC_DASHBOARD_DIR, exist_ok=True)
-        fd, pub_tmp = tempfile.mkstemp(prefix="agent_state_", suffix=".json", dir=cfg.PUBLIC_DASHBOARD_DIR)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(pub_tmp, cfg.PUBLIC_STATE_FILE)
-        os.chmod(cfg.PUBLIC_STATE_FILE, 0o644)
+        atomic_write_text(cfg.PUBLIC_STATE_FILE, payload, chmod=0o644)
     except OSError as e:
         log.warning("[Ledger] Could not publish dashboard cache: %s", e)
