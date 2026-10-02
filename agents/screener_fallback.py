@@ -1,16 +1,39 @@
-"""Screener-ensemble entry path when LLM research fails or returns no picks.
+"""Screener-ensemble entry path when LLM research or analysis cannot decide.
 
 When research fails or returns a valid empty set, candidates are ordered by
 ``signal_strength`` (legacy ``total_score`` when the explicit field is absent).
 Equal strength keeps the screener universe order. BUY/SKIP annotation does not
 call an analysis LLM, so entries are not hard-gated on a provider outage.
+
+When research did return names but every analysis model fails or returns
+unusable JSON, ``deterministic_signal_decision`` still emits BUY or SKIP from
+that same strength. A schema-valid model vote is left alone. Protective sells
+stay on the position-review path, and Tier 2 still sizes any BUY.
 """
 
 import logging
 
 import agent_config as cfg
 from buckets import Bucket
-from signal_attribution import resolve_signal_mix, resolve_signal_strength
+from signal_attribution import (
+    PIPELINE_HIT_SCALE,
+    PIPELINE_WEIGHTS,
+    resolve_signal_mix,
+    resolve_signal_strength,
+)
+
+# A lone momentum hit is weight 1 × 10 = 10 and stays below this bar.
+# One full-rank news hit (weight 2 × 10 = 20) is enough evidence to buy
+# when the analysis models produced no decision.
+ANALYSIS_FALLBACK_MIN_STRENGTH = PIPELINE_WEIGHTS["news_sentiment"] * PIPELINE_HIT_SCALE
+
+_ANALYSIS_ACTIONS = {"BUY", "SELL", "HOLD", "SKIP"}
+_ANALYSIS_FAILURE_PREFIXES = (
+    "All tiered analysis models failed",
+    "All configured LLM providers failed",
+    "All models failed",
+    "No configured/healthy tiered analysis models",
+)
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +141,130 @@ def resolve_entry_candidates(outcome, universe: list, sources: dict, bucket_name
         if rows:
             return rows, "screener"
     return [], "none"
+
+
+def analysis_result_failed(result) -> bool:
+    """True when analysis produced no schema-valid BUY/SELL/HOLD/SKIP.
+
+    A real model SKIP (including tiered ``no_buy_consensus``) is a decision.
+    Provider errors, invalid JSON, and empty parses are not.
+    """
+    if not isinstance(result, dict) or not result:
+        return True
+    if str(result.get("analysis_status") or "").lower() == "failed":
+        return True
+    if str(result.get("tiered_status") or "").lower() == "error":
+        return True
+    if str(result.get("dual_status") or "").lower() == "error":
+        return True
+    action = str(result.get("action") or result.get("decision") or "").upper().strip()
+    if action not in _ANALYSIS_ACTIONS:
+        return True
+    if action == "SKIP":
+        rationale = str(result.get("rationale") or "")
+        if rationale.startswith(_ANALYSIS_FAILURE_PREFIXES):
+            return True
+    return False
+
+
+def deterministic_signal_decision(
+    candidate: dict,
+    bucket: Bucket,
+    market: dict = None,
+    failure=None,
+) -> dict:
+    """BUY or SKIP from screener strength when analysis LLM output is unusable.
+
+    Strength at or above ``ANALYSIS_FALLBACK_MIN_STRENGTH`` with a live price
+    is BUY. Missing or weaker strength is SKIP. No shares are attached; Tier 2
+    sizes an approved BUY. This does not emit a protective SELL.
+    """
+    ticker = str((candidate or {}).get("ticker") or "").upper().strip()
+    attr = {}
+    if isinstance(candidate, dict) and isinstance(candidate.get("signal_attribution"), dict):
+        attr = candidate.get("signal_attribution") or {}
+    strength = resolve_signal_strength(attr)
+    if strength is None:
+        strength = resolve_signal_strength(candidate if isinstance(candidate, dict) else None)
+    mix = resolve_signal_mix(attr) or resolve_signal_mix(candidate if isinstance(candidate, dict) else None)
+
+    if isinstance(market, dict):
+        data = market
+    else:
+        data = _market_snapshot(ticker, bucket) if ticker else {}
+    price = 0.0
+    try:
+        price = float(data.get("current_price") or 0)
+    except (TypeError, ValueError):
+        price = 0.0
+
+    reason = "analysis_failed"
+    if isinstance(failure, dict):
+        reason = str(
+            failure.get("analysis_reason")
+            or failure.get("tiered_status")
+            or failure.get("dual_status")
+            or "analysis_failed"
+        )
+
+    if price <= 0:
+        action = "SKIP"
+        skip_reason = "screener_fallback_no_price"
+        rationale = f"Analysis failed ({reason}); no price for {ticker or 'candidate'}"
+    elif strength is None or float(strength) < ANALYSIS_FALLBACK_MIN_STRENGTH:
+        action = "SKIP"
+        skip_reason = "weak_or_missing_signal"
+        shown = "missing" if strength is None else strength
+        rationale = (
+            f"Analysis failed ({reason}); signal_strength {shown} "
+            f"below {ANALYSIS_FALLBACK_MIN_STRENGTH:g}"
+        )
+    else:
+        action = "BUY"
+        skip_reason = ""
+        rationale = (
+            f"Analysis LLM failed ({reason}); screener signal_strength {strength} supports BUY"
+        )
+
+    entry_source = "screener"
+    if isinstance(candidate, dict):
+        entry_source = candidate.get("entry_source") or candidate.get("source") or "screener"
+    atr = data.get("atr14")
+    if atr in (None, "", 0, 0.0):
+        atr = data.get("atr")
+
+    return {
+        "ticker": ticker,
+        "action": action,
+        "decision": action,
+        "confidence": (candidate or {}).get("confidence") if isinstance(candidate, dict) else None,
+        "rationale": rationale,
+        "reason": (candidate or {}).get("reason") or rationale if isinstance(candidate, dict) else rationale,
+        "source": (candidate or {}).get("source") or entry_source if isinstance(candidate, dict) else entry_source,
+        "candidate_source": (
+            (candidate or {}).get("candidate_source") or entry_source
+            if isinstance(candidate, dict) else entry_source
+        ),
+        "entry_source": entry_source,
+        "analysis_path": "deterministic_signal",
+        "analysis_status": "fallback",
+        "analysis_reason": reason,
+        "tiered_status": (failure or {}).get("tiered_status", "error") if isinstance(failure, dict) else "error",
+        "screener_rank": (candidate or {}).get("screener_rank") if isinstance(candidate, dict) else None,
+        "bucket": bucket.name,
+        "current_price": price or None,
+        "atr_pct": data.get("atr_pct"),
+        "atr": atr,
+        "ohlcv": data.get("ohlcv"),
+        "total_score": strength,
+        "signal_strength": strength,
+        "signal_mix": mix,
+        "signal_components": mix,
+        "reddit_detail": (candidate or {}).get("reddit_detail") if isinstance(candidate, dict) else None,
+        "skip_reason": skip_reason,
+        "blocked_reason": skip_reason,
+        "dual_agree": bool((candidate or {}).get("dual_agree")) if isinstance(candidate, dict) else False,
+    }
 
 
 def _market_snapshot(ticker: str, bucket: Bucket) -> dict:

@@ -496,7 +496,7 @@ def _tiered_aliases(phase: str) -> list[str]:
 
 
 def _tiered_fanout(phase: str) -> int:
-    """Research: stop after this many valid parses. Analysis: participant cap."""
+    """Stop after this many schema-valid parses. Failures do not consume a slot."""
     if phase == "research":
         raw = (
             os.getenv("LLM_TIERED_VALID_PARSES")
@@ -741,40 +741,175 @@ def _tiered_research(prompt: str, agent_tag: str = "research") -> dict:
     return _failed_research(reason, tiered_models_used=[], tiered_failures=failure_kinds)
 
 
+_ANALYSIS_ACTIONS = {"BUY", "SELL", "HOLD", "SKIP"}
+
+# One retry when a model answers but does not produce a decision. HTTP errors
+# are not retried here; the walk moves to the next configured model.
+_STRICT_ANALYSIS_JSON_INSTRUCTION = (
+    "JSON only. No prose and no markdown. "
+    "decision must be one of BUY, SELL, HOLD, or SKIP. Include confidence and rationale."
+)
+
+
+def _strict_analysis_prompt(prompt: str) -> str:
+    return (prompt or "").rstrip() + "\n\n" + _STRICT_ANALYSIS_JSON_INSTRUCTION
+
+
+def _analysis_action(parsed) -> str:
+    if not isinstance(parsed, dict):
+        return ""
+    raw = parsed.get("action")
+    if raw in (None, ""):
+        raw = parsed.get("decision")
+    return str(raw or "").upper().strip()
+
+
+def _analysis_payload_is_valid(parsed) -> bool:
+    """Schema-valid analysis object. Prose, ``{}``, and a research ``selected`` list are not."""
+    return _analysis_action(parsed) in _ANALYSIS_ACTIONS
+
+
+def _normalize_analysis_decision(parsed: dict) -> dict:
+    out = dict(parsed)
+    action = _analysis_action(out)
+    out["action"] = action
+    out["decision"] = action
+    return out
+
+
+def _failed_analysis(reason: str, **extra) -> dict:
+    rationale = extra.pop("rationale", None) or (
+        "All tiered analysis models failed or returned invalid JSON"
+    )
+    out = {
+        "action": "SKIP",
+        "decision": "SKIP",
+        "shares": 0,
+        "rationale": rationale,
+        "tiered_status": "error",
+        "analysis_status": "failed",
+        "analysis_reason": reason,
+    }
+    out.update(extra)
+    return out
+
+
+def _analysis_failure_kind(err: Exception) -> str:
+    if _is_rate_limited_error(err):
+        return "rate_limited"
+    if _is_model_not_found_error(err):
+        return "model_not_found"
+    return "error"
+
+
+def _tiered_analysis_once(provider: str, model: str, prompt: str, agent_tag: str):
+    """Call one model. Returns ``(parsed, error)``. Success is not recorded here."""
+    try:
+        text = _call_provider(
+            provider, model, prompt,
+            max_tokens=_max_tokens_for(provider, "analysis"),
+            agent_tag=agent_tag,
+            mark_success=False,
+        )
+    except Exception as exc:
+        return None, exc
+    return _parse_json(text), None
+
+
+def _accept_analysis_vote(parsed, alias: str, provider: str, decisions: list, successful: list) -> bool:
+    if not _analysis_payload_is_valid(parsed):
+        return False
+    _mark_provider_success(provider)
+    row = _normalize_analysis_decision(parsed)
+    row["tiered_source"] = alias
+    decisions.append(row)
+    successful.append(alias)
+    return True
+
+
 def _tiered_analysis(prompt: str, agent_tag: str = "analysis") -> Optional[dict]:
-    """Proactive tiered analysis: several models decide independently, then voting/aggregation returns one action."""
-    choices = _tiered_choices("analysis", prompt)[:_tiered_fanout("analysis")]
+    """Tiered analysis: walk providers until N schema-valid decisions, then vote.
+
+    HTTP 200 with prose, a fence, an empty object, or JSON that has no
+    BUY/SELL/HOLD/SKIP is not a vote and does not stop the walk. One strict
+    retry is attempted on that same model before the next tier. When nothing
+    valid remains, the result is an analysis failure (``tiered_status=error``),
+    not a model opinion to SKIP.
+    """
+    choices = _tiered_choices("analysis", prompt)
     if not choices:
         log.error("[LLM/TieredAnalysis] No configured/healthy tiered analysis models available.")
-        return {"action": "SKIP", "shares": 0, "rationale": "No configured/healthy tiered analysis models available"}
+        return _failed_analysis(
+            "no_models_available",
+            rationale="No configured/healthy tiered analysis models available",
+            tiered_models_used=[],
+        )
 
+    target = _tiered_fanout("analysis")
     decisions = []
     successful = []
+    failure_kinds = []
     cooled_providers: set[str] = set()
+
     for alias, provider, model in choices:
+        if len(successful) >= target:
+            break
         if provider in cooled_providers:
             log.info("[LLM/TieredAnalysis] Skipping %s — provider %s is backing off.", alias, provider)
             continue
         if _model_is_suppressed(provider, model):
             _log_suppressed_skip(provider, model)
             continue
-        try:
-            text = _call_provider(provider, model, prompt, max_tokens=_max_tokens_for(provider, "analysis"), agent_tag=f"{agent_tag}_{alias}")
-            parsed = _parse_json(text)
-            if not parsed:
-                continue
-            parsed["tiered_source"] = alias
-            decisions.append(parsed)
-            successful.append(alias)
-        except Exception as e:
-            log.warning(f"[LLM/TieredAnalysis] {alias} ({provider}/{model}) failed: {e}")
-            _classify_cooldown(provider, e, model=model)
-            if _is_rate_limited_error(e):
+
+        parsed, err = _tiered_analysis_once(provider, model, prompt, f"{agent_tag}_{alias}")
+        if err is not None:
+            log.warning("[LLM/TieredAnalysis] %s (%s/%s) failed: %s", alias, provider, model, err)
+            _classify_cooldown(provider, err, model=model)
+            kind = _analysis_failure_kind(err)
+            failure_kinds.append(kind)
+            if kind == "rate_limited":
                 cooled_providers.add(provider)
-                log.warning("[LLM/TieredAnalysis] %s returned 429 — backing off %s and trying the next tier.", alias, provider)
+                log.warning(
+                    "[LLM/TieredAnalysis] %s returned 429 — backing off %s and trying the next tier.",
+                    alias, provider,
+                )
+            continue
+
+        if _accept_analysis_vote(parsed, alias, provider, decisions, successful):
+            continue
+
+        log.warning(
+            "[LLM/TieredAnalysis] %s returned an unusable body (prose, fence-only, empty object, or no decision) — one strict JSON retry.",
+            alias,
+        )
+        parsed2, err2 = _tiered_analysis_once(
+            provider, model, _strict_analysis_prompt(prompt), f"{agent_tag}_{alias}_strict",
+        )
+        if err2 is not None:
+            log.warning("[LLM/TieredAnalysis] %s strict retry failed: %s", alias, err2)
+            _classify_cooldown(provider, err2, model=model)
+            kind = _analysis_failure_kind(err2)
+            failure_kinds.append(kind)
+            if kind == "rate_limited":
+                cooled_providers.add(provider)
+            continue
+        if _accept_analysis_vote(parsed2, alias, provider, decisions, successful):
+            continue
+        failure_kinds.append("unusable")
 
     if not decisions:
-        return {"action": "SKIP", "shares": 0, "rationale": "All tiered analysis models failed or returned invalid JSON", "tiered_status": "error"}
+        if failure_kinds and all(kind == "rate_limited" for kind in failure_kinds):
+            reason = "rate_limited"
+        elif failure_kinds and all(kind == "unusable" for kind in failure_kinds):
+            reason = "invalid_parse"
+        elif "model_not_found" in failure_kinds and not any(
+            k in failure_kinds for k in ("error", "rate_limited", "unusable")
+        ):
+            reason = "model_not_found"
+        else:
+            reason = "analysis_failed"
+        log.error("[LLM/TieredAnalysis] Analysis failed (%s). Not recording a SKIP vote.", reason)
+        return _failed_analysis(reason, tiered_models_used=[], tiered_failures=failure_kinds)
 
     buy_decisions = [
         d for d in decisions
@@ -791,6 +926,7 @@ def _tiered_analysis(prompt: str, agent_tag: str = "analysis") -> Optional[dict]
         chosen.pop("shares", None)
         chosen.pop("notional_usd", None)
         chosen.pop("qty", None)
+        chosen["analysis_status"] = "ok"
         chosen["tiered_status"] = "buy_votes"
         chosen["tiered_buy_votes"] = len(buy_decisions)
         chosen["tiered_total_votes"] = len(decisions)
@@ -809,6 +945,7 @@ def _tiered_analysis(prompt: str, agent_tag: str = "analysis") -> Optional[dict]
         "rationale": "Tiered multi-model vote did not meet BUY threshold: " + " | ".join(
             f"{d.get('tiered_source')}: {d.get('action', 'SKIP')} - {d.get('rationale', '')}" for d in decisions
         )[:800],
+        "analysis_status": "ok",
         "tiered_status": "no_buy_consensus",
         "tiered_buy_votes": len(buy_decisions),
         "tiered_total_votes": len(decisions),
@@ -1107,6 +1244,39 @@ def _call_with_fallback(prompt, max_tokens, agent_tag, primary_provider, primary
     log.error(f"[LLM] All fallbacks failed for {agent_tag}")
     return None
 
+def _try_analysis_model(provider: str, model: str, prompt: str, agent_tag: str):
+    """Return a schema-valid decision, or None. Success is recorded only then."""
+    if _model_is_suppressed(provider, model) or not _provider_ready(provider):
+        if _model_is_suppressed(provider, model):
+            _log_suppressed_skip(provider, model)
+        else:
+            log.info("[LLM] Skipping %s/%s — provider is backing off.", provider, model)
+        return None
+    parsed, err = _tiered_analysis_once(provider, model, prompt, agent_tag)
+    if err is not None:
+        log.warning("[LLM] Analysis model %s/%s failed: %s", provider, model, err)
+        _classify_cooldown(provider, err, model=model)
+        return None
+    if _analysis_payload_is_valid(parsed):
+        _mark_provider_success(provider)
+        return _normalize_analysis_decision(parsed)
+    log.warning(
+        "[LLM] %s/%s returned an unusable analysis body — one strict JSON retry.",
+        provider, model,
+    )
+    parsed2, err2 = _tiered_analysis_once(
+        provider, model, _strict_analysis_prompt(prompt), f"{agent_tag}_strict",
+    )
+    if err2 is not None:
+        log.warning("[LLM] %s/%s strict retry failed: %s", provider, model, err2)
+        _classify_cooldown(provider, err2, model=model)
+        return None
+    if _analysis_payload_is_valid(parsed2):
+        _mark_provider_success(provider)
+        return _normalize_analysis_decision(parsed2)
+    return None
+
+
 def query_analysis(prompt: str, agent_tag: str = "analysis") -> Optional[dict]:
     mode = _effective_mode()
     if mode == "budget_exhausted":
@@ -1115,25 +1285,27 @@ def query_analysis(prompt: str, agent_tag: str = "analysis") -> Optional[dict]:
         return _dual_analysis(prompt, agent_tag)
     if _is_proactive_tiered(mode):
         return _tiered_analysis(prompt, agent_tag)
-    picked = _pick_model("analysis", mode)
-    if not picked:
-        raise RuntimeError("No API keys configured for any supported LLM provider.")
-    provider, model = picked
     try:
-        text = _call_provider(provider, model, prompt, max_tokens=_max_tokens_for(provider, "analysis"), agent_tag=agent_tag)
-        return _parse_json(text)
-    except Exception as e:
-        log.warning(f"[LLM] Primary analysis model {provider}/{model} failed: {e}")
-        _classify_cooldown(provider, e, model=model)
-        for fp, fm in _fallback_models("analysis", provider):
-            try:
-                text = _call_provider(fp, fm, prompt, max_tokens=_max_tokens_for(fp, "analysis"), agent_tag=f"{agent_tag}_{fp}_fallback")
-                return _parse_json(text)
-            except Exception as fe:
-                log.warning(f"[LLM] Fallback analysis model {fp}/{fm} failed: {fe}")
-                _classify_cooldown(fp, fe, model=fm)
-        log.error("[LLM] All analysis models failed; returning SKIP instead of crashing cycle.")
-        return {"action": "SKIP", "shares": 0, "rationale": "All configured LLM providers failed or are cooling down"}
+        picked = _pick_model("analysis", mode)
+    except Exception as exc:
+        log.error("[LLM] No analysis model available: %s", exc)
+        return _failed_analysis("no_models_available", rationale="No configured/healthy analysis models available")
+    if not picked:
+        log.error("[LLM] No API keys configured for any supported LLM provider.")
+        return _failed_analysis("no_models_available", rationale="No configured/healthy analysis models available")
+    provider, model = picked
+    accepted = _try_analysis_model(provider, model, prompt, agent_tag)
+    if accepted:
+        return accepted
+    for fp, fm in _fallback_models("analysis", provider):
+        accepted = _try_analysis_model(fp, fm, prompt, f"{agent_tag}_{fp}_fallback")
+        if accepted:
+            return accepted
+    log.error("[LLM] All analysis models failed; this is an analysis failure, not a SKIP vote.")
+    return _failed_analysis(
+        "analysis_failed",
+        rationale="All configured LLM providers failed or are cooling down",
+    )
 
 
 # ── Dual-consult logic ────────────────────────────────────────────────────────
@@ -1201,15 +1373,29 @@ def _dual_research(prompt: str, agent_tag: str) -> dict:
 def _dual_analysis(prompt: str, agent_tag: str) -> dict:
     decisions = {}
     for provider, model in _dual_pair():
+        if _model_is_suppressed(provider, model) or not _provider_ready(provider):
+            if _model_is_suppressed(provider, model):
+                _log_suppressed_skip(provider, model)
+            continue
         try:
-            text = _call_provider(provider, model, prompt, max_tokens=400, agent_tag=f"{agent_tag}_{provider}")
-            parsed = _parse_json(text)
-            if parsed:
-                decisions[provider] = parsed
+            text = _call_provider(
+                provider, model, prompt, max_tokens=400,
+                agent_tag=f"{agent_tag}_{provider}", mark_success=False,
+            )
         except Exception as e:
             log.warning(f"[LLM/DualAnalysis] {provider} failed: {e}")
+            _classify_cooldown(provider, e, model=model)
+            continue
+        parsed = _parse_json(text)
+        if not _analysis_payload_is_valid(parsed):
+            log.warning("[LLM/DualAnalysis] %s returned an unusable body — trying next model.", provider)
+            continue
+        _mark_provider_success(provider)
+        decisions[provider] = _normalize_analysis_decision(parsed)
     if not decisions:
-        return {"action": "SKIP", "shares": 0, "rationale": "All models failed", "dual_status": "error"}
+        failed = _failed_analysis("analysis_failed", rationale="All models failed")
+        failed["dual_status"] = "error"
+        return failed
     if len(decisions) == 1:
         result = dict(list(decisions.values())[0])
         result.pop("shares", None)
@@ -1459,13 +1645,52 @@ def _should_salvage_research(text: str, parsed) -> bool:
     return True
 
 
+_ANALYSIS_ACTION_RE = re.compile(
+    r'"(?:decision|action)"\s*:\s*"(BUY|SELL|HOLD|SKIP)"',
+    re.IGNORECASE,
+)
+
+
+def _salvage_analysis_json(text: str) -> Optional[dict]:
+    """Pull a decision out of truncated analysis JSON. Research tickers are not invented."""
+    raw = text or ""
+    match = _ANALYSIS_ACTION_RE.search(raw)
+    if not match:
+        return None
+    action = match.group(1).upper()
+    out = {
+        "action": action,
+        "decision": action,
+        "json_repaired": True,
+        "rationale": "Recovered from truncated analysis JSON",
+    }
+    confidence = re.search(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)', raw)
+    if confidence:
+        try:
+            out["confidence"] = float(confidence.group(1))
+        except ValueError:
+            pass
+    rationale = re.search(r'"rationale"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)', raw)
+    if rationale and rationale.group(1).strip():
+        out["rationale"] = rationale.group(1)[:500]
+    return out
+
+
+def _should_salvage_analysis(text: str, parsed) -> bool:
+    """Salvage a cut-off decision. A finished analysis or research payload is left alone."""
+    if _analysis_payload_is_valid(parsed) or _parsed_payload_is_usable(parsed):
+        return False
+    return bool(_ANALYSIS_ACTION_RE.search(text or ""))
+
+
 def _parse_json(text: str):
     """Parse an LLM reply. Clean JSON is unchanged; preambles and fences are stripped first.
 
     If loads, balanced extract, and single-quote/trailing-comma repair all fail,
-    `_salvage_research_json` pulls ticker/reason pairs out of the raw text.
-    The same salvage runs when parse succeeds but `selected` is missing or empty
-    and the text still looks like broken research JSON.
+    analysis salvage pulls a BUY/SELL/HOLD/SKIP out of the raw text when one is
+    present, and `_salvage_research_json` pulls ticker/reason pairs otherwise.
+    The same salvage runs when parse succeeds but the object is not a usable
+    research or analysis payload.
     """
     if not text:
         return None
@@ -1479,6 +1704,11 @@ def _parse_json(text: str):
             parsed = None
     if _parsed_payload_is_usable(parsed):
         return parsed
+    if _should_salvage_analysis(text, parsed):
+        salvaged = _salvage_analysis_json(text)
+        if salvaged and _analysis_payload_is_valid(salvaged):
+            log.warning("[LLM] Salvaged analysis decision %s from malformed JSON", salvaged.get("action"))
+            return salvaged
     if _should_salvage_research(text, parsed):
         salvaged = _salvage_research_json(text)
         if salvaged and salvaged.get("selected"):
