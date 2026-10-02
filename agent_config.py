@@ -54,6 +54,21 @@ EMERGENCY_REBALANCE_BUY_LOCK = True
 MIN_CASH_RESERVE = 5000.0
 ALLOW_NEGATIVE_CASH = False
 
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.getenv(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Milestone C. Drawdown pause and invested-capital cap are risk-gate knobs.
+# A value <= 0 disables that guard. Position adds stay off unless explicitly enabled.
+MAX_ACCOUNT_DRAWDOWN_PCT = _env_float("MAX_ACCOUNT_DRAWDOWN_PCT", 0.10)
+MAX_INVESTED_PCT = _env_float("MAX_INVESTED_PCT", 0.90)
+ALLOW_POSITION_ADDS = os.getenv("ALLOW_POSITION_ADDS", "false").lower() in ("1", "true", "yes", "on")
+ALLOW_AVERAGE_DOWN = os.getenv("ALLOW_AVERAGE_DOWN", "false").lower() in ("1", "true", "yes", "on")
+
 bucket_manager = BucketManager()
 
 daily_trades = 0
@@ -92,6 +107,8 @@ def refresh_config() -> None:
     global BUYING_ENABLED, SELLING_ENABLED, ALLOW_SAME_DAY_REBUY
     global POST_SELL_COOLDOWN_HOURS, EMERGENCY_REBALANCE_BUY_LOCK
     global MIN_CASH_RESERVE, ALLOW_NEGATIVE_CASH
+    global MAX_ACCOUNT_DRAWDOWN_PCT, MAX_INVESTED_PCT
+    global ALLOW_POSITION_ADDS, ALLOW_AVERAGE_DOWN
 
     apply_config_to_env()
 
@@ -126,6 +143,16 @@ def refresh_config() -> None:
     except ValueError:
         MIN_CASH_RESERVE = 5000.0
     ALLOW_NEGATIVE_CASH = env_bool("ALLOW_NEGATIVE_CASH", "false")
+    try:
+        MAX_ACCOUNT_DRAWDOWN_PCT = float(os.getenv("MAX_ACCOUNT_DRAWDOWN_PCT", "0.10"))
+    except ValueError:
+        MAX_ACCOUNT_DRAWDOWN_PCT = 0.10
+    try:
+        MAX_INVESTED_PCT = float(os.getenv("MAX_INVESTED_PCT", "0.90"))
+    except ValueError:
+        MAX_INVESTED_PCT = 0.90
+    ALLOW_POSITION_ADDS = env_bool("ALLOW_POSITION_ADDS", "false")
+    ALLOW_AVERAGE_DOWN = env_bool("ALLOW_AVERAGE_DOWN", "false")
     sync_bucket_allocations()
 
 

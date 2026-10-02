@@ -1,9 +1,34 @@
-"""Agent 3: Risk — position sizing and bucket guardrails."""
+"""Agent 3: Risk — position sizing guardrails and cycle-level entry blocks.
+
+Executable share/notional sizing stays in Tier 2 (``agenttrade.risk``). This
+gate decides whether a BUY may be sized at all.
+
+Add rule (paper default): leftover room under the position cap is not
+permission to buy more of a name that is already held.
+
+- Held symbols are global (the whole portfolio plus names already approved
+  earlier in this cycle). A different bucket is ``cross_bucket_duplicate``.
+  An untagged holding is ``already_held``.
+- Same-bucket adds are off unless ``ALLOW_POSITION_ADDS`` is true.
+  Unrealized P&L that is not positive is ``average_down_blocked``.
+  A winner with adds disabled is ``add_not_allowed``.
+- ``ALLOW_AVERAGE_DOWN`` (default false) is the only switch that permits
+  adding to a loser, and only when adds are also enabled.
+- A position at or above 90% of its bucket dollar cap is still
+  ``position_near_max``.
+
+Cash: each approval reserves its quoted notional on the cycle ledger. The
+next approval sees the reduced balance. Drawdown (``MAX_ACCOUNT_DRAWDOWN_PCT``,
+default 0.10) and invested capital (``MAX_INVESTED_PCT``, default 0.90) block
+new buys while the portfolio is already stressed. A value <= 0 disables that
+guard. Protective sells are not decided here.
+"""
 
 import logging
 
 import agent_config as cfg
 from agenttrade import db as ledger
+from agenttrade.risk import CycleRiskState, quote_buy_notional, _is_cash_block
 from buckets import Bucket
 
 log = logging.getLogger(__name__)
@@ -11,6 +36,59 @@ log = logging.getLogger(__name__)
 
 def _is_crypto_bucket(bucket: Bucket) -> bool:
     return getattr(bucket, "asset_class", "us_equity") == "crypto" or bucket.mode == "crypto"
+
+
+def _stamp_buys(decisions: list, reason: str) -> None:
+    for d in decisions or []:
+        action = str(d.get("action") or d.get("decision") or "SKIP").upper()
+        if action == "BUY":
+            d["blocked_reason"] = reason
+
+
+def _unrealized_pl(position: dict) -> float:
+    if not position:
+        return 0.0
+    raw = position.get("unrealized_pl")
+    if raw is None or raw == "":
+        raw = position.get("unrealized_plpc")
+    if raw is None or raw == "":
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _held_block_reason(bucket: Bucket, position: dict, max_pos_dollars: float, owner) -> str:
+    """Block reason for a symbol that is already held, or empty if an add is allowed."""
+    if owner is None:
+        return ""
+    if owner == "":
+        return "already_held"
+    if owner != bucket.name:
+        return "cross_bucket_duplicate"
+    if position is None:
+        return "already_held"
+    pl = _unrealized_pl(position)
+    if not cfg.ALLOW_POSITION_ADDS:
+        if pl <= 0:
+            return "average_down_blocked"
+        return "add_not_allowed"
+    if pl <= 0 and not cfg.ALLOW_AVERAGE_DOWN:
+        return "average_down_blocked"
+    try:
+        market_value = float(position.get("market_value") or 0)
+    except (TypeError, ValueError):
+        market_value = 0.0
+    if max_pos_dollars > 0 and market_value >= max_pos_dollars * 0.90:
+        return "position_near_max"
+    return ""
+
+
+def _base_snapshot(account: dict, account_snapshot: dict) -> dict:
+    if isinstance(account_snapshot, dict):
+        return account_snapshot
+    return {"account": account if isinstance(account, dict) else {}}
 
 
 def risk_agent(
@@ -21,6 +99,7 @@ def risk_agent(
     rebalance_report: dict = None,
     buy_lock: dict = None,
     account_snapshot: dict = None,
+    cycle_state: CycleRiskState = None,
 ) -> list:
     """Five-brake risk gate (bucket guardrails; executable sizing is Tier 2)."""
     log.info("[%s/Risk] %d decisions (aggression=%s)", bucket.name, len(decisions), cfg.STRATEGY_AGGRESSION)
@@ -67,15 +146,39 @@ def risk_agent(
             log.warning("[%s/Risk] Overweight %.1f%% — blocking.", bucket.name, ow * 100)
             return []
 
+    base_snapshot = _base_snapshot(account, account_snapshot)
+    if cycle_state is None:
+        cycle_state = CycleRiskState.from_snapshot(base_snapshot, positions)
+
+    drawdown = cycle_state.drawdown_reason()
+    if drawdown:
+        log.warning("[%s/Risk] %s — blocking new buys.", bucket.name, drawdown)
+        _stamp_buys(decisions, drawdown)
+        return []
+
+    already_invested = cycle_state.long_market_value + cycle_state.confirmed_reserved()
+    invested_block = cycle_state.invested_reason(already_invested)
+    if invested_block:
+        log.warning(
+            "[%s/Risk] max invested (long $%.2f + reserved $%.2f, equity $%.2f) — blocking new buys.",
+            bucket.name,
+            cycle_state.long_market_value,
+            cycle_state.confirmed_reserved(),
+            cycle_state.equity,
+        )
+        _stamp_buys(decisions, invested_block)
+        return []
+
     bucket_positions = cfg.bucket_manager.bucket_positions(bucket, positions)
-    held_tickers = {p["symbol"] for p in bucket_positions}
+    bucket_held = {str(p.get("symbol") or "").upper() for p in bucket_positions}
     max_pos_dollars = cfg.bucket_manager.max_position_dollars(bucket, portfolio_value)
 
     approved = []
     buys_this_cycle = 0
 
     for d in decisions:
-        ticker = d.get("ticker", "")
+        ticker = str(d.get("ticker") or "")
+        ticker_key = ticker.upper()
         action = str(d.get("action") or d.get("decision", "SKIP")).upper()
         price = float(d.get("current_price") or d.get("price") or 0)
         if action != "BUY" or price <= 0:
@@ -85,19 +188,47 @@ def risk_agent(
             d["blocked_reason"] = "max_buys_per_cycle"
             continue
 
-        if ticker in held_tickers:
-            ex = next((p for p in bucket_positions if p["symbol"] == ticker), None)
-            if ex and float(ex.get("market_value", 0)) >= max_pos_dollars * 0.90:
-                d["blocked_reason"] = "position_near_max"
+        owner = cycle_state.holding_bucket(ticker_key)
+        if owner is not None:
+            position = cycle_state.position_for(ticker_key)
+            if position is None:
+                position = next(
+                    (p for p in positions or [] if str(p.get("symbol") or "").upper() == ticker_key),
+                    None,
+                )
+            held_reason = _held_block_reason(bucket, position, max_pos_dollars, owner)
+            if held_reason:
+                d["blocked_reason"] = held_reason
                 continue
 
-        if ticker not in held_tickers and len(bucket_positions) >= bucket.max_positions:
+        if ticker_key not in bucket_held and len(bucket_positions) >= bucket.max_positions:
             d["blocked_reason"] = "bucket_full"
+            continue
+
+        quote_ok, quote_reason, notional = quote_buy_notional(
+            d, cycle_state.snapshot_for(ticker_key, base_snapshot), bucket,
+        )
+        if quote_ok and notional > 0:
+            projected = (
+                cycle_state.long_market_value
+                + cycle_state.reserved_excluding(ticker_key)
+                + notional
+            )
+            invest_reason = cycle_state.invested_reason(projected)
+            if invest_reason:
+                d["blocked_reason"] = invest_reason
+                continue
+            if not cycle_state.commit(ticker_key, notional):
+                d["blocked_reason"] = "insufficient_cash"
+                continue
+        elif cycle_state.reserved_total() > 0.01 and _is_cash_block(quote_reason):
+            d["blocked_reason"] = "insufficient_cash"
             continue
 
         # Stops set by Tier 2 (ATR); bucket defaults applied there as fallback only
         log.info("[%s/Risk] %s: APPROVED for deterministic sizing @ ~$%.2f", bucket.name, ticker, price)
         approved.append(d)
+        cycle_state.note_pending(ticker_key, bucket.name)
         buys_this_cycle += 1
 
     return approved

@@ -432,25 +432,302 @@ def evaluate_proposed_order(
     return True, "", adj
 
 
+def _is_cash_block(reason: str) -> bool:
+    text = (reason or "").lower()
+    return "cash" in text or "buying power" in text or "buying_power" in text
+
+
+def _positive(value: Optional[float]) -> Optional[float]:
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+class CycleRiskState:
+    """Remaining cash and held symbols shared across one trading cycle.
+
+    Approvals reserve deterministic notional against ``remaining_cash``. Later
+    approvals in the same cycle, including other buckets, see that reduced
+    balance and are refused when it cannot fund the order.
+
+    ``ALLOW_MARGIN`` still permits orders beyond cash; the ledger records them
+    but does not refuse for cash. Drawdown and max-invested checks read config
+    at decision time (``MAX_ACCOUNT_DRAWDOWN_PCT``, ``MAX_INVESTED_PCT``).
+    A setting <= 0 turns that guard off.
+    """
+
+    def __init__(
+        self,
+        spendable: float,
+        *,
+        equity: float = 0.0,
+        long_market_value: float = 0.0,
+        high_water: Optional[float] = None,
+        position_symbols: Optional[set] = None,
+        position_buckets: Optional[dict] = None,
+        positions_by_symbol: Optional[dict] = None,
+    ):
+        self.starting_cash = round(float(spendable or 0), 2)
+        self.remaining_cash = self.starting_cash
+        self.equity = float(equity or 0)
+        self.long_market_value = float(long_market_value or 0)
+        self.high_water = high_water
+        self.position_symbols = set(position_symbols or ())
+        self.position_buckets = dict(position_buckets or {})
+        self.positions_by_symbol = dict(positions_by_symbol or {})
+        self.reservations: dict[str, float] = {}
+        self.pending: dict[str, str] = {}
+        self.confirmed: dict[str, str] = {}
+
+    @classmethod
+    def from_snapshot(cls, account_snapshot: Optional[dict], positions: Optional[list] = None) -> "CycleRiskState":
+        snap = account_snapshot if isinstance(account_snapshot, dict) else {}
+        acct = snap.get("account") if isinstance(snap.get("account"), dict) else snap
+        if positions is None:
+            positions = list(snap.get("positions") or [])
+        else:
+            positions = list(positions)
+
+        raw_cash = _float(acct.get("cash"))
+        open_buy = _float(snap.get("open_buy_notional"))
+        if cfg.ALLOW_MARGIN:
+            buying_power = acct.get("buying_power")
+            spendable = _float(buying_power, raw_cash) if buying_power not in (None, "") else raw_cash
+        else:
+            spendable = raw_cash - open_buy
+
+        equity = _float(acct.get("equity") or acct.get("portfolio_value"))
+        if acct.get("long_market_value") not in (None, ""):
+            long_mv = _float(acct.get("long_market_value"))
+        else:
+            long_mv = 0.0
+
+        try:
+            raw_tags = cfg.bucket_manager._load_tags() or {}
+        except Exception:
+            raw_tags = {}
+        tags = {str(k).upper(): v for k, v in raw_tags.items() if k}
+
+        symbols = set()
+        buckets = {}
+        by_symbol = {}
+        summed_mv = 0.0
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+            sym = str(pos.get("symbol") or pos.get("ticker") or "").upper()
+            if not sym:
+                continue
+            symbols.add(sym)
+            by_symbol[sym] = pos
+            summed_mv += _float(pos.get("market_value"))
+            if sym in tags:
+                buckets[sym] = str(tags[sym])
+        if acct.get("long_market_value") in (None, ""):
+            long_mv = summed_mv
+
+        high_water = None
+        if "high_water_equity" in snap:
+            high_water = _positive(_float(snap.get("high_water_equity"), None))
+        elif isinstance(acct, dict) and "high_water_equity" in acct:
+            high_water = _positive(_float(acct.get("high_water_equity"), None))
+        else:
+            try:
+                raw_hw = ledger.get_system_flag("HIGH_WATER_EQUITY")
+            except Exception:
+                raw_hw = None
+            if raw_hw not in (None, ""):
+                high_water = _positive(_float(raw_hw, None))
+
+        return cls(
+            spendable,
+            equity=equity,
+            long_market_value=long_mv,
+            high_water=high_water,
+            position_symbols=symbols,
+            position_buckets=buckets,
+            positions_by_symbol=by_symbol,
+        )
+
+    def reserved_total(self) -> float:
+        return round(sum(self.reservations.values()), 2)
+
+    def reserved_excluding(self, ticker: str) -> float:
+        key = str(ticker or "").upper()
+        return round(sum(v for sym, v in self.reservations.items() if sym != key), 2)
+
+    def confirmed_reserved(self) -> float:
+        return round(sum(v for sym, v in self.reservations.items() if sym in self.confirmed), 2)
+
+    def snapshot_for(self, ticker: str, base: Optional[dict]) -> dict:
+        """Copy of the account snapshot with other reservations removed from cash."""
+        base = base if isinstance(base, dict) else {}
+        snap = dict(base)
+        acct_src = base.get("account") if isinstance(base.get("account"), dict) else base
+        acct = dict(acct_src)
+        acct["cash"] = round(_float(acct.get("cash")) - self.reserved_excluding(ticker), 2)
+        snap["account"] = acct
+        snap["cash"] = acct["cash"]
+        return snap
+
+    def commit(self, ticker: str, notional: float, *, replace: bool = True) -> bool:
+        """Reserve ``notional`` for ticker. ``replace`` updates a prior quote."""
+        key = str(ticker or "").upper()
+        notional = round(float(notional or 0), 2)
+        if not key or notional <= 0:
+            return False
+        prev = round(self.reservations.get(key, 0.0), 2)
+        if replace:
+            new_total = notional
+            delta = round(new_total - prev, 2)
+        else:
+            delta = notional
+            new_total = round(prev + notional, 2)
+        if not cfg.ALLOW_MARGIN and delta > self.remaining_cash + 0.01:
+            return False
+        self.reservations[key] = new_total
+        if not cfg.ALLOW_MARGIN:
+            self.remaining_cash = round(self.remaining_cash - delta, 2)
+        return True
+
+    def release(self, ticker: str) -> None:
+        """Drop a reservation that was not confirmed as an order."""
+        key = str(ticker or "").upper()
+        if not key or key in self.confirmed:
+            return
+        prev = round(self.reservations.pop(key, 0.0), 2)
+        if not cfg.ALLOW_MARGIN:
+            self.remaining_cash = round(self.remaining_cash + prev, 2)
+        self.pending.pop(key, None)
+
+    def note_pending(self, ticker: str, bucket_name: str) -> None:
+        key = str(ticker or "").upper()
+        if not key or key in self.confirmed:
+            return
+        self.pending[key] = bucket_name or ""
+
+    def confirm(self, ticker: str, bucket_name: str, notional: float) -> bool:
+        key = str(ticker or "").upper()
+        if not self.commit(key, notional, replace=key not in self.confirmed):
+            return False
+        self.pending.pop(key, None)
+        self.confirmed[key] = bucket_name or self.confirmed.get(key, "")
+        return True
+
+    def holding_bucket(self, ticker: str) -> Optional[str]:
+        """Bucket that owns the symbol, ``""`` if held but untagged, or None."""
+        key = str(ticker or "").upper()
+        if key in self.position_symbols:
+            return self.position_buckets.get(key, "")
+        if key in self.confirmed:
+            return self.confirmed[key]
+        if key in self.pending:
+            return self.pending[key]
+        return None
+
+    def position_for(self, ticker: str) -> Optional[dict]:
+        return self.positions_by_symbol.get(str(ticker or "").upper())
+
+    def drawdown_reason(self) -> Optional[str]:
+        try:
+            threshold = float(cfg.MAX_ACCOUNT_DRAWDOWN_PCT)
+        except (TypeError, ValueError):
+            threshold = 0.10
+        if threshold <= 0 or not self.high_water or self.high_water <= 0 or self.equity <= 0:
+            return None
+        drawdown = (self.high_water - self.equity) / self.high_water
+        if drawdown >= threshold - 1e-9:
+            return "drawdown_pause"
+        return None
+
+    def invested_reason(self, projected: float) -> Optional[str]:
+        try:
+            cap = float(cfg.MAX_INVESTED_PCT)
+        except (TypeError, ValueError):
+            cap = 0.90
+        if cap <= 0:
+            return None
+        projected = float(projected or 0)
+        if self.equity <= 0:
+            return "max_invested" if projected > 0.01 else None
+        if projected / self.equity >= cap - 1e-9:
+            return "max_invested"
+        return None
+
+
+def quote_buy_notional(decision: dict, account_snapshot: dict, bucket=None) -> tuple[bool, str, float]:
+    """Estimate Tier 2 notional without writing shares onto the caller's decision."""
+    scratch = dict(decision or {})
+    for key in LLM_SIZING_KEYS:
+        scratch.pop(key, None)
+    ok, reason, adj = prepare_buy_order(
+        scratch,
+        account_snapshot,
+        bucket,
+        cycle_run_id=None,
+        is_crypto=_is_crypto_bucket(bucket),
+    )
+    if not ok:
+        return False, reason or "sizing_rejected", 0.0
+    return True, "", _float(adj.get("estimated_notional"))
+
+
 def evaluate_batch(
     decisions: list,
     account_snapshot: dict,
     bucket=None,
     cycle_run_id: Optional[int] = None,
+    cycle_state: Optional[CycleRiskState] = None,
 ) -> list:
-    """Filter approved BUY decisions through Tier 2 deterministic risk."""
+    """Filter approved BUY decisions through Tier 2 deterministic risk.
+
+    Cash reserved by an approval is removed from the balance seen by the next
+    approval. Pass the cycle's ``CycleRiskState`` so later buckets share it.
+    """
+    state = cycle_state or CycleRiskState.from_snapshot(account_snapshot)
     approved = []
+    gate = state.drawdown_reason() or state.invested_reason(
+        state.long_market_value + state.confirmed_reserved()
+    )
+    if gate:
+        for d in decisions or []:
+            if str(d.get("action", "SKIP")).upper() != "BUY":
+                continue
+            d["blocked_reason"] = gate
+            state.release(str(d.get("ticker") or ""))
+        return []
+
+    bucket_name = getattr(bucket, "name", "") if bucket else ""
     for d in decisions:
         if str(d.get("action", "SKIP")).upper() != "BUY":
             continue
-        ok, reason, adj = evaluate_proposed_order(d, account_snapshot, bucket, cycle_run_id)
+        ticker = str(d.get("ticker") or "")
+        snap = state.snapshot_for(ticker, account_snapshot)
+        ok, reason, adj = evaluate_proposed_order(d, snap, bucket, cycle_run_id)
+        if ok:
+            notional = _float(adj.get("estimated_notional"))
+            projected = state.long_market_value + state.reserved_excluding(ticker) + notional
+            block = state.drawdown_reason() or state.invested_reason(projected)
+            if block:
+                ok = False
+                reason = block
+            elif not state.confirm(ticker, bucket_name, notional):
+                ok = False
+                reason = "insufficient_cash"
         if ok:
             approved.append(adj)
         else:
+            if _is_cash_block(reason) and (approved or state.reserved_total() > 0.01):
+                reason = "insufficient_cash"
             log.warning("[RiskManager] Rejected %s: %s", d.get("ticker"), reason)
             d["blocked_reason"] = reason
-            if isinstance(adj, dict) and adj.get("blocked_reason"):
+            if (
+                isinstance(adj, dict)
+                and adj.get("blocked_reason")
+                and reason not in ("insufficient_cash", "drawdown_pause", "max_invested")
+            ):
                 d["blocked_reason"] = adj["blocked_reason"] or reason
+            state.release(ticker)
     return approved
 
 

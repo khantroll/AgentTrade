@@ -165,7 +165,26 @@ LLM research is a narrator and a fallback, not the only way into a trade.
 
 `run_cycle.sh` and `monitor.sh` export `.env` with `set -a` before Python so import-time settings such as `CRYPTO_MAX_ALLOCATION` are visible. `run_cycle.sh` uses `flock -E 75` so a busy lock exits 0 and a failed cycle keeps its own exit code.
 
-Not in this pass: cash-ledger / held-set / no-average-down controls, drawdown or max-invested limits, or ATR / 0.5% equity sizing.
+## Milestone C risk guards
+
+Approvals in one cycle share a cash ledger and a global held set. Tier 2 still sizes the order. These checks only decide whether another buy may be opened.
+
+**Cash.** Each approved buy reserves its deterministic notional. The next approval, including one in a later bucket, sees the reduced cash and is refused with `insufficient_cash` when the remainder cannot fund it. Margin accounts (`ALLOW_MARGIN`) keep the existing cash exception.
+
+**Held names are global.** A symbol already in the portfolio, or approved earlier in the same cycle, is not opened again in another bucket (`cross_bucket_duplicate`). A holding with no bucket tag is `already_held`.
+
+**No implicit average-down.** Room under the position-size cap is not permission to add. The paper default is no automatic adds:
+
+| Situation | Result |
+|---|---|
+| Same bucket, unrealized P&L ≤ 0, `ALLOW_POSITION_ADDS` false (default) | `average_down_blocked` |
+| Same bucket, unrealized P&L > 0, adds disabled | `add_not_allowed` |
+| `ALLOW_POSITION_ADDS=true` and P&L ≤ 0, `ALLOW_AVERAGE_DOWN` false (default) | `average_down_blocked` |
+| Adds enabled, and either P&L > 0 or `ALLOW_AVERAGE_DOWN=true` | add allowed unless market value is at least 90% of the bucket max (`position_near_max`) |
+
+`ALLOW_AVERAGE_DOWN` does nothing while adds are disabled. Both default to false.
+
+**Stress gates.** `MAX_ACCOUNT_DRAWDOWN_PCT` (default `0.10`) blocks new buys with `drawdown_pause` when equity is at least that far below the high-water mark (`high_water_equity` on the cycle snapshot, otherwise the `HIGH_WATER_EQUITY` flag). `MAX_INVESTED_PCT` (default `0.90`) blocks new buys with `max_invested` when long market value plus notionals already reserved this cycle would reach that fraction of equity. Set either value to `0` to turn that risk-gate check off. Protective sells are unchanged. ATR / 0.5% equity sizing is unchanged.
 
 ## Configuration
 

@@ -495,9 +495,6 @@ def test_pre_analysis_skip_reasons_are_machine_readable():
     assert [r["ticker"] for r in analyze] == ["A"]
 
 
-RECOVERED_AGENTS_RISK_SHA256 = "0201340ad66fcbf046457cd9e33a7e63fcf07b37a089b83b0da002d167f15392"
-
-
 def _crypto_bucket() -> Bucket:
     return Bucket(
         name="Crypto",
@@ -526,15 +523,14 @@ def _two_tier(decisions, snapshot, bucket, positions=None, buy_lock=None):
     return tier1, tier2
 
 
-def test_recovered_agents_risk_is_later_4142_byte_source():
+def test_agents_risk_still_defers_executable_sizing_to_tier2():
+    """Milestone C changes the recovered gate. Sizing stays in Tier 2."""
     path = os.path.join(REPO_ROOT, "agents", "risk.py")
-    data = open(path, "rb").read()
-    assert len(data) == 4142
-    assert _hash_file(path) == RECOVERED_AGENTS_RISK_SHA256
-    src = data.decode("utf-8")
+    src = open(path, encoding="utf-8").read()
     assert "executable sizing is Tier 2" in src
     assert "APPROVED for deterministic sizing" in src
-    assert "d[\"shares\"] = shares" not in src
+    assert 'd["shares"] = shares' not in src
+    assert "cycle_state" in src
 
 
 def test_equity_buy_without_shares_survives_tier1_and_is_sized_in_tier2():

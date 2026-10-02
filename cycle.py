@@ -378,6 +378,11 @@ def run_trading_cycle() -> None:
         all_blocked = []
         bucket_research = {}
 
+        # One ledger for every bucket. Approvals reserve cash and held names
+        # so a later bucket cannot overspend or double a name already taken.
+        from agenttrade.risk import CycleRiskState
+        cycle_risk = CycleRiskState.from_snapshot(snapshot, positions)
+
         for bucket in ordered_buckets:
             if not market_open and not is_crypto_bucket(bucket):
                 log.info("[%s] Stock market closed — skipping equity bucket.", bucket.name)
@@ -538,8 +543,12 @@ def run_trading_cycle() -> None:
             approved = risk_agent(
                 decisions, account, positions, bucket, rebalance,
                 buy_lock=buy_lock, account_snapshot=snapshot,
+                cycle_state=cycle_risk,
             )
-            approved = risk_mgr.evaluate_batch(approved, snapshot, bucket, cycle_run_id=_CYCLE_RUN_ID)
+            approved = risk_mgr.evaluate_batch(
+                approved, snapshot, bucket, cycle_run_id=_CYCLE_RUN_ID,
+                cycle_state=cycle_risk,
+            )
             approved_tickers = {d["ticker"] for d in approved}
             bucket_ac = getattr(bucket, "asset_class", "us_equity")
             if is_crypto_bucket(bucket):
