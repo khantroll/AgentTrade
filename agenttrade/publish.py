@@ -113,6 +113,10 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
     persisted_artifacts = sqlite_funnel.get("artifacts") or {}
 
     snapshot = dict(snapshot or {})
+    # Broker list captured before the SQLite fallback. Publishing must not
+    # write those ledger rows back: each row's raw_json used to be nested
+    # inside the next raw_json and the orders table grew without bound.
+    broker_open_orders = list(snapshot.get("open_orders") or [])
     if not snapshot.get("account"):
         acct_from_ledger = ledger.account_row_as_snapshot(ledger_data.get("account_snapshot"))
         if acct_from_ledger:
@@ -168,19 +172,18 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
     state["open_positions"] = ledger_data.get("positions") or snapshot.get("positions") or []
 
     # ── Sync Alpaca open orders into SQLite ──────────────────────────────────
-    # Pull broker-side open orders from the snapshot (already fetched by
-    # refresh_alpaca_snapshot) and upsert them into the local orders table so
-    # protective stop orders are always visible in the ledger.
-    _alpaca_open_orders = snapshot.get("open_orders") or []
-    if _alpaca_open_orders and _alpaca_ok:
+    # Only the broker payload from this fetch. Ledger rows loaded as a
+    # fallback already live in SQLite; writing them again nested raw_json.
+    if broker_open_orders and _alpaca_ok:
         try:
-            ledger.sync_open_orders_from_alpaca(_alpaca_open_orders)
+            ledger.sync_open_orders_from_alpaca(broker_open_orders)
         except Exception as _oo_err:
             log.debug("[Publish] sync_open_orders_from_alpaca: %s", _oo_err)
 
     # Merge broker-side stops with durable SQLite manual overrides.
     # Manual operator-set stops win over broker-derived values for display.
-    _broker_stops = ledger.extract_stop_prices_from_orders(_alpaca_open_orders)
+    _stop_source = broker_open_orders or snapshot.get("open_orders") or []
+    _broker_stops = ledger.extract_stop_prices_from_orders(_stop_source)
     _manual_stops = ledger.get_manual_stop_prices()
     state["stop_prices"] = {**_broker_stops, **_manual_stops}
 
@@ -431,9 +434,11 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
 def publish_dashboard_state(state: dict) -> None:
     """Write cache JSON for dashboard (non-authoritative).
 
-    Refuses the replace when the serialized payload exceeds
-    AGENT_STATE_MAX_BYTES (default 8 MiB). The previous projection files stay
-    in place. SQLite is not modified.
+    Prunes bulky screener and LLM bodies first, then refuses the replace only
+    if the pruned payload still exceeds AGENT_STATE_MAX_BYTES (default 8 MiB).
+    The previous projection files stay in place on a refusal. SQLite is not
+    modified by this function, and a refusal does not roll back rows the
+    cycle already committed.
     """
     payload = dumps_dashboard_projection(state)
     if payload is None:

@@ -4,15 +4,72 @@ import logging
 from datetime import datetime
 
 import agent_config as cfg
-from alpaca_client import AlpacaAPIError, alpaca_post, get_account, get_open_orders, has_pending_sell_order
+from alpaca_client import (
+    AlpacaAPIError,
+    alpaca_delete,
+    alpaca_post,
+    get_account,
+    get_open_orders,
+    has_pending_sell_order,
+)
 from buckets import Bucket
 from buy_lock import is_buy_locked
 from buy_guard import check_buy_allowed
 from agenttrade.buy_guard import enforce_no_margin_order_guard, record_order_rejection
 from market_data import is_crypto_bucket
-from order_utils import format_qty_for_asset
+from order_utils import (
+    build_equity_buy_payload,
+    format_qty_for_asset,
+    plan_equity_buy_vs_open_orders,
+)
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_equity_open_order_plan(ticker: str, snapshot: dict) -> dict:
+    """Cancel resting same-symbol buys. Do not cancel protective sells."""
+    orders = []
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("open_orders"), list):
+        orders = snapshot["open_orders"]
+    plan = plan_equity_buy_vs_open_orders(ticker, orders)
+    if plan["action"] != "cancel_then_submit":
+        return plan
+    cancelled = []
+    for oid in plan["cancel_ids"]:
+        try:
+            alpaca_delete(f"/v2/orders/{oid}")
+            log.info("[Execution] Canceled resting buy %s for %s before replace", oid, ticker)
+            cancelled.append(oid)
+        except AlpacaAPIError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                cancelled.append(oid)
+                continue
+            log.error("[Execution] Could not cancel open buy %s for %s: %s", oid, ticker, exc)
+            return {
+                "action": "skip",
+                "reason": "open_buy_cancel_failed",
+                "cancel_ids": plan["cancel_ids"],
+                "include_bracket": False,
+            }
+        except Exception as exc:
+            log.error("[Execution] Could not cancel open buy %s for %s: %s", oid, ticker, exc)
+            return {
+                "action": "skip",
+                "reason": "open_buy_cancel_failed",
+                "cancel_ids": plan["cancel_ids"],
+                "include_bracket": False,
+            }
+    if isinstance(snapshot, dict) and cancelled:
+        snapshot["open_orders"] = [
+            order for order in orders
+            if str((order or {}).get("id") or (order or {}).get("order_id") or "") not in set(cancelled)
+        ]
+    return plan
+
+
+def _broker_payload(payload: dict) -> dict:
+    """Drop local bookkeeping keys before the Alpaca POST."""
+    return {key: value for key, value in payload.items() if not str(key).startswith("_")}
 
 
 def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
@@ -191,7 +248,20 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                 })
                 continue
             else:
-                payload["qty"] = str(shares)
+                try:
+                    payload["qty"] = format_qty_for_asset(shares, ticker)
+                except ValueError as ve:
+                    log.warning("[%s/Execution] %s: %s", bucket.name, ticker, ve)
+                    results.append({
+                        "ticker": ticker,
+                        "shares": shares,
+                        "bucket": bucket.name,
+                        "status": "blocked",
+                        "blocked_reason": "invalid_qty",
+                        "reason": "invalid_qty",
+                        "error": str(ve),
+                    })
+                    continue
 
             order_notional = float(notional or 0) if is_crypto else float(shares or 0) * float(_p or d.get("current_price") or 0)
             ac = "crypto" if is_crypto else "us_equity"
@@ -245,27 +315,68 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                 })
                 continue
 
-            # For stocks with stop/take-profit: use bracket order (single submission)
-            # This replaces the two-step buy + OCO with one atomic bracket order
-            _sl = d.get("stop_loss_price")
-            _tp = d.get("take_profit_price")
-            if not is_crypto and _sl and _tp and shares and _p:
-                # Rebuild payload as bracket order — combines buy + OCO in one API call
-                payload = {
-                    "symbol":        ticker,
-                    "qty":           str(shares),
-                    "side":          "buy",
-                    "type":          "market" if (_atr_pct > 3.0 or _near or not _p) else "limit",
-                    "time_in_force": "day",
-                    "order_class":   "bracket",
-                    "stop_loss":     {"stop_price": str(_sl)},
-                    "take_profit":   {"limit_price": str(_tp)},
-                }
-                if payload["type"] == "limit":
-                    payload["limit_price"] = str(round(_p + max(_p * (_atr_pct / 100) * 0.5, 0.01), 2))
-                _ot = f"bracket({'limit' if payload['type']=='limit' else 'market'} SL=${_sl} TP=${_tp})"
+            # Equity buys: whole-share qty, stop below the market, take-profit above it.
+            # A resting unfilled buy is canceled first so this submit is a replace.
+            if not is_crypto and shares:
+                plan = _resolve_equity_open_order_plan(ticker, snapshot if isinstance(snapshot, dict) else {})
+                if plan.get("action") == "skip":
+                    reason = plan.get("reason") or "open_buy_conflict"
+                    log.warning("[%s/Execution] %s: %s — not submitting", bucket.name, ticker, reason)
+                    results.append({
+                        "ticker": ticker,
+                        "shares": shares,
+                        "bucket": bucket.name,
+                        "status": "blocked",
+                        "blocked_reason": reason,
+                        "reason": reason,
+                    })
+                    continue
+                use_market = _atr_pct > 3.0 or _near or not _p
+                limit_price = None
+                if not use_market:
+                    limit_price = round(_p + max(_p * (_atr_pct / 100) * 0.5, 0.01), 2)
+                try:
+                    payload = build_equity_buy_payload(
+                        ticker,
+                        shares,
+                        order_type="market" if use_market else "limit",
+                        limit_price=limit_price,
+                        stop_price=d.get("stop_loss_price"),
+                        take_profit_price=d.get("take_profit_price"),
+                        current_price=_p or None,
+                        include_bracket=bool(plan.get("include_bracket", True)),
+                    )
+                except ValueError as ve:
+                    log.warning("[%s/Execution] %s: %s", bucket.name, ticker, ve)
+                    results.append({
+                        "ticker": ticker,
+                        "shares": shares,
+                        "bucket": bucket.name,
+                        "status": "blocked",
+                        "blocked_reason": "invalid_qty",
+                        "reason": "invalid_qty",
+                        "error": str(ve),
+                    })
+                    continue
+                if payload.get("order_class") == "bracket":
+                    _sl = (payload.get("stop_loss") or {}).get("stop_price")
+                    _tp = (payload.get("take_profit") or {}).get("limit_price")
+                    _ot = f"bracket({payload['type']} SL=${_sl} TP=${_tp})"
+                    if payload.get("_stop_adjusted") or payload.get("_take_profit_adjusted"):
+                        log.info(
+                            "[Execution] %s bracket prices moved onto the correct side of the entry "
+                            "(stop=%s take_profit=%s)",
+                            ticker,
+                            _sl,
+                            _tp,
+                        )
+                elif not plan.get("include_bracket", True):
+                    log.info(
+                        "[Execution] %s entry without bracket — open sell already rests on the symbol",
+                        ticker,
+                    )
 
-            order = alpaca_post("/v2/orders", payload)
+            order = alpaca_post("/v2/orders", _broker_payload(payload))
             log.info(
                 "[%s/Execution] ✅ %s %s %s | ID: %s",
                 bucket.name,

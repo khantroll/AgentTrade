@@ -14,6 +14,39 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 4
 
+
+def _json_for_store(value: Any) -> str:
+    """Persist a slim JSON body so later dashboard reloads stay under the cap."""
+    from agenttrade.state_size import slim_persisted_json
+
+    return json.dumps(slim_persisted_json(value))
+
+
+def _json_from_store(raw: Optional[str]) -> Any:
+    """Parse stored JSON and drop bulky nested bodies from older rows."""
+    from agenttrade.state_size import slim_persisted_json
+
+    try:
+        parsed = json.loads(raw if raw else "null")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return slim_persisted_json(parsed)
+
+
+def _order_raw_for_store(order: Any) -> str:
+    """Persist a KB-scale order body. Drops nested state and prior raw_json."""
+    from agenttrade.state_size import order_raw_json
+
+    return order_raw_json(order)
+
+
+# Columns safe to load into a cycle. raw_json is omitted: historical rows are
+# multi-megabyte and must not be rehydrated into dashboard or cycle memory.
+_ORDER_LOAD_COLUMNS = (
+    "id, cycle_run_id, alpaca_order_id, submitted_at, symbol, side, qty, notional, "
+    "order_type, time_in_force, limit_price, stop_price, status, strategy_name"
+)
+
 _DB_INITIALIZED = False
 
 SCHEMA_SQL = """
@@ -720,7 +753,7 @@ def insert_orders(cycle_run_id: int, open_orders: list, source: str = "alpaca") 
                         _f(o.get("stop_price")),
                         o.get("status"),
                         o.get("strategy_name"),
-                        json.dumps(o),
+                        _order_raw_for_store(o),
                     ),
                 )
                 count += 1
@@ -753,7 +786,7 @@ def record_submitted_order(cycle_run_id: int, order: dict, strategy_name: str = 
                 _f(order.get("stop_price")),
                 order.get("status", "placed"),
                 strategy_name or order.get("strategy_name", ""),
-                json.dumps(order),
+                _order_raw_for_store(order),
             ),
         )
 
@@ -808,7 +841,7 @@ def insert_strategy_signal(cycle_run_id: int, row: dict) -> None:
                 row.get("confidence"),
                 row.get("score"),
                 row.get("reason") or row.get("rationale"),
-                json.dumps(row),
+                _json_for_store(row),
             ),
         )
 
@@ -830,7 +863,7 @@ def insert_sentiment_score(cycle_run_id: int, row: dict) -> None:
                 row.get("score"),
                 row.get("confidence"),
                 row.get("summary"),
-                json.dumps(row),
+                _json_for_store(row),
             ),
         )
 
@@ -900,7 +933,8 @@ def get_latest_open_orders() -> list:
     with get_connection() as conn:
         rows = conn.execute(
             f"""
-            SELECT * FROM orders
+            SELECT {_ORDER_LOAD_COLUMNS}
+            FROM orders
             WHERE LOWER(COALESCE(status, '')) IN ({placeholders})
             ORDER BY id DESC
             """,
@@ -969,7 +1003,7 @@ def sync_open_orders_from_alpaca(open_orders: list) -> dict:
                         _f(o.get("stop_price")),
                         o.get("status"),
                         o.get("strategy_name"),
-                        json.dumps(o),
+                        _order_raw_for_store(o),
                     ),
                 )
                 upserted += 1
@@ -978,6 +1012,76 @@ def sync_open_orders_from_alpaca(open_orders: list) -> dict:
                 skipped += 1
 
     return {"upserted": upserted, "skipped": skipped}
+
+
+def prune_orders_raw_json() -> dict:
+    """Rewrite every ``orders.raw_json`` to the slim form. Rows are kept.
+
+    Reads one blob at a time so a multi-gigabyte table is not loaded at once.
+    The file size does not shrink until ``VACUUM INTO`` (see
+    ``python -m agenttrade.prune_orders``).
+    """
+    _ensure_db()
+    updated = 0
+    bytes_before = 0
+    bytes_after = 0
+    with get_connection() as conn:
+        ids = [int(row[0]) for row in conn.execute("SELECT id FROM orders ORDER BY id")]
+        for oid in ids:
+            row = conn.execute("SELECT raw_json FROM orders WHERE id=?", (oid,)).fetchone()
+            raw = row["raw_json"] if row and row["raw_json"] else ""
+            slim = _order_raw_for_store(raw)
+            conn.execute("UPDATE orders SET raw_json=? WHERE id=?", (slim, oid))
+            updated += 1
+            bytes_before += len(raw)
+            bytes_after += len(slim)
+    return {
+        "rows": updated,
+        "bytes_before": bytes_before,
+        "bytes_after": bytes_after,
+    }
+
+
+def reclaim_running_cycles(
+    cycle_run_id: Optional[int] = None,
+    *,
+    older_than_minutes: int = 30,
+    notes: str = "",
+) -> list:
+    """Mark stuck ``cycle_runs.status='running'`` rows interrupted.
+
+    Does not delete the cycle or any ledger history. Pass ``cycle_run_id`` to
+    reclaim one row regardless of age (the OOM-killed cycle 2313 case). With
+    no id, only rows started more than ``older_than_minutes`` ago are updated.
+    """
+    _ensure_db()
+    message = notes or "reclaimed stale running cycle (process exited before finish)"
+    finished = utc_now()
+    with get_connection() as conn:
+        if cycle_run_id is not None:
+            rows = conn.execute(
+                "SELECT id, started_at, status FROM cycle_runs WHERE id=? AND status='running'",
+                (int(cycle_run_id),),
+            ).fetchall()
+        else:
+            from datetime import timedelta
+
+            cutoff = (datetime.now(timezone.utc) - timedelta(minutes=int(older_than_minutes))).replace(microsecond=0).isoformat()
+            rows = conn.execute(
+                """
+                SELECT id, started_at, status FROM cycle_runs
+                WHERE status='running' AND started_at < ?
+                """,
+                (cutoff,),
+            ).fetchall()
+        reclaimed = []
+        for row in rows:
+            conn.execute(
+                "UPDATE cycle_runs SET finished_at=?, status=?, notes=? WHERE id=? AND status='running'",
+                (finished, "interrupted", message, int(row["id"])),
+            )
+            reclaimed.append({"id": int(row["id"]), "started_at": row["started_at"], "status": "interrupted"})
+    return reclaimed
 
 
 def extract_stop_prices_from_orders(open_orders: list) -> dict:
@@ -1129,7 +1233,7 @@ def insert_signal_attribution(cycle_run_id: int, row: dict) -> int:
                 _f(row.get("total_score")),
                 json.dumps(row.get("components") or {}),
                 json.dumps(row.get("pipelines") or {}),
-                json.dumps(row),
+                _json_for_store(row),
             ),
         )
         return int(cur.lastrowid)
@@ -1211,7 +1315,7 @@ def insert_signal_snapshot(cycle_run_id: int, row: dict) -> int:
                 _f(row.get("total_score")),
                 json.dumps(row.get("components") or {}),
                 json.dumps(row.get("explainability") or {}),
-                json.dumps(row),
+                _json_for_store(row),
             ),
         )
         return int(cur.lastrowid)
@@ -1571,7 +1675,7 @@ def insert_funnel_event(
             (
                 cycle_run_id, utc_now(), str(stage).upper(),
                 sym, bkt,
-                status or "", reason or "", json.dumps(payload or {}),
+                status or "", reason or "", _json_for_store(payload or {}),
             ),
         )
         return int(cur.lastrowid or 0)
@@ -1612,7 +1716,7 @@ def upsert_cycle_artifact(cycle_run_id: int, artifact_key: str, payload: Any) ->
             ON CONFLICT(cycle_run_id, artifact_key) DO UPDATE SET
                 created_at=excluded.created_at, payload_json=excluded.payload_json
             """,
-            (cycle_run_id, utc_now(), artifact_key, json.dumps(payload)),
+            (cycle_run_id, utc_now(), artifact_key, _json_for_store(payload)),
         )
 
 
@@ -1625,10 +1729,8 @@ def get_cycle_artifacts(cycle_run_id: int) -> dict:
         ).fetchall()
     out = {}
     for row in rows:
-        try:
-            out[row["artifact_key"]] = json.loads(row["payload_json"] or "null")
-        except (TypeError, json.JSONDecodeError):
-            out[row["artifact_key"]] = None
+        parsed = _json_from_store(row["payload_json"])
+        out[row["artifact_key"]] = parsed
     return out
 
 
@@ -1650,12 +1752,9 @@ def get_cycle_funnel(cycle_run_id: int) -> dict:
     }
     for row in rows:
         d = dict(row)
-        try:
-            payload = json.loads(d.get("raw_json") or "{}")
-        except json.JSONDecodeError:
-            payload = {}
+        payload = _json_from_store(d.get("raw_json"))
         if not isinstance(payload, dict):
-            payload = {"value": payload}
+            payload = {} if payload is None else {"value": payload}
         payload.setdefault("ticker", d.get("symbol"))
         payload.setdefault("bucket", d.get("bucket") or None)
         if d.get("status") and not payload.get("status"):
