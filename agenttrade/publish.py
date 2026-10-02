@@ -47,11 +47,16 @@ def _funnel_signal_attributions(cached: dict) -> list:
             if sym_u in seen or not isinstance(row, dict):
                 continue
             seen.add(sym_u)
+            from signal_attribution import attribution_view
+
+            view = attribution_view(row)
             rows.append({
                 "symbol": sym_u,
-                "total_score": row.get("total_score"),
-                "components": row.get("components"),
-                "pipelines": row.get("pipelines"),
+                "signal_strength": view.get("signal_strength"),
+                "signal_mix": view.get("signal_mix"),
+                "total_score": view.get("total_score"),
+                "components": view.get("components"),
+                "pipelines": view.get("pipelines") or row.get("pipelines"),
                 "bucket": bucket,
                 "source": "screener_funnel",
             })
@@ -370,14 +375,14 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
     for row in state["signal_attributions"]:
         sym = row.get("symbol")
         if sym and sym not in attr_by_sym:
-            try:
-                import json as _json
-                comps = row.get("components") or _json.loads(row.get("components_json") or "{}")
-            except Exception:
-                comps = {}
+            from signal_attribution import attribution_view
+
+            view = attribution_view(row)
             attr_by_sym[sym] = {
-                "total_score": row.get("total_score"),
-                "components": comps,
+                "signal_strength": view.get("signal_strength"),
+                "signal_mix": view.get("signal_mix"),
+                "total_score": view.get("total_score"),
+                "components": view.get("components") or {},
             }
     state["position_signal_breakdown"] = attr_by_sym
 

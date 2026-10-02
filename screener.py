@@ -849,6 +849,9 @@ def _build_universe(
     merge(movers,   2.0, "Alpaca Movers")
     merge(news,     2.0, "News Sentiment")
     merge(congress, 3.0, "Congress Trades")
+    # Ensemble weight stays 2.5. Attribution raw points for this pipeline are
+    # additionally capped (signal_attribution.REDDIT_RAW_CAP) so quality
+    # bonuses cannot outrun congress/news/movers/momentum before the mix split.
     merge(reddit,   2.5, "Reddit VADER")
     tradingview = tradingview_screen(pool, top_n=25)
     for i, raw_t in enumerate(tradingview):
@@ -864,16 +867,18 @@ def _build_universe(
             if t in scored:
                 scored[t] *= 1.5   # 50% boost for confirmed dividend quality
 
-    ranked   = sorted(scored.items(), key=lambda x: x[1], reverse=True)
-    universe = [t for t, _ in ranked[:max_universe]]
-
-    from signal_attribution import build_universe_attributions
-    attribution = build_universe_attributions(
-        universe,
+    # Rank by attribution strength (capped raw magnitude), not by a mix that
+    # always sums to 100. The ensemble merge score, including the dividend
+    # quality boost, is the tie-break.
+    from signal_attribution import build_universe_attributions, rank_symbols_by_strength
+    attribution_all = build_universe_attributions(
+        list(scored.keys()),
         pipeline_membership,
         reddit_intelligence=reddit_intelligence,
         tv_ratings=tv_ratings,
     )
+    universe = rank_symbols_by_strength(scored, attribution_all, max_universe)
+    attribution = {sym: attribution_all[sym] for sym in universe if sym in attribution_all}
 
     sources = {
         "momentum": len(momentum),

@@ -13,7 +13,7 @@ def record_candidates(cycle_run_id: int, candidates: list, strategy_name: str = 
             "symbol": c.get("ticker"),
             "signal": "CANDIDATE",
             "confidence": c.get("calibrated_confidence") or c.get("confidence"),
-            "score": c.get("total_score") or c.get("score"),
+            "score": c.get("signal_strength") if c.get("signal_strength") is not None else (c.get("total_score") or c.get("score")),
             "reason": c.get("rationale") or c.get("reason"),
             **c,
         })
@@ -26,7 +26,7 @@ def record_decisions(cycle_run_id: int, decisions: list, strategy_name: str = "a
             "symbol": d.get("ticker"),
             "signal": str(d.get("action", "SKIP")).upper(),
             "confidence": d.get("calibrated_confidence") or d.get("confidence"),
-            "score": d.get("total_score") or d.get("score"),
+            "score": d.get("signal_strength") if d.get("signal_strength") is not None else (d.get("total_score") or d.get("score")),
             "reason": d.get("rationale"),
             **d,
         })
@@ -104,9 +104,19 @@ def attach_attribution_to_candidates(candidates: list, attribution_map: dict) ->
     for c in candidates or []:
         sym = str(c.get("ticker") or "").upper()
         attr = attribution_map.get(sym) or {}
+        from signal_attribution import resolve_signal_mix, resolve_signal_strength
+
         merged = dict(c)
-        merged["total_score"] = attr.get("total_score")
-        merged["signal_components"] = attr.get("components")
-        merged["signal_attribution"] = attr
+        strength = resolve_signal_strength(attr)
+        mix = resolve_signal_mix(attr)
+        if strength is None:
+            strength = resolve_signal_strength(merged)
+        if not mix:
+            mix = resolve_signal_mix(merged)
+        merged["signal_strength"] = strength
+        merged["signal_mix"] = mix
+        merged["total_score"] = strength
+        merged["signal_components"] = mix
+        merged["signal_attribution"] = attr or merged.get("signal_attribution")
         out.append(merged)
     return out

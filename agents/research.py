@@ -16,6 +16,7 @@ from market_data import (
     fetch_stock_data,
     is_crypto_bucket,
 )
+from signal_attribution import build_screener_evidence
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class ResearchOutcome:
     reason: str = ""
 
 
-def research_agent(tickers: list, bucket: Bucket) -> ResearchOutcome:
+def research_agent(tickers: list, bucket: Bucket, sources: dict = None) -> ResearchOutcome:
     log.info("[%s/Research] Screening %d tickers (mode=%s)...", bucket.name, len(tickers), active_mode())
 
     if budget_exhausted():
@@ -64,12 +65,21 @@ def research_agent(tickers: list, bucket: Bucket) -> ResearchOutcome:
         asset_label = "stocks"
         analyst_role = "stock research analyst"
 
+    evidence = build_screener_evidence(tickers, sources)
+    evidence_block = ""
+    if evidence:
+        evidence_block = f"""
+Screener ensemble evidence from this same universe (narrate and refine against these facts; do not invent pipeline hits, ranks, signal_strength, or signal_mix):
+signal_strength is conviction magnitude and is not scaled to 100. signal_mix is relative composition and sums to about 100. screener_rank 1 is the ensemble order passed in.
+{json.dumps(evidence, separators=(",", ":"))}
+"""
+
     prompt = f"""You are a {analyst_role}. Today is {datetime.now().strftime('%Y-%m-%d')}.
 Bucket: {bucket.name} ({bucket.mode}) — {strategy_note}
 
 Market data for {len(market_data)} {asset_label}:
 {json.dumps(compact_market_data_rows(market_data), separators=(",", ":"))}
-
+{evidence_block}
 Select the TOP {cfg.RESEARCH_TOP_N} most promising {asset_label} for this bucket strategy.
 Respond ONLY with valid JSON — no other text:
 {{

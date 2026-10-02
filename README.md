@@ -153,15 +153,19 @@ See `V3_RECOVERY_NOTES.md` for provenance, remaining fallbacks, and the changed-
 
 LLM research is a narrator and a fallback, not the only way into a trade.
 
-- A schema-valid research object with picks (`research_status=ok`) is still used, with screener attribution attached as evidence.
-- If research **fails** (provider error, 429, parse failure, budget exhaustion, model-not-found, no healthy model) or returns a **valid empty** set, and the screener already built a universe, entries come from that universe order (`source=screener`). Analysis for those names is deterministic; risk and execution gates are unchanged.
+- A schema-valid research object with picks (`research_status=ok`) is still used. The research prompt for that call includes the screener evidence from the same universe (ranks, pipeline hits, `signal_strength`, `signal_mix`).
+- If research **fails** (provider error, 429, parse failure, budget exhaustion, model-not-found, no healthy model) or returns a **valid empty** set, and the screener already built a universe, entries come from that universe (`source=screener`) ordered by `signal_strength`. Analysis for those names is deterministic; risk and execution gates are unchanged.
 - `failed` and `empty` stay distinct on `research_status` in the cycle log, SQLite artifact, and dashboard. An empty candidate table is not how a broken research gate is reported.
 - Protective exits (position review and hard rebalance) run even when the token budget blocks LLM calls.
 - Tiered research keeps walking the provider list until `LLM_TIERED_FANOUT` (or `LLM_TIERED_VALID_PARSES`) valid JSON parses, or the list is exhausted. HTTP 200 with prose, a code fence, or `{}` is not success. A 429 backs the provider off (`LLM_RATE_LIMIT_COOLDOWN_MINUTES`, default 120) and tries the next tier. Model-not-found / HTTP 404 suppresses that model for `LLM_MODEL_NOT_FOUND_SUPPRESS_HOURS` (default 24).
 - Repo Groq defaults are `GROQ_QWEN_MODEL=qwen/qwen3.8-27b` and `GROQ_LLAMA_MODEL=openai/gpt-oss-120b`. `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` 404 on the current host.
 - Built-in bucket defaults are Growth 45% / Dividend 25% / Swing 20% / Crypto 10% (`CRYPTO_MAX_ALLOCATION`, default `0.10`). Override with `GROWTH_ALLOCATION`, `DIVIDEND_ALLOCATION`, `SWING_ALLOCATION`, and `CRYPTO_MAX_ALLOCATION`. A recommended tiered list is in `config.example.json` (`groq_qwen,gemini_flash,mistral_small` for research).
 
-Not in this pass: signal strength vs mix, cash-ledger / held-set / average-down controls, or ATR sizing changes.
+`signal_strength` is the capped raw conviction (a one-pipeline name stays weak). `signal_mix` is the relative composition and can sum to 100. `total_score` is the strength alias and `components` is the mix alias, so older readers follow the split. Reddit raw points are capped at one full-rank Congress hit (`REDDIT_RAW_CAP`, weight 3 × 10 = 30) before that mix is computed, which keeps Reddit below the combined congress + news + movers + momentum ceiling (80).
+
+`run_cycle.sh` and `monitor.sh` export `.env` with `set -a` before Python so import-time settings such as `CRYPTO_MAX_ALLOCATION` are visible. `run_cycle.sh` uses `flock -E 75` so a busy lock exits 0 and a failed cycle keeps its own exit code.
+
+Not in this pass: cash-ledger / held-set / no-average-down controls, drawdown or max-invested limits, or ATR / 0.5% equity sizing.
 
 ## Configuration
 
@@ -197,6 +201,8 @@ Momentum score ×1.0  ← technical foundation
 ```
 
 If NVDA appears in all four pipelines it scores ~8× higher than a stock only in the momentum screen. Tickers appearing in multiple pipelines are the agent's highest-conviction candidates.
+
+Reddit's ensemble weight is 2.5, between news and Congress. A separate raw-point cap (`REDDIT_RAW_CAP` in `signal_attribution.py`) stops Reddit quality, sentiment, and mention bonuses from exceeding a full-rank Congress hit (30 points) before composition is normalized. That cap is what keeps one noisy Reddit run from drowning congress, news, movers, and momentum.
 
 ---
 
