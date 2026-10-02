@@ -154,12 +154,13 @@ def _patch_tiered_research(monkeypatch, replies):
     def fake_choices(phase, prompt):
         return [("gemini_flash", "gemini", "gemini-test")]
 
-    def fake_call(provider, model, prompt, max_tokens=600, agent_tag=""):
-        calls.append({"prompt": prompt, "agent_tag": agent_tag})
+    def fake_call(provider, model, prompt, max_tokens=600, agent_tag="", mark_success=True):
+        calls.append({"prompt": prompt, "agent_tag": agent_tag, "mark_success": mark_success})
         return replies[len(calls) - 1]
 
     monkeypatch.setattr(llm_router, "_tiered_choices", fake_choices)
     monkeypatch.setattr(llm_router, "_call_provider", fake_call)
+    monkeypatch.setattr(llm_router, "_mark_provider_success", lambda provider: None)
     return llm_router, calls
 
 
@@ -189,7 +190,8 @@ def test_tiered_research_strict_retry_happens_only_once(monkeypatch):
     ])
     result = llm_router._tiered_research("pick the best stock", agent_tag="growth_research")
     assert len(calls) == 2
-    assert result is None
+    assert result["research_status"] == "empty"
+    assert result["selected"] == []
 
 
 def test_tiered_research_does_not_retry_when_salvage_finds_tickers(monkeypatch):

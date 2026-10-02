@@ -14,7 +14,8 @@ from account_sync import (
 from agents.analysis import analysis_agent
 from agents.execution import execution_agent, hard_rebalance_agent
 from agents.position_review import review_positions
-from agents.research import research_agent
+from agents.research import ResearchOutcome, research_agent
+from agents.screener_fallback import deterministic_screener_decisions, resolve_entry_candidates
 from agents.risk import risk_agent
 from alpaca_client import get_recent_fills, is_market_open
 from buy_lock import (
@@ -70,6 +71,50 @@ def _summarize_screener_sources(all_sources: dict) -> dict:
     return out
 
 
+def summarize_research_status(bucket_results: dict) -> dict:
+    """Roll up per-bucket research outcomes.
+
+    ``failed`` is never reported as ``empty``. ``entry_source`` says whether
+    buys came from LLM research, the screener ensemble, both, or neither.
+    """
+    buckets = bucket_results or {}
+    statuses = [b.get("status") for b in buckets.values() if isinstance(b, dict)]
+    failed = [name for name, b in buckets.items() if isinstance(b, dict) and b.get("status") == "failed"]
+    sources = {
+        b.get("entry_source")
+        for b in buckets.values()
+        if isinstance(b, dict) and b.get("entry_source")
+    }
+    if not buckets:
+        status, reason = "not_run", "no research buckets attempted"
+    elif any(s == "failed" for s in statuses):
+        status, reason = "failed", "research gate failed"
+    elif any(s == "ok" for s in statuses):
+        status, reason = "ok", "research returned candidates"
+    elif statuses and all(s == "empty" for s in statuses):
+        status, reason = "empty", "valid empty candidate set"
+    else:
+        status, reason = "not_run", "no research buckets attempted"
+
+    if sources == {"screener"}:
+        entry_source = "screener"
+    elif sources == {"research"}:
+        entry_source = "research"
+    elif "screener" in sources and "research" in sources:
+        entry_source = "mixed"
+    elif sources == {"none"}:
+        entry_source = "none"
+    else:
+        entry_source = next(iter(sources), "none")
+    return {
+        "status": status,
+        "reason": reason,
+        "buckets": buckets,
+        "failed_buckets": failed,
+        "entry_source": entry_source,
+    }
+
+
 def _log_cycle_publish_payload(state: dict, all_sources: dict) -> None:
     """Log the signals-related slice of the dashboard payload."""
     ss = state.get("screener_sources") or all_sources or {}
@@ -82,13 +127,16 @@ def _log_cycle_publish_payload(state: dict, all_sources: dict) -> None:
                 pipelines[k] = pipelines.get(k, 0) + v
     log.info(
         "[Cycle] Publish payload — signal_attributions=%d reddit_trends=%d "
-        "screener_buckets=%s pipeline_totals=%s trade_candidates=%d decisions=%d",
+        "screener_buckets=%s pipeline_totals=%s trade_candidates=%d decisions=%d "
+        "research_status=%s entry_source=%s",
         len(attrs),
         len(trends),
         list(ss.keys()),
         pipelines,
         len(state.get("trade_candidates") or []),
         len(state.get("decisions") or []),
+        (state.get("research_status") or {}).get("status"),
+        (state.get("research_status") or {}).get("entry_source"),
     )
 
 
@@ -154,9 +202,13 @@ def run_trading_cycle() -> None:
     )
     log.info("=" * 65)
 
+    llm_entries_blocked = None
     if budget_exhausted():
-        log.warning("Daily token budget exhausted — skipping entire cycle.")
-        return
+        log.warning(
+            "Daily token budget exhausted — skipping LLM research/analysis. "
+            "Protective exits still run. A screener universe can still open entries."
+        )
+        llm_entries_blocked = "budget_exhausted"
 
     market_open = is_market_open()
     if not market_open and not (cfg.ENABLE_CRYPTO and cfg.CRYPTO_TRADE_24_7):
@@ -324,6 +376,7 @@ def run_trading_cycle() -> None:
         all_candidates = []
         all_decisions = []
         all_blocked = []
+        bucket_research = {}
 
         for bucket in ordered_buckets:
             if not market_open and not is_crypto_bucket(bucket):
@@ -386,23 +439,65 @@ def run_trading_cycle() -> None:
                         status="SCREENED", payload={"ticker": str(_sym), "bucket": bucket.name, "attribution": _attr},
                     )
 
-            candidates = research_agent(universe, bucket)
-            log.info(
-                "[%s] Research: %d candidates from universe of %d",
-                bucket.name,
-                len(candidates or []),
-                len(universe),
-            )
-            if not candidates:
+            if llm_entries_blocked:
+                outcome = ResearchOutcome([], "failed", llm_entries_blocked)
                 log.warning(
-                    "[%s] No research candidates — analysis skipped; screener data retained in state",
+                    "[%s] LLM research skipped (%s). Exits already ran; entries may use the screener.",
                     bucket.name,
+                    llm_entries_blocked,
                 )
+            else:
+                outcome = research_agent(universe, bucket)
+
+            candidates, entry_source = resolve_entry_candidates(
+                outcome, universe, sources, bucket.name, cfg.RESEARCH_TOP_N,
+            )
+            bucket_research[bucket.name] = {
+                "status": outcome.status,
+                "reason": outcome.reason,
+                "candidates": len(outcome.candidates or []),
+                "universe": len(universe or []),
+                "entry_source": entry_source,
+            }
+            log.info(
+                "[%s] Research status=%s reason=%s llm_picks=%d entry_source=%s entry_candidates=%d universe=%d",
+                bucket.name,
+                outcome.status,
+                outcome.reason or "-",
+                len(outcome.candidates or []),
+                entry_source,
+                len(candidates),
+                len(universe or []),
+            )
+            if entry_source == "screener":
+                log.warning(
+                    "[%s] Research %s (%s) — screener ensemble is the entry path: %s",
+                    bucket.name,
+                    outcome.status,
+                    outcome.reason or "-",
+                    [c.get("ticker") for c in candidates],
+                )
+            if not candidates:
+                if outcome.status == "failed":
+                    log.error(
+                        "[%s] Research failed (%s) and the screener universe is empty — no entry path",
+                        bucket.name,
+                        outcome.reason or "research_failed",
+                    )
+                else:
+                    log.warning(
+                        "[%s] No entry candidates (research %s, empty screener universe)",
+                        bucket.name,
+                        outcome.status,
+                    )
                 continue
 
             candidates = rec.attach_attribution_to_candidates(candidates, attribution_map)
             for c in candidates:
                 c["bucket"] = bucket.name
+                c["entry_source"] = entry_source
+                c["source"] = c.get("source") or entry_source
+                c["candidate_source"] = c.get("candidate_source") or entry_source
             all_candidates.extend(candidates)
             rec.record_candidates(_CYCLE_RUN_ID, candidates)
             if _CYCLE_RUN_ID:
@@ -410,15 +505,24 @@ def run_trading_cycle() -> None:
                 _ledger.insert_funnel_events(_CYCLE_RUN_ID, "CANDIDATE", candidates, bucket=bucket.name)
                 record_candidate_snapshots(_CYCLE_RUN_ID, candidates, attribution_map)
 
-            decisions = analysis_agent(candidates, account, positions, bucket, attribution_map=attribution_map)
-            if apply_calibration_to_decisions is not None:
-                decisions = apply_calibration_to_decisions(decisions, attribution_map)
+            if entry_source == "screener":
+                decisions = deterministic_screener_decisions(candidates, bucket)
             else:
-                log.warning("[%s] confidence_engine unavailable — raw confidence unchanged", bucket.name)
+                decisions = analysis_agent(candidates, account, positions, bucket, attribution_map=attribution_map)
+                if apply_calibration_to_decisions is not None:
+                    decisions = apply_calibration_to_decisions(decisions, attribution_map)
+                else:
+                    log.warning("[%s] confidence_engine unavailable — raw confidence unchanged", bucket.name)
+            for d in decisions:
+                d["entry_source"] = entry_source
+                d.setdefault("source", entry_source)
+                d.setdefault("candidate_source", entry_source)
             for d in decisions:
                 attr = attribution_map.get(str(d.get("ticker", "")).upper()) or {}
-                d["total_score"] = attr.get("total_score")
-                d["signal_components"] = attr.get("components")
+                if attr.get("total_score") is not None:
+                    d["total_score"] = attr.get("total_score")
+                if attr.get("components"):
+                    d["signal_components"] = attr.get("components")
             all_decisions.extend(decisions)
             rec.record_decisions(_CYCLE_RUN_ID, decisions)
             if _CYCLE_RUN_ID:
@@ -480,11 +584,14 @@ def run_trading_cycle() -> None:
                 from agenttrade import db as _ledger
                 _ledger.insert_funnel_events(_CYCLE_RUN_ID, "ORDER", orders, bucket=bucket.name)
 
+        research_status = summarize_research_status(bucket_research)
         log.info(
-            "[Cycle] Funnel summary: candidates=%d decisions=%d blocked=%d buckets_screener=%s",
+            "[Cycle] Funnel summary: candidates=%d decisions=%d blocked=%d research=%s entry_source=%s buckets_screener=%s",
             len(all_candidates),
             len(all_decisions),
             len(all_blocked),
+            research_status.get("status"),
+            research_status.get("entry_source"),
             _summarize_screener_sources(all_sources),
         )
 
@@ -525,6 +632,7 @@ def run_trading_cycle() -> None:
             "positions": positions,
             "bucket_tags": cfg.bucket_manager._load_tags(),
             "trade_candidates": all_candidates,
+            "research_status": research_status,
             "decisions": all_decisions,
             "blocked_ideas": all_blocked,
             "last_orders": all_orders,  # includes position_review sells + hard_rebalance + buys
@@ -553,7 +661,7 @@ def run_trading_cycle() -> None:
         state = merge_snapshot_into_state(state, snapshot, source="cycle")
         if _CYCLE_RUN_ID:
             from agenttrade import db as _ledger
-            for _key in ("universes", "screener_sources", "token_usage", "rebalance", "hard_rebalance", "buy_lock", "llm_mode", "last_run"):
+            for _key in ("universes", "screener_sources", "token_usage", "rebalance", "hard_rebalance", "buy_lock", "llm_mode", "last_run", "research_status"):
                 _ledger.upsert_cycle_artifact(_CYCLE_RUN_ID, _key, state.get(_key))
         from agenttrade.publish import build_dashboard_state, publish_dashboard_state
         state = build_dashboard_state(cached_funnel=state, live_snapshot=snapshot)

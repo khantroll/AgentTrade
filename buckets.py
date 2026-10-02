@@ -12,11 +12,11 @@ Think of it like running 3 separate mini-funds inside one Alpaca account.
 ──────────────────────────────────────────────────
 Example bucket layout (edit BUCKETS below):
 
-  Bucket A — "Growth"      50% of portfolio
+  Bucket A — "Growth"      45% of portfolio
     Standard momentum/news/reddit screener
     Price $10–$500, normal risk params
 
-  Bucket B — "Dividend"    30% of portfolio
+  Bucket B — "Dividend"    25% of portfolio
     Dividend quality screen + r/dividends sentiment
     Minimum 2% yield, payout < 90%, near ex-div dates
     Tighter stop-loss (3%) since these are income plays
@@ -24,6 +24,11 @@ Example bucket layout (edit BUCKETS below):
   Bucket C — "Swing"       20% of portfolio
     Price-range filtered: $5–$50 stocks only
     Higher risk tolerance, wider take-profit target
+
+  Bucket D — "Crypto"      10% of portfolio (CRYPTO_MAX_ALLOCATION)
+    Equity + crypto defaults sum to 100%. Override any bucket with
+    GROWTH_ALLOCATION, DIVIDEND_ALLOCATION, SWING_ALLOCATION, or
+    CRYPTO_MAX_ALLOCATION.
 ──────────────────────────────────────────────────
 
 Rebalancing:
@@ -46,6 +51,27 @@ from typing import Optional
 import os
 
 log = logging.getLogger(__name__)
+
+# Equity + crypto defaults sum to 100%. Env overrides win when set.
+ALLOCATION_DEFAULTS = {
+    "Growth": ("GROWTH_ALLOCATION", 0.45),
+    "Dividend": ("DIVIDEND_ALLOCATION", 0.25),
+    "Swing": ("SWING_ALLOCATION", 0.20),
+    "Crypto": ("CRYPTO_MAX_ALLOCATION", 0.10),
+}
+
+
+def allocation_pct_for(name: str) -> float:
+    """Target fraction for a built-in bucket. Blank/invalid env keeps the default."""
+    env_key, default = ALLOCATION_DEFAULTS[name]
+    raw = os.getenv(env_key, "")
+    if raw is None or str(raw).strip() == "":
+        return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        log.warning("[Buckets] Invalid %s=%r — using default %.2f", env_key, raw, default)
+        return float(default)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,7 +140,7 @@ class Bucket:
 BUCKETS = [
     Bucket(
         name            = "Growth",
-        allocation_pct  = 0.50,       # 50% of total portfolio
+        allocation_pct  = allocation_pct_for("Growth"),  # default 45%
         mode            = "growth",
         min_price       = 10.0,
         max_price       = 500.0,
@@ -127,7 +153,7 @@ BUCKETS = [
 
     Bucket(
         name            = "Dividend",
-        allocation_pct  = 0.30,       # 30% of total portfolio
+        allocation_pct  = allocation_pct_for("Dividend"),  # default 25%
         mode            = "dividend",
         min_price       = 5.0,
         max_price       = 200.0,
@@ -141,7 +167,7 @@ BUCKETS = [
 
     Bucket(
         name            = "Swing",
-        allocation_pct  = 0.20,       # 20% of total portfolio
+        allocation_pct  = allocation_pct_for("Swing"),  # default 20%
         mode            = "price_range",
         min_price       = 5.0,
         max_price       = 50.0,       # only stocks $5–$50
@@ -156,7 +182,7 @@ BUCKETS = [
 
     Bucket(
         name            = "Crypto",
-        allocation_pct  = float(os.getenv("CRYPTO_MAX_ALLOCATION", "0.10")),
+        allocation_pct  = allocation_pct_for("Crypto"),  # default 10%; CRYPTO_MAX_ALLOCATION overrides
         mode            = "crypto",
         custom_tickers  = [s.strip() for s in os.getenv("CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,LINK/USD").split(",") if s.strip()],
         max_positions   = int(os.getenv("CRYPTO_MAX_POSITIONS", "3")),

@@ -291,6 +291,10 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                 "take_profit_price": d.get("take_profit_price"),
                 "dual_status": d.get("dual_status", "single"),
                 "tiered_source": d.get("tiered_source"),
+                "source": d.get("source") or d.get("candidate_source") or "",
+                "candidate_source": d.get("candidate_source") or d.get("source") or "",
+                "entry_source": d.get("entry_source") or "",
+                "analysis_path": d.get("analysis_path") or "",
             }
             if cycle_run_id:
                 try:

@@ -126,6 +126,16 @@ def refresh_config() -> None:
     except ValueError:
         MIN_CASH_RESERVE = 5000.0
     ALLOW_NEGATIVE_CASH = env_bool("ALLOW_NEGATIVE_CASH", "false")
+    sync_bucket_allocations()
+
+
+def sync_bucket_allocations() -> None:
+    """Re-read allocation env after config.json is applied at cycle start."""
+    from buckets import ALLOCATION_DEFAULTS, allocation_pct_for
+
+    for bucket in bucket_manager.buckets:
+        if bucket.name in ALLOCATION_DEFAULTS:
+            bucket.allocation_pct = allocation_pct_for(bucket.name)
     sync_crypto_bucket_enabled()
 
 
@@ -138,6 +148,11 @@ def sync_crypto_bucket_enabled() -> None:
             or getattr(bucket, "asset_class", "") == "crypto"
         ):
             bucket.enabled = ENABLE_CRYPTO
+
+
+# BUCKETS is built when buckets.py is imported, which is before config.json
+# is copied into the environment. Re-apply env overrides once that has happened.
+sync_bucket_allocations()
 
 
 def init_daily_trades() -> None:

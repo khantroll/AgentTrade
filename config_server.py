@@ -95,6 +95,14 @@ DEFAULT_CONFIG = {
     "NVIDIA_QWEN_MODEL":    "qwen/qwen3-235b-a22b",
     "NVIDIA_DEEPSEEK_MODEL": "deepseek-ai/deepseek-r1",
     "LLM_MODE":             "tiered",
+    "GROQ_LLAMA_MODEL":     "openai/gpt-oss-120b",
+    "GROQ_QWEN_MODEL":      "qwen/qwen3.8-27b",
+    "LLM_MODEL_NOT_FOUND_SUPPRESS_HOURS": "24",
+    "LLM_RATE_LIMIT_COOLDOWN_MINUTES": "120",
+    "GROWTH_ALLOCATION":    "0.45",
+    "DIVIDEND_ALLOCATION":  "0.25",
+    "SWING_ALLOCATION":     "0.20",
+    "CRYPTO_MAX_ALLOCATION": "0.10",
     "DAILY_TOKEN_BUDGET":   "200000",
     "MAX_DAILY_TRADES":     "5",
     "STRATEGY_AGGRESSION":  "balanced",
@@ -348,7 +356,8 @@ def test_deepseek(api_key: str) -> dict:
 
 
 def test_groq(api_key: str) -> dict:
-    return _test_chat_endpoint("groq", api_key, "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile")
+    model = os.getenv("GROQ_LLAMA_MODEL", "openai/gpt-oss-120b")
+    return _test_chat_endpoint("groq", api_key, "https://api.groq.com/openai/v1/chat/completions", model)
 
 
 def test_nvidia(api_key: str) -> dict:
