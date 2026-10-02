@@ -31,6 +31,18 @@ MAX_LOG_BYTES=10485760   # 10MB
 
 cd "$APP_DIR"
 
+# buckets.py reads CRYPTO_MAX_ALLOCATION (and the other allocation knobs) while
+# the module is imported, which is before load_dotenv() runs. Cron does not
+# export .env by itself. `set -a` exports every sourced assignment into Python.
+if [ -f "$APP_DIR/.env" ]; then
+    set +u
+    set -a
+    # shellcheck disable=SC1091
+    source "$APP_DIR/.env"
+    set +a
+    set -u
+fi
+
 echo "── $(date '+%Y-%m-%d %H:%M:%S %Z') run_cycle.sh starting ──"
 
 # ── Log rotation ──────────────────────────────────────────────────────────────
@@ -40,17 +52,27 @@ if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt "$MAX_LOG_
 fi
 
 # ── Run with file lock (prevents overlap) ─────────────────────────────────────
-/usr/bin/flock -n "$LOCK" \
+# flock -E 75 is only the "lock already held" code. The Python exit status is
+# passed through, so a crashed cycle is not reported as a skip and is not
+# swallowed with exit 0.
+CYCLE_RC=0
+/usr/bin/flock -n -E 75 "$LOCK" \
     "$VENV" -c "
 import sys, os
 sys.path.insert(0, '$APP_DIR')
 os.chdir('$APP_DIR')
 from agent import run_trading_cycle
 run_trading_cycle()
-" || {
+" || CYCLE_RC=$?
+
+if [ "$CYCLE_RC" -eq 75 ]; then
     echo "⚠️  Another cycle is already running (flock busy) — skipping this run."
     exit 0
-}
+fi
+if [ "$CYCLE_RC" -ne 0 ]; then
+    echo "✗ trading cycle failed (exit $CYCLE_RC). Lock was acquired; not a flock skip."
+    exit "$CYCLE_RC"
+fi
 
 # ── Publish state to web dashboard ───────────────────────────────────────────
 if [ -f "$APP_DIR/agent_state.json" ]; then
