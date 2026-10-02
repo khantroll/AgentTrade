@@ -447,7 +447,7 @@ def run_trading_cycle() -> None:
                     llm_entries_blocked,
                 )
             else:
-                outcome = research_agent(universe, bucket)
+                outcome = research_agent(universe, bucket, sources=sources)
 
             candidates, entry_source = resolve_entry_candidates(
                 outcome, universe, sources, bucket.name, cfg.RESEARCH_TOP_N,
@@ -517,12 +517,17 @@ def run_trading_cycle() -> None:
                 d["entry_source"] = entry_source
                 d.setdefault("source", entry_source)
                 d.setdefault("candidate_source", entry_source)
+            from signal_attribution import resolve_signal_mix, resolve_signal_strength
             for d in decisions:
                 attr = attribution_map.get(str(d.get("ticker", "")).upper()) or {}
-                if attr.get("total_score") is not None:
-                    d["total_score"] = attr.get("total_score")
-                if attr.get("components"):
-                    d["signal_components"] = attr.get("components")
+                strength = resolve_signal_strength(attr)
+                mix = resolve_signal_mix(attr)
+                if strength is not None:
+                    d["signal_strength"] = strength
+                    d["total_score"] = strength
+                if mix:
+                    d["signal_mix"] = mix
+                    d["signal_components"] = mix
             all_decisions.extend(decisions)
             rec.record_decisions(_CYCLE_RUN_ID, decisions)
             if _CYCLE_RUN_ID:

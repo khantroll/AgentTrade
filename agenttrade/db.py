@@ -1754,11 +1754,16 @@ def _attribution_map(rows: list) -> dict:
                 comps = json.loads(row.get("components_json") or "{}")
             except (TypeError, json.JSONDecodeError):
                 comps = {}
+        from signal_attribution import attribution_view
+
+        view = attribution_view({**row, "components": comps or {}})
         out[sym] = {
             "symbol": sym,
-            "total_score": row.get("total_score"),
-            "components": comps or {},
-            "pipelines": row.get("pipelines"),
+            "signal_strength": view.get("signal_strength"),
+            "signal_mix": view.get("signal_mix"),
+            "total_score": view.get("total_score"),
+            "components": view.get("components") or {},
+            "pipelines": view.get("pipelines") or row.get("pipelines"),
         }
     return out
 
@@ -1814,7 +1819,12 @@ def load_application_state() -> dict:
         "blocked_ideas": funnel.get("blocked") or [],
         "signal_attributions": attr_rows,
         "position_signal_breakdown": {
-            sym: {"total_score": row.get("total_score"), "components": row.get("components")}
+            sym: {
+                "signal_strength": row.get("signal_strength"),
+                "signal_mix": row.get("signal_mix"),
+                "total_score": row.get("total_score"),
+                "components": row.get("components"),
+            }
             for sym, row in attr_map.items()
         },
         "stop_prices": {**broker_stops, **manual_stops},

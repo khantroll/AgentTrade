@@ -113,11 +113,19 @@ def analysis_agent(
                 "SKIP if RSI > 75 or deteriorating fundamentals."
             )
 
+        from signal_attribution import resolve_signal_mix, resolve_signal_strength
+
         attr = (attribution_map or {}).get(str(ticker).upper()) or candidate.get("signal_attribution") or {}
-        components = attr.get("components") or candidate.get("signal_components") or {}
+        components = resolve_signal_mix(attr) or resolve_signal_mix(candidate)
+        strength = resolve_signal_strength(attr)
+        if strength is None:
+            strength = resolve_signal_strength(candidate)
         signal_block = ""
-        if components:
-            signal_block = f"\nSignal breakdown (total {attr.get('total_score', '?')}): {json.dumps(components)}"
+        if components or strength is not None:
+            signal_block = (
+                f"\nSignal strength (conviction, not scaled to 100): {strength if strength is not None else '?'}"
+                f"\nSignal mix (composition, sums to ~100): {json.dumps(components)}"
+            )
         reddit_detail = attr.get("reddit_detail") or {}
         if reddit_detail:
             signal_block += (
@@ -183,7 +191,9 @@ Respond ONLY with valid JSON — no other text:
         result["atr_pct"] = data.get("atr_pct")
         result["atr"] = data.get("atr14")
         result["signal_components"] = components
-        result["total_score"] = attr.get("total_score")
+        result["signal_mix"] = components
+        result["signal_strength"] = strength
+        result["total_score"] = strength
         result["reddit_detail"] = reddit_detail
         if result.get("sentiment_summary") and not result.get("reddit_summary"):
             result["reddit_summary"] = result.get("sentiment_summary")

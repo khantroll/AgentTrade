@@ -1134,7 +1134,7 @@ def create_app():
 
         Sell priority (higher score = sell first):
           45% P/L performance  — biggest losers sell first
-          40% Signal weakness  — same PIPELINE_WEIGHTS as screener, inverted
+          40% Signal weakness  — low signal_strength sells first
           15% Stop proximity   — at/near stop sells first
         """
         try:

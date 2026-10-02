@@ -50,6 +50,11 @@ def test_research_failed_is_not_reported_as_empty():
 
 
 def test_screener_fallback_keeps_universe_order_and_provenance():
+    """Research failure still uses the screener. Strength, not list order, ranks it.
+
+    ``total_score`` without ``signal_strength`` is the legacy strength field.
+    ``screener_rank`` stays the original ensemble position.
+    """
     universe = ["MSFT", "AAPL"]
     sources = {
         "attribution": {
@@ -58,17 +63,19 @@ def test_screener_fallback_keeps_universe_order_and_provenance():
         }
     }
     rows = screener_fallback_candidates(universe, sources, "Growth", top_n=5)
-    assert [r["ticker"] for r in rows] == ["MSFT", "AAPL"]
+    assert [r["ticker"] for r in rows] == ["AAPL", "MSFT"]
     assert all(r["source"] == "screener" for r in rows)
     assert all(r["candidate_source"] == "screener" for r in rows)
-    assert rows[0]["screener_rank"] == 1
-    assert rows[0]["total_score"] == 10
-    assert "Screener ensemble rank 1/2" in rows[0]["reason"]
+    assert rows[0]["screener_rank"] == 2
+    assert rows[0]["signal_strength"] == 100
+    assert rows[0]["total_score"] == 100
+    assert "Screener ensemble rank 2/2" in rows[0]["reason"]
+    assert "signal_strength 100" in rows[0]["reason"]
 
     failed = ResearchOutcome([], "failed", "invalid_parse")
     picked, source = resolve_entry_candidates(failed, universe, sources, "Growth", 5)
     assert source == "screener"
-    assert [r["ticker"] for r in picked] == ["MSFT", "AAPL"]
+    assert [r["ticker"] for r in picked] == ["AAPL", "MSFT"]
 
     empty = ResearchOutcome([], "empty", "valid_empty_selected")
     picked, source = resolve_entry_candidates(empty, universe, sources, "Growth", 5)

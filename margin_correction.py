@@ -4,7 +4,7 @@ using the same weighted signal logic as the buy pipeline (inverted for exit scor
 
 Sell priority (higher score = sell first) is determined by:
   1. P/L performance     (45%) — biggest losers sell first
-  2. Signal weakness     (40%) — same PIPELINE_WEIGHTS as screener, inverted
+  2. Signal weakness     (40%) — low signal_strength sells first (not mix-as-strength)
   3. Stop-loss proximity (15%) — positions already past or near stop sell first
 
 Positions that score highest are the weakest holds; selling them maximises the
@@ -20,7 +20,9 @@ from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
-# Mirror the canonical weights from signal_attribution.py
+# Mirror the canonical weights from signal_attribution.py.
+# Weakness scoring uses signal_strength; these weights stay for callers that
+# still want the pipeline scale.
 PIPELINE_WEIGHTS: dict[str, float] = {
     "reddit_sentiment": 2.5,
     "news_sentiment":   2.0,
@@ -53,34 +55,25 @@ def _signal_weakness(sym: str, signal_attrs: dict, pos_breakdown: dict) -> float
     """
     Return a weakness score in [0, 1].  1.0 = completely no signal support.
 
-    Uses signal_attributions[sym].components if available, falling back to
-    position_signal_breakdown[sym].components.
+    Uses signal strength (conviction), not the mix. A mix that is 100% one
+    pipeline is not treated as a perfect score. Legacy rows that only have
+    ``total_score`` resolve through ``resolve_signal_strength``.
     """
-    comps: dict[str, float] = {}
-
     src = signal_attrs.get(sym) or {}
-    if src:
-        comps = src.get("components") or {}
-
-    if not comps:
-        src2 = pos_breakdown.get(sym) or {}
-        comps = src2.get("components") or {}
-
-    if not comps:
-        # No signal data at all — treat as moderately weak
+    if not src:
+        src = pos_breakdown.get(sym) or {}
+    if not src:
         return 0.55
 
-    # Weighted average of component scores (each 0..100 in the normalised form)
-    w_sum = 0.0
-    w_total = 0.0
-    for key, weight in PIPELINE_WEIGHTS.items():
-        v = _float(comps.get(key, 0))
-        w_sum   += v * weight
-        w_total += weight
+    from signal_attribution import STRENGTH_REFERENCE, resolve_signal_strength
 
-    weighted_avg = w_sum / w_total if w_total > 0 else 50.0
-    # Normalise: 100 = strong = low weakness; 0 = no signal = high weakness
-    return 1.0 - min(weighted_avg / 100.0, 1.0)
+    strength = resolve_signal_strength(src)
+    if strength is None:
+        return 0.55
+    if STRENGTH_REFERENCE <= 0:
+        return 0.55
+    support = min(max(float(strength), 0.0) / STRENGTH_REFERENCE, 1.0)
+    return 1.0 - support
 
 
 def _stop_proximity(pos: dict, stop_prices: dict) -> float:
@@ -164,7 +157,7 @@ def _as_attr_map(signal_attrs) -> dict:
             return {}
         first = next(iter(signal_attrs.values()), None)
         if isinstance(first, dict) and (
-            "components" in first or "total_score" in first or "symbol" in first
+            "components" in first or "total_score" in first or "signal_strength" in first or "symbol" in first
         ):
             return {str(k).upper(): v for k, v in signal_attrs.items() if isinstance(v, dict)}
         return {}

@@ -1,16 +1,16 @@
 """Screener-ensemble entry path when LLM research fails or returns no picks.
 
-The screener universe is already ranked by the existing pipeline ensemble.
-This module does not invent a new strength score (that is Milestone B). It
-walks universe order, attaches current attribution as evidence, and can
-annotate BUY/SKIP decisions without an analysis LLM so entries are not
-hard-gated on a provider outage.
+When research fails or returns a valid empty set, candidates are ordered by
+``signal_strength`` (legacy ``total_score`` when the explicit field is absent).
+Equal strength keeps the screener universe order. BUY/SKIP annotation does not
+call an analysis LLM, so entries are not hard-gated on a provider outage.
 """
 
 import logging
 
 import agent_config as cfg
 from buckets import Bucket
+from signal_attribution import resolve_signal_mix, resolve_signal_strength
 
 log = logging.getLogger(__name__)
 
@@ -26,10 +26,12 @@ def screener_fallback_candidates(
     bucket_name: str,
     top_n: int,
 ) -> list:
-    """Build trade candidates from screener universe order.
+    """Build trade candidates ordered by signal strength.
 
-    ``universe`` is the ensemble ranking (best first). Attribution
-    ``total_score`` is attached as evidence and is not used to re-rank.
+    ``screener_rank`` stays the ensemble position (1-based index in
+    ``universe``). Output order follows strength, then that ensemble position.
+    Names with no strength number keep their relative universe order after
+    any scored name.
     """
     attribution = {}
     if isinstance(sources, dict):
@@ -38,37 +40,51 @@ def screener_fallback_candidates(
             attribution = raw_attr
 
     limit = max(0, int(top_n or 0))
-    rows = []
+    universe_n = len(universe or [])
+    pending = []
     seen = set()
-    for raw in universe or []:
+    for index, raw in enumerate(universe or []):
         ticker = str(raw or "").upper().strip()
         if not ticker or ticker in seen:
             continue
         seen.add(ticker)
         attr = attribution.get(ticker) or {}
-        components = attr.get("components") if isinstance(attr.get("components"), dict) else {}
+        mix = resolve_signal_mix(attr)
         pipelines = attr.get("pipelines") if isinstance(attr.get("pipelines"), dict) else {}
-        pipeline_names = list(pipelines.keys()) or [k for k, v in components.items() if v]
-        rank = len(rows) + 1
-        universe_n = len(universe or [])
-        bits = [f"Screener ensemble rank {rank}/{universe_n}"]
-        if attr.get("total_score") is not None:
-            bits.append(f"attribution total_score {attr.get('total_score')}")
+        pipeline_names = list(pipelines.keys()) or [k for k, v in mix.items() if v]
+        strength = resolve_signal_strength(attr)
+        ensemble_rank = index + 1
+        bits = [f"Screener ensemble rank {ensemble_rank}/{universe_n}"]
+        if strength is not None:
+            bits.append(f"signal_strength {strength}")
         if pipeline_names:
             bits.append("pipelines: " + ", ".join(str(name) for name in pipeline_names[:6]))
-        rows.append({
+        pending.append((strength, index, {
             "ticker": ticker,
             "reason": "; ".join(bits),
-            "confidence": _rank_confidence(len(rows)),
             "source": "screener",
             "candidate_source": "screener",
             "entry_source": "screener",
-            "screener_rank": rank,
-            "total_score": attr.get("total_score"),
-            "signal_components": components,
+            "screener_rank": ensemble_rank,
+            "signal_strength": strength,
+            "signal_mix": mix,
+            "total_score": strength,
+            "signal_components": mix,
             "signal_attribution": attr,
             "bucket": bucket_name,
-        })
+        }))
+
+    def _order(item):
+        strength, index, _row = item
+        if strength is None:
+            return (1, 0.0, index)
+        return (0, -float(strength), index)
+
+    pending.sort(key=_order)
+    rows = []
+    for _strength, _index, row in pending:
+        row["confidence"] = _rank_confidence(len(rows))
+        rows.append(row)
         if limit and len(rows) >= limit:
             break
     return rows
@@ -172,8 +188,10 @@ def deterministic_screener_decisions(candidates: list, bucket: Bucket) -> list:
             "atr_pct": data.get("atr_pct"),
             "atr": data.get("atr14"),
             "ohlcv": data.get("ohlcv"),
-            "total_score": candidate.get("total_score"),
-            "signal_components": candidate.get("signal_components") or {},
+            "total_score": candidate.get("signal_strength", candidate.get("total_score")),
+            "signal_strength": candidate.get("signal_strength", candidate.get("total_score")),
+            "signal_mix": candidate.get("signal_mix") or candidate.get("signal_components") or {},
+            "signal_components": candidate.get("signal_components") or candidate.get("signal_mix") or {},
             "skip_reason": skip_reason,
             "blocked_reason": skip_reason,
         })
