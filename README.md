@@ -38,10 +38,11 @@ screener.py — Dynamic Universe Builder
   Pipeline 5: Reddit VADER (optional)
     │ universe[]  persisted as UNIVERSE funnel rows
     ▼
-Agent 1: Research — LLM picks top N per bucket
-    │ candidates[]  CANDIDATE rows
+Agent 1: Research — LLM picks when the parse is valid
+    │  failed or empty → candidates from universe order (source=screener)
+    │  ok with picks → LLM candidates (source=research)
     ▼
-Agent 2: Analysis — BUY or SKIP (no executable sizing)
+Agent 2: Analysis — LLM BUY/SKIP, or deterministic annotate on screener fallback
     │ decisions[]  DECISION rows (pre-skips have skip_reason)
     ▼
 Bucket risk gate + deterministic risk manager
@@ -147,6 +148,20 @@ v3.2 recovery validation: **46 passed**, `compileall` clean, recovered `agenttra
 See `V3_RECOVERY_NOTES.md` for provenance, remaining fallbacks, and the changed-file list.
 
 ---
+
+## Routing, research failure, and bucket defaults
+
+LLM research is a narrator and a fallback, not the only way into a trade.
+
+- A schema-valid research object with picks (`research_status=ok`) is still used, with screener attribution attached as evidence.
+- If research **fails** (provider error, 429, parse failure, budget exhaustion, model-not-found, no healthy model) or returns a **valid empty** set, and the screener already built a universe, entries come from that universe order (`source=screener`). Analysis for those names is deterministic; risk and execution gates are unchanged.
+- `failed` and `empty` stay distinct on `research_status` in the cycle log, SQLite artifact, and dashboard. An empty candidate table is not how a broken research gate is reported.
+- Protective exits (position review and hard rebalance) run even when the token budget blocks LLM calls.
+- Tiered research keeps walking the provider list until `LLM_TIERED_FANOUT` (or `LLM_TIERED_VALID_PARSES`) valid JSON parses, or the list is exhausted. HTTP 200 with prose, a code fence, or `{}` is not success. A 429 backs the provider off (`LLM_RATE_LIMIT_COOLDOWN_MINUTES`, default 120) and tries the next tier. Model-not-found / HTTP 404 suppresses that model for `LLM_MODEL_NOT_FOUND_SUPPRESS_HOURS` (default 24).
+- Repo Groq defaults are `GROQ_QWEN_MODEL=qwen/qwen3.8-27b` and `GROQ_LLAMA_MODEL=openai/gpt-oss-120b`. `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` 404 on the current host.
+- Built-in bucket defaults are Growth 45% / Dividend 25% / Swing 20% / Crypto 10% (`CRYPTO_MAX_ALLOCATION`, default `0.10`). Override with `GROWTH_ALLOCATION`, `DIVIDEND_ALLOCATION`, `SWING_ALLOCATION`, and `CRYPTO_MAX_ALLOCATION`. A recommended tiered list is in `config.example.json` (`groq_qwen,gemini_flash,mistral_small` for research).
+
+Not in this pass: signal strength vs mix, cash-ledger / held-set / average-down controls, or ATR sizing changes.
 
 ## Configuration
 

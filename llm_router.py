@@ -86,8 +86,8 @@ MISTRAL_SMALL = os.getenv("MISTRAL_SMALL_MODEL", "mistral-small-latest")
 MISTRAL_LARGE = os.getenv("MISTRAL_LARGE_MODEL", "mistral-small-latest")  # safer default; override if paid tier supports large
 DEEPSEEK_CHAT = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
 DEEPSEEK_REASONER = os.getenv("DEEPSEEK_REASONER_MODEL", "deepseek-reasoner")
-GROQ_LLAMA    = os.getenv("GROQ_LLAMA_MODEL",    "llama-3.3-70b-versatile")
-GROQ_QWEN     = os.getenv("GROQ_QWEN_MODEL",     "llama-3.1-8b-instant")  # low-TPM friendly default
+GROQ_LLAMA    = os.getenv("GROQ_LLAMA_MODEL",    "openai/gpt-oss-120b")
+GROQ_QWEN     = os.getenv("GROQ_QWEN_MODEL",     "qwen/qwen3.8-27b")  # JSON-object capable Groq default
 NVIDIA_LLAMA  = os.getenv("NVIDIA_LLAMA_MODEL",  "meta/llama-3.1-70b-instruct")
 NVIDIA_QWEN   = os.getenv("NVIDIA_QWEN_MODEL",   "qwen/qwen3-235b-a22b")
 NVIDIA_DEEPSEEK = os.getenv("NVIDIA_DEEPSEEK_MODEL", "deepseek-ai/deepseek-r1")
@@ -151,9 +151,21 @@ def _score_provider(provider: str, phase: str, input_tokens: int = 0) -> float:
     if provider == "gemini" and input_tokens > 10000: size_penalty = 8
     return base + reliability - size_penalty
 
+def _ready_models(candidates: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
+    ready = []
+    for provider, model in candidates:
+        if not _provider_ready(provider):
+            continue
+        if _model_is_suppressed(provider, model):
+            _log_suppressed_skip(provider, model)
+            continue
+        ready.append((provider, model))
+    return ready
+
+
 def _provider_sorted(candidates: Iterable[tuple[str, str]], phase: str, prompt: str = "") -> list[tuple[str, str]]:
     input_tokens = _estimate_tokens(prompt)
-    ready = [(p, m) for p, m in candidates if _provider_ready(p)]
+    ready = _ready_models(candidates)
     if not LLM_AUTO_ADAPT:
         return ready
     return sorted(ready, key=lambda pm: _score_provider(pm[0], phase, input_tokens), reverse=True)
@@ -178,13 +190,140 @@ def _cooldown_provider(provider: str, seconds: int, reason: str = ""):
     _save_health(data)
     log.warning(f"[LLM] Cooling down {provider} for {seconds}s. {reason}")
 
-def _classify_cooldown(provider: str, err: Exception):
+# Per-model suppression for dead model ids (404 / model_not_found). Hours, not minutes,
+# so a known-dead Groq model is not retried on every cron cycle.
+_MODEL_SUPPRESS_UNTIL: dict[str, float] = {}
+_MODELS_HEALTH_KEY = "_models"
+DEFAULT_MODEL_NOT_FOUND_SUPPRESS_HOURS = 24
+
+
+def model_not_found_suppress_seconds() -> int:
+    raw = os.getenv("LLM_MODEL_NOT_FOUND_SUPPRESS_HOURS", str(DEFAULT_MODEL_NOT_FOUND_SUPPRESS_HOURS))
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        hours = float(DEFAULT_MODEL_NOT_FOUND_SUPPRESS_HOURS)
+    if hours < 1:
+        hours = float(DEFAULT_MODEL_NOT_FOUND_SUPPRESS_HOURS)
+    return int(hours * 3600)
+
+
+def rate_limit_cooldown_seconds() -> int:
+    """How long a 429 backs off a provider before the next tier is worth retrying."""
+    raw = os.getenv("LLM_RATE_LIMIT_COOLDOWN_MINUTES", "120")
+    try:
+        minutes = float(raw)
+    except (TypeError, ValueError):
+        minutes = 120.0
+    if minutes < 1:
+        minutes = 120.0
+    return int(minutes * 60)
+
+
+def _model_key(provider: str, model: str) -> str:
+    return f"{provider}:{model}"
+
+
+def _load_model_suppressions() -> dict:
+    models = _load_health().get(_MODELS_HEALTH_KEY)
+    return models if isinstance(models, dict) else {}
+
+
+def _suppressed_until(provider: str, model: str) -> float:
+    key = _model_key(provider, model)
+    mem = float(_MODEL_SUPPRESS_UNTIL.get(key, 0) or 0)
+    disk = float((_load_model_suppressions().get(key) or {}).get("suppress_until") or 0)
+    return max(mem, disk)
+
+
+def _model_is_suppressed(provider: str, model: str) -> bool:
+    if not model:
+        return False
+    return _suppressed_until(provider, model) > time.time()
+
+
+def _log_suppressed_skip(provider: str, model: str) -> None:
+    until = _suppressed_until(provider, model)
+    rec = _load_model_suppressions().get(_model_key(provider, model)) or {}
+    when = datetime.fromtimestamp(until).isoformat(timespec="seconds") if until else "?"
+    log.info(
+        "[LLM] Skipping suppressed model %s/%s until %s. %s",
+        provider,
+        model,
+        when,
+        rec.get("reason") or "model-not-found",
+    )
+
+
+def _suppress_model(provider: str, model: str, seconds: int, reason: str) -> None:
+    key = _model_key(provider, model)
+    until = time.time() + max(1, int(seconds))
+    _MODEL_SUPPRESS_UNTIL[key] = until
+    data = _load_health()
+    models = data.setdefault(_MODELS_HEALTH_KEY, {})
+    if not isinstance(models, dict):
+        models = {}
+        data[_MODELS_HEALTH_KEY] = models
+    models[key] = {
+        "provider": provider,
+        "model": model,
+        "suppress_until": until,
+        "reason": reason,
+        "suppressed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    _save_health(data)
+    log.warning(
+        "[LLM] Suppressing model %s/%s for %.1fh until %s. %s",
+        provider,
+        model,
+        seconds / 3600,
+        datetime.fromtimestamp(until).isoformat(timespec="seconds"),
+        reason,
+    )
+
+
+def _is_model_not_found_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    if "model_not_found" in msg or "model not found" in msg:
+        return True
+    if "does not exist" in msg and "model" in msg:
+        return True
+    if "unknown model" in msg or "invalid model" in msg:
+        return True
+    if "http 404" in msg or " 404:" in msg or "status 404" in msg:
+        return True
+    return False
+
+
+def _is_rate_limited_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return (
+        "429" in msg
+        or "too many requests" in msg
+        or "rate limit" in msg
+        or "rate_limit" in msg
+        or "rate" in msg
+    )
+
+
+def _classify_cooldown(provider: str, err: Exception, model: str = ""):
+    if model and _is_model_not_found_error(err):
+        _suppress_model(provider, model, model_not_found_suppress_seconds(), "model-not-found")
+        return
     msg = str(err).lower()
     if "401" in msg or "authentication" in msg or "invalid x-api-key" in msg or "invalid api key" in msg:
         _cooldown_provider(provider, 24*3600, "auth/key error")
     elif "insufficient balance" in msg or "payment" in msg or "billing" in msg:
         _cooldown_provider(provider, 24*3600, "billing/balance error")
-    elif "429" in msg or "rate" in msg or "capacity" in msg or "tokens per minute" in msg or "request too large" in msg:
+    elif _is_rate_limited_error(err):
+        seconds = rate_limit_cooldown_seconds()
+        _cooldown_provider(provider, seconds, "rate-limit (429)")
+        log.warning(
+            "[LLM] %s rate-limited — backing off %.0f min and skipping to the next tier.",
+            provider,
+            seconds / 60,
+        )
+    elif "capacity" in msg or "tokens per minute" in msg or "request too large" in msg:
         _cooldown_provider(provider, 20*60, "rate/capacity/token-limit error")
     elif "503" in msg or "unavailable" in msg or "high demand" in msg:
         _cooldown_provider(provider, 7*60, "temporary provider outage")
@@ -356,18 +495,40 @@ def _tiered_aliases(phase: str) -> list[str]:
     return [a for a in aliases if a in MODEL_ALIASES]
 
 
+def _tiered_fanout(phase: str) -> int:
+    """Research: stop after this many valid parses. Analysis: participant cap."""
+    if phase == "research":
+        raw = (
+            os.getenv("LLM_TIERED_VALID_PARSES")
+            or os.getenv("LLM_TIERED_RESEARCH_FANOUT")
+            or os.getenv("LLM_TIERED_FANOUT", "3")
+        )
+    else:
+        raw = os.getenv("LLM_TIERED_ANALYSIS_FANOUT") or os.getenv("LLM_TIERED_FANOUT", "3")
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return 3
+
+
 def _tiered_choices(phase: str, prompt: str) -> list[tuple[str, str, str]]:
-    """Return [(alias, provider, model)] for configured, healthy tiered participants."""
+    """Return every configured, healthy, non-suppressed tiered participant in try order.
+
+    Research walks this full list until it has N valid parses. The fanout cap is
+    applied by the caller, not by dropping later models before they are needed.
+    """
     candidates = []
     for alias in _tiered_aliases(phase):
         provider, model = MODEL_ALIASES[alias]
-        if _provider_ready(provider):
-            candidates.append((alias, provider, model))
+        if not _provider_ready(provider):
+            continue
+        if _model_is_suppressed(provider, model):
+            _log_suppressed_skip(provider, model)
+            continue
+        candidates.append((alias, provider, model))
     if LLM_AUTO_ADAPT:
         candidates = sorted(candidates, key=lambda apm: _score_provider(apm[1], phase, _estimate_tokens(prompt)), reverse=True)
-    fanout_default = "3" if phase == "research" else "3"
-    fanout = int(os.getenv("LLM_TIERED_FANOUT", os.getenv("LLM_TIERED_RESEARCH_FANOUT" if phase == "research" else "LLM_TIERED_ANALYSIS_FANOUT", fanout_default)))
-    return candidates[:max(1, fanout)]
+    return candidates
 
 
 def _is_proactive_tiered(mode: str) -> bool:
@@ -393,59 +554,66 @@ def _selected_picks(parsed) -> list:
     return selected if isinstance(selected, list) else []
 
 
-def _tiered_research(prompt: str, agent_tag: str = "research") -> Optional[dict]:
-    """Proactive tiered research: several authenticated models screen independently, then we merge votes."""
-    choices = _tiered_choices("research", prompt)
-    if not choices:
-        log.error("[LLM/TieredResearch] No configured/healthy tiered research models available.")
-        return None
+def _research_payload_is_valid(parsed) -> bool:
+    """Schema-valid research object. Empty ``selected`` is valid; ``{}`` and prose are not.
 
-    merged: dict[str, dict] = {}
-    successful = []
-    for alias, provider, model in choices:
-        try:
-            text = _call_provider(provider, model, prompt, max_tokens=_max_tokens_for(provider, "research"), agent_tag=f"{agent_tag}_{alias}")
-            parsed = _parse_json(text) or {}
-            picks = _selected_picks(parsed)
-            if not picks:
-                log.warning(
-                    "[LLM/TieredResearch] %s returned no selected picks — one strict JSON retry.",
-                    alias,
-                )
-                text = _call_provider(
-                    provider, model, _strict_research_prompt(prompt),
-                    max_tokens=_max_tokens_for(provider, "research"),
-                    agent_tag=f"{agent_tag}_{alias}_strict",
-                )
-                parsed = _parse_json(text) or {}
-                picks = _selected_picks(parsed)
-            if not picks:
-                log.warning("[LLM/TieredResearch] %s returned no selected picks.", alias)
-                continue
-            successful.append(alias)
-            for pick in picks:
-                ticker = str(pick.get("ticker", "")).upper().strip()
-                if not ticker:
-                    continue
-                rec = merged.setdefault(ticker, {"ticker": ticker, "votes": 0, "confidence_sum": 0.0, "sources": [], "reasons": []})
-                rec["votes"] += 1
-                rec["confidence_sum"] += float(pick.get("confidence", 0.5) or 0.5)
-                rec["sources"].append(alias)
-                reason = str(pick.get("reason", "")).strip()
-                if reason:
-                    rec["reasons"].append(f"{alias}: {reason}")
-        except Exception as e:
-            log.warning(f"[LLM/TieredResearch] {alias} ({provider}/{model}) failed: {e}")
-            _classify_cooldown(provider, e)
+    Preamble-only and fence-only bodies never reach this as a dict with ``selected``.
+    The salvage path counts only when it yields a ``selected`` list.
+    """
+    return isinstance(parsed, dict) and isinstance(parsed.get("selected"), list)
 
+
+def _failed_research(reason: str, **extra) -> dict:
+    out = {
+        "selected": [],
+        "research_status": "failed",
+        "research_reason": reason,
+    }
+    out.update(extra)
+    return out
+
+
+def _annotate_research_status(parsed: dict, reason: str = "") -> dict:
+    selected = parsed.get("selected") if isinstance(parsed.get("selected"), list) else []
+    out = dict(parsed)
+    out["selected"] = selected
+    out["research_status"] = "ok" if selected else "empty"
+    if reason:
+        out["research_reason"] = reason
+    elif not selected:
+        out.setdefault("research_reason", "valid_empty_selected")
+    return out
+
+
+def _merge_research_picks(merged: dict, picks: list, alias: str) -> None:
+    for pick in picks or []:
+        if not isinstance(pick, dict):
+            continue
+        ticker = str(pick.get("ticker", "")).upper().strip()
+        if not ticker:
+            continue
+        rec = merged.setdefault(ticker, {"ticker": ticker, "votes": 0, "confidence_sum": 0.0, "sources": [], "reasons": []})
+        rec["votes"] += 1
+        rec["confidence_sum"] += float(pick.get("confidence", 0.5) or 0.5)
+        rec["sources"].append(alias)
+        reason = str(pick.get("reason", "")).strip()
+        if reason:
+            rec["reasons"].append(f"{alias}: {reason}")
+
+
+def _research_result_from_merge(merged: dict, successful: list, reason: str = "") -> dict:
+    if not successful:
+        return _failed_research(reason or "research_failed", tiered_models_used=[])
     if not merged:
-        log.error("[LLM/TieredResearch] All tiered research models failed or returned no picks.")
-        return None
-
+        return {
+            "selected": [],
+            "research_status": "empty",
+            "research_reason": reason or "valid_empty_selected",
+            "tiered_models_used": successful,
+        }
     selected = []
     for rec in merged.values():
         avg_conf = rec["confidence_sum"] / max(1, rec["votes"])
-        # Vote bonus lets consensus rise above one-model picks without hiding confidence.
         conf = min(0.99, avg_conf + (0.06 * (rec["votes"] - 1)))
         selected.append({
             "ticker": rec["ticker"],
@@ -456,20 +624,140 @@ def _tiered_research(prompt: str, agent_tag: str = "research") -> Optional[dict]
             "dual_agree": rec["votes"] >= 2,
         })
     selected.sort(key=lambda x: (x.get("tiered_votes", 0), x.get("confidence", 0)), reverse=True)
-    log.info(f"[LLM/TieredResearch] Used {successful}; merged picks: {[x['ticker'] for x in selected[:5]]}")
-    return {"selected": selected[:5], "tiered_models_used": successful}
+    log.info("[LLM/TieredResearch] Used %s; merged picks: %s", successful, [x["ticker"] for x in selected[:5]])
+    return {
+        "selected": selected[:5],
+        "tiered_models_used": successful,
+        "research_status": "ok",
+        "research_reason": reason,
+    }
+
+
+def _tiered_research_once(provider: str, model: str, prompt: str, agent_tag: str):
+    """Call one model. Returns ``(parsed, error)``. Success is not recorded here."""
+    try:
+        text = _call_provider(
+            provider, model, prompt,
+            max_tokens=_max_tokens_for(provider, "research"),
+            agent_tag=agent_tag,
+            mark_success=False,
+        )
+    except Exception as exc:
+        return None, exc
+    return _parse_json(text), None
+
+
+def _tiered_research(prompt: str, agent_tag: str = "research") -> dict:
+    """Tiered research: keep walking providers until N valid parses, or the list ends.
+
+    HTTP 200 with prose, a fence, or an empty object is not a success and does not
+    stop the walk. A schema-valid ``selected: []`` is one valid parse (empty, not
+    failed) after a single strict retry on that same model.
+    """
+    choices = _tiered_choices("research", prompt)
+    if not choices:
+        log.error("[LLM/TieredResearch] No configured/healthy tiered research models available.")
+        return _failed_research("no_models_available", tiered_models_used=[])
+
+    target = _tiered_fanout("research")
+    merged: dict[str, dict] = {}
+    successful = []
+    failure_kinds = []
+    cooled_providers: set[str] = set()
+
+    for alias, provider, model in choices:
+        if len(successful) >= target:
+            break
+        if provider in cooled_providers:
+            log.info("[LLM/TieredResearch] Skipping %s — provider %s is backing off.", alias, provider)
+            continue
+        if _model_is_suppressed(provider, model):
+            _log_suppressed_skip(provider, model)
+            continue
+
+        parsed, err = _tiered_research_once(provider, model, prompt, f"{agent_tag}_{alias}")
+        if err is not None:
+            log.warning("[LLM/TieredResearch] %s (%s/%s) failed: %s", alias, provider, model, err)
+            _classify_cooldown(provider, err, model=model)
+            if _is_rate_limited_error(err):
+                cooled_providers.add(provider)
+                failure_kinds.append("rate_limited")
+                log.warning(
+                    "[LLM/TieredResearch] %s returned 429 — backing off %s and trying the next tier.",
+                    alias, provider,
+                )
+            elif _is_model_not_found_error(err):
+                failure_kinds.append("model_not_found")
+            else:
+                failure_kinds.append("error")
+            continue
+
+        if _research_payload_is_valid(parsed) and _selected_picks(parsed):
+            _mark_provider_success(provider)
+            successful.append(alias)
+            _merge_research_picks(merged, _selected_picks(parsed), alias)
+            continue
+
+        if _research_payload_is_valid(parsed):
+            log.warning("[LLM/TieredResearch] %s returned no selected picks — one strict JSON retry.", alias)
+            parsed2, err2 = _tiered_research_once(
+                provider, model, _strict_research_prompt(prompt), f"{agent_tag}_{alias}_strict",
+            )
+            if err2 is not None:
+                log.warning("[LLM/TieredResearch] %s strict retry failed: %s", alias, err2)
+                _classify_cooldown(provider, err2, model=model)
+                if _is_rate_limited_error(err2):
+                    cooled_providers.add(provider)
+                    failure_kinds.append("rate_limited")
+            elif _research_payload_is_valid(parsed2) and _selected_picks(parsed2):
+                _mark_provider_success(provider)
+                successful.append(alias)
+                _merge_research_picks(merged, _selected_picks(parsed2), alias)
+                continue
+            # First body was a real empty selection. That is a valid parse, not a failure.
+            _mark_provider_success(provider)
+            successful.append(alias)
+            log.warning("[LLM/TieredResearch] %s returned a valid empty selected list.", alias)
+            continue
+
+        log.warning(
+            "[LLM/TieredResearch] %s returned an unusable body (prose, fence-only, or empty object) — trying next model.",
+            alias,
+        )
+        failure_kinds.append("unusable")
+
+    if successful:
+        return _research_result_from_merge(merged, successful)
+
+    if failure_kinds and all(kind == "rate_limited" for kind in failure_kinds):
+        reason = "rate_limited"
+    elif "unusable" in failure_kinds:
+        reason = "invalid_parse"
+    elif "model_not_found" in failure_kinds and not any(k in failure_kinds for k in ("error", "rate_limited", "unusable")):
+        reason = "model_not_found"
+    else:
+        reason = "research_failed"
+    log.error("[LLM/TieredResearch] Research failed (%s). Not recording an empty pick set.", reason)
+    return _failed_research(reason, tiered_models_used=[], tiered_failures=failure_kinds)
 
 
 def _tiered_analysis(prompt: str, agent_tag: str = "analysis") -> Optional[dict]:
     """Proactive tiered analysis: several models decide independently, then voting/aggregation returns one action."""
-    choices = _tiered_choices("analysis", prompt)
+    choices = _tiered_choices("analysis", prompt)[:_tiered_fanout("analysis")]
     if not choices:
         log.error("[LLM/TieredAnalysis] No configured/healthy tiered analysis models available.")
         return {"action": "SKIP", "shares": 0, "rationale": "No configured/healthy tiered analysis models available"}
 
     decisions = []
     successful = []
+    cooled_providers: set[str] = set()
     for alias, provider, model in choices:
+        if provider in cooled_providers:
+            log.info("[LLM/TieredAnalysis] Skipping %s — provider %s is backing off.", alias, provider)
+            continue
+        if _model_is_suppressed(provider, model):
+            _log_suppressed_skip(provider, model)
+            continue
         try:
             text = _call_provider(provider, model, prompt, max_tokens=_max_tokens_for(provider, "analysis"), agent_tag=f"{agent_tag}_{alias}")
             parsed = _parse_json(text)
@@ -480,7 +768,10 @@ def _tiered_analysis(prompt: str, agent_tag: str = "analysis") -> Optional[dict]
             successful.append(alias)
         except Exception as e:
             log.warning(f"[LLM/TieredAnalysis] {alias} ({provider}/{model}) failed: {e}")
-            _classify_cooldown(provider, e)
+            _classify_cooldown(provider, e, model=model)
+            if _is_rate_limited_error(e):
+                cooled_providers.add(provider)
+                log.warning("[LLM/TieredAnalysis] %s returned 429 — backing off %s and trying the next tier.", alias, provider)
 
     if not decisions:
         return {"action": "SKIP", "shares": 0, "rationale": "All tiered analysis models failed or returned invalid JSON", "tiered_status": "error"}
@@ -537,7 +828,7 @@ def _effective_mode() -> str:
 
 
 def _available(candidates: Iterable[tuple[str, str]]) -> list[tuple[str, str]]:
-    return [(p, m) for p, m in candidates if _provider_ready(p)]
+    return _ready_models(candidates)
 
 
 def _pick_model(phase: str, mode: str) -> tuple[str, str] | None:
@@ -599,29 +890,37 @@ def _pick_model(phase: str, mode: str) -> tuple[str, str] | None:
 
 
 # ── Provider call wrappers ────────────────────────────────────────────────────
-def _call_provider(provider: str, model: str, prompt: str, max_tokens: int = 600, agent_tag: str = "") -> str:
+def _call_provider(provider: str, model: str, prompt: str, max_tokens: int = 600, agent_tag: str = "",
+                   mark_success: bool = True) -> str:
     phase = "analysis" if "analysis" in (agent_tag or "") else "research"
     prompt = _json_system_prefix(phase) + _compact_prompt(prompt, provider, phase)
     if max_tokens is None or max_tokens <= 0:
         max_tokens = _max_tokens_for(provider, phase)
+
+    def _finish(out: str) -> str:
+        # Research callers pass mark_success=False and record success only after a valid parse.
+        if mark_success:
+            _mark_provider_success(provider)
+        return out
+
     if provider == "claude":
-        out = _call_claude(model, prompt, max_tokens, agent_tag); _mark_provider_success(provider); return out
+        return _finish(_call_claude(model, prompt, max_tokens, agent_tag))
     if provider == "openai":
-        out = _call_openai(model, prompt, max_tokens, agent_tag); _mark_provider_success(provider); return out
+        return _finish(_call_openai(model, prompt, max_tokens, agent_tag))
     if provider == "gemini":
-        out = _call_gemini(model, prompt, max_tokens, agent_tag); _mark_provider_success(provider); return out
+        return _finish(_call_gemini(model, prompt, max_tokens, agent_tag))
     if provider == "mistral":
-        out = _call_chat_endpoint("mistral", model, prompt, max_tokens, agent_tag,
-                                   "https://api.mistral.ai/v1/chat/completions", MISTRAL_API_KEY); _mark_provider_success(provider); return out
+        return _finish(_call_chat_endpoint("mistral", model, prompt, max_tokens, agent_tag,
+                                           "https://api.mistral.ai/v1/chat/completions", MISTRAL_API_KEY))
     if provider == "deepseek":
-        out = _call_chat_endpoint("deepseek", model, prompt, max_tokens, agent_tag,
-                                   "https://api.deepseek.com/chat/completions", DEEPSEEK_API_KEY); _mark_provider_success(provider); return out
+        return _finish(_call_chat_endpoint("deepseek", model, prompt, max_tokens, agent_tag,
+                                           "https://api.deepseek.com/chat/completions", DEEPSEEK_API_KEY))
     if provider == "groq":
-        out = _call_chat_endpoint("groq", model, prompt, max_tokens, agent_tag,
-                                   "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY); _mark_provider_success(provider); return out
+        return _finish(_call_chat_endpoint("groq", model, prompt, max_tokens, agent_tag,
+                                           "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY))
     if provider == "nvidia":
-        out = _call_chat_endpoint("nvidia", model, prompt, max_tokens, agent_tag,
-                                   f"{NVIDIA_BASE_URL}/chat/completions", NVIDIA_API_KEY); _mark_provider_success(provider); return out
+        return _finish(_call_chat_endpoint("nvidia", model, prompt, max_tokens, agent_tag,
+                                           f"{NVIDIA_BASE_URL}/chat/completions", NVIDIA_API_KEY))
     raise RuntimeError(f"Unknown LLM provider: {provider}")
 
 
@@ -664,6 +963,9 @@ def _call_chat_endpoint(provider: str, model: str, prompt: str, max_tokens: int,
     }
     r = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                       json=payload, timeout=45)
+    # A 429 is a backoff, not a prompt-format problem. Do not immediately POST again.
+    if r.status_code == 429:
+        raise RuntimeError(f"{provider} HTTP 429: {r.text[:300]}")
     if r.status_code >= 400 and "response_format" in payload and ("response_format" in r.text.lower() or "json_object" in r.text.lower()):
         payload.pop("response_format", None)
         r = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -713,33 +1015,69 @@ def _fallback_models(phase: str, exclude_provider: str = "") -> list[tuple[str, 
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
-def query_research(prompt: str, agent_tag: str = "research") -> Optional[dict]:
+def _accept_research_parse(provider: str, parsed):
+    """Record provider success only after a schema-valid research object."""
+    if not _research_payload_is_valid(parsed):
+        return None
+    _mark_provider_success(provider)
+    return _annotate_research_status(parsed)
+
+
+def query_research(prompt: str, agent_tag: str = "research") -> dict:
     mode = _effective_mode()
     if mode == "budget_exhausted":
-        return None
+        return _failed_research("budget_exhausted")
     if mode == "dual":
         return _dual_research(prompt, agent_tag)
     if _is_proactive_tiered(mode):
         return _tiered_research(prompt, agent_tag)
-    picked = _pick_model("research", mode)
-    if not picked:
-        raise RuntimeError("No API keys configured for any supported LLM provider.")
-    provider, model = picked
     try:
-        text = _call_provider(provider, model, prompt, max_tokens=_max_tokens_for(provider, "research"), agent_tag=agent_tag)
-        return _parse_json(text)
-    except Exception as e:
-        log.warning(f"[LLM] Primary research model {provider}/{model} failed: {e}")
-        _classify_cooldown(provider, e)
-        for fp, fm in _fallback_models("research", provider):
-            try:
-                text = _call_provider(fp, fm, prompt, max_tokens=_max_tokens_for(fp, "research"), agent_tag=f"{agent_tag}_{fp}_fallback")
-                return _parse_json(text)
-            except Exception as fe:
-                log.warning(f"[LLM] Fallback research model {fp}/{fm} failed: {fe}")
-                _classify_cooldown(fp, fe)
-        log.error("[LLM] All research models failed; returning no picks instead of crashing cycle.")
+        picked = _pick_model("research", mode)
+    except Exception as exc:
+        log.error("[LLM] No research model available: %s", exc)
+        return _failed_research("no_models_available")
+    if not picked:
+        return _failed_research("no_models_available")
+    provider, model = picked
+
+    def _try(prov: str, mod: str, tag: str):
+        if _model_is_suppressed(prov, mod) or not _provider_ready(prov):
+            if _model_is_suppressed(prov, mod):
+                _log_suppressed_skip(prov, mod)
+            else:
+                log.info("[LLM] Skipping %s/%s — provider is backing off.", prov, mod)
+            return None
+        try:
+            text = _call_provider(
+                prov, mod, prompt,
+                max_tokens=_max_tokens_for(prov, "research"),
+                agent_tag=tag,
+                mark_success=False,
+            )
+        except Exception as exc:
+            log.warning("[LLM] Research model %s/%s failed: %s", prov, mod, exc)
+            _classify_cooldown(prov, exc, model=mod)
+            if _is_rate_limited_error(exc):
+                log.warning("[LLM] %s rate-limited — backing off and trying the next tier.", prov)
+            return None
+        accepted = _accept_research_parse(prov, _parse_json(text))
+        if accepted:
+            return accepted
+        log.warning(
+            "[LLM] %s/%s returned an unusable research body (prose, fence-only, or empty object) — trying next tier.",
+            prov, mod,
+        )
         return None
+
+    accepted = _try(provider, model, agent_tag)
+    if accepted:
+        return accepted
+    for fp, fm in _fallback_models("research", provider):
+        accepted = _try(fp, fm, f"{agent_tag}_{fp}_fallback")
+        if accepted:
+            return accepted
+    log.error("[LLM] All research models failed; this is a research failure, not an empty pick set.")
+    return _failed_research("research_failed")
 
 
 _FALLBACK_CHAIN = [("anthropic",None),("openai",None),("mistral",None),("deepseek",None)]
@@ -786,14 +1124,14 @@ def query_analysis(prompt: str, agent_tag: str = "analysis") -> Optional[dict]:
         return _parse_json(text)
     except Exception as e:
         log.warning(f"[LLM] Primary analysis model {provider}/{model} failed: {e}")
-        _classify_cooldown(provider, e)
+        _classify_cooldown(provider, e, model=model)
         for fp, fm in _fallback_models("analysis", provider):
             try:
                 text = _call_provider(fp, fm, prompt, max_tokens=_max_tokens_for(fp, "analysis"), agent_tag=f"{agent_tag}_{fp}_fallback")
                 return _parse_json(text)
             except Exception as fe:
                 log.warning(f"[LLM] Fallback analysis model {fp}/{fm} failed: {fe}")
-                _classify_cooldown(fp, fe)
+                _classify_cooldown(fp, fe, model=fm)
         log.error("[LLM] All analysis models failed; returning SKIP instead of crashing cycle.")
         return {"action": "SKIP", "shares": 0, "rationale": "All configured LLM providers failed or are cooling down"}
 
@@ -811,28 +1149,53 @@ def _dual_pair() -> list[tuple[str, str]]:
 
 def _dual_research(prompt: str, agent_tag: str) -> dict:
     results = {}
+    valid = 0
+    failure_kinds = []
     for provider, model in _dual_pair():
+        if _model_is_suppressed(provider, model) or not _provider_ready(provider):
+            if _model_is_suppressed(provider, model):
+                _log_suppressed_skip(provider, model)
+            continue
         try:
-            text = _call_provider(provider, model, prompt, max_tokens=600, agent_tag=f"{agent_tag}_{provider}")
+            text = _call_provider(
+                provider, model, prompt, max_tokens=600,
+                agent_tag=f"{agent_tag}_{provider}", mark_success=False,
+            )
             parsed = _parse_json(text)
-            if parsed and "selected" in parsed:
-                for pick in parsed["selected"]:
-                    ticker = pick.get("ticker", "")
-                    if not ticker:
-                        continue
-                    if ticker in results:
-                        results[ticker]["confidence"] = (results[ticker]["confidence"] + pick.get("confidence", 0.5)) / 2
-                        results[ticker]["reason"] += f" | {provider} agrees: {pick.get('reason','')}"
-                        results[ticker]["dual_agree"] = True
-                    else:
-                        results[ticker] = {"ticker": ticker, "reason": pick.get("reason", ""),
-                                           "confidence": pick.get("confidence", 0.5),
-                                           "source": provider, "dual_agree": False}
+            if not _research_payload_is_valid(parsed):
+                log.warning("[LLM/DualResearch] %s returned an unusable body — trying next model.", provider)
+                failure_kinds.append("unusable")
+                continue
+            _mark_provider_success(provider)
+            valid += 1
+            for pick in parsed["selected"]:
+                if not isinstance(pick, dict):
+                    continue
+                ticker = pick.get("ticker", "")
+                if not ticker:
+                    continue
+                if ticker in results:
+                    results[ticker]["confidence"] = (results[ticker]["confidence"] + pick.get("confidence", 0.5)) / 2
+                    results[ticker]["reason"] += f" | {provider} agrees: {pick.get('reason','')}"
+                    results[ticker]["dual_agree"] = True
+                else:
+                    results[ticker] = {"ticker": ticker, "reason": pick.get("reason", ""),
+                                       "confidence": pick.get("confidence", 0.5),
+                                       "source": provider, "dual_agree": False}
         except Exception as e:
             log.warning(f"[LLM/DualResearch] {provider} failed: {e}")
-            time.sleep(1)
+            _classify_cooldown(provider, e, model=model)
+            failure_kinds.append("rate_limited" if _is_rate_limited_error(e) else "error")
+    if valid == 0:
+        if failure_kinds and all(kind == "rate_limited" for kind in failure_kinds):
+            reason = "rate_limited"
+        elif failure_kinds and all(kind == "unusable" for kind in failure_kinds):
+            reason = "invalid_parse"
+        else:
+            reason = "research_failed"
+        return _failed_research(reason)
     picks = sorted(results.values(), key=lambda x: (x["dual_agree"], x["confidence"]), reverse=True)
-    return {"selected": picks[:5]}
+    return _annotate_research_status({"selected": picks[:5]})
 
 
 def _dual_analysis(prompt: str, agent_tag: str) -> dict:

@@ -352,9 +352,16 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
                 if str(row.get("risk_status") or row.get("status") or "").upper() == "BLOCKED"
             ]
         state["last_orders"] = persisted_funnel.get("orders") or state.get("last_orders") or []
-        for _key in ("token_usage", "rebalance", "hard_rebalance", "buy_lock", "llm_mode", "last_run"):
+        for _key in ("token_usage", "rebalance", "hard_rebalance", "buy_lock", "llm_mode", "last_run", "research_status"):
             if persisted_artifacts.get(_key) is not None:
                 state[_key] = persisted_artifacts[_key]
+    research_status = state.get("research_status")
+    if research_status is None:
+        research_status = persisted_artifacts.get("research_status")
+    if research_status is None:
+        research_status = cached.get("research_status")
+    if research_status is not None:
+        state["research_status"] = research_status
     state["signal_snapshots"] = ledger_data.get("signal_snapshots") or []
     state["source_accuracy_stats"] = ledger_data.get("source_accuracy_stats") or {}
 

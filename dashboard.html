@@ -48,7 +48,7 @@
 <section class="section"><div class="section-title">Portfolio Composition</div><div class="card"><div id="composition"></div></div></section>
 <section class="section"><div class="section-title">Open Positions</div><div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Bucket</th><th>Class</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Price</th><th class="num">Value</th><th class="num">P/L</th><th class="num">Today</th><th>Why</th></tr></thead><tbody id="positions-body"><tr><td colspan="10" class="empty">No positions loaded</td></tr></tbody></table></div></section>
 <section class="section"><div class="section-title">Recent Trades / Orders</div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Ticker</th><th>Bucket</th><th>Side</th><th class="num">Qty</th><th class="num">Amount</th><th>Status</th><th>Reason</th></tr></thead><tbody id="orders-body"><tr><td colspan="8" class="empty">No orders yet</td></tr></tbody></table></div></section>
-<section class="section"><div class="section-title">Candidates / Blocked Ideas</div><div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Bucket</th><th>Model</th><th class="num">Confidence</th><th>Payoff</th><th>Reason</th></tr></thead><tbody id="candidates-body"><tr><td colspan="6" class="empty">No candidate data</td></tr></tbody></table></div></section>
+<section class="section"><div class="section-title">Candidates / Blocked Ideas <span id="research-status-note" class="mini"></span></div><div class="table-wrap"><table><thead><tr><th>Ticker</th><th>Bucket</th><th>Model</th><th class="num">Confidence</th><th>Payoff</th><th>Reason</th></tr></thead><tbody id="candidates-body"><tr><td colspan="6" class="empty">No candidate data</td></tr></tbody></table></div></section>
 <section class="section"><div class="section-title">Activity Log</div><div class="log" id="activity-log"></div></section>
 </main><aside class="side">
 <div class="section-title">Model Config</div>
@@ -422,6 +422,11 @@ function renderCandidates(s) {
     return true;
   });
   const cs = [...picks, ...extras];
+  renderResearchStatus(s);
+  const research = (s && s.research_status) || {};
+  const emptyMsg = research.status === 'failed'
+    ? 'Research failed — not an empty-picks day'
+    : (research.status === 'empty' ? 'Research returned no LLM picks' : 'No candidate data — run a cycle first');
   document.getElementById('candidates-body').innerHTML = cs.slice(0, 40).map(c => {
     const sym = c.ticker || c.symbol || '?';
     const bucket = c.bucket || bucketForSymbol(sym, s) || '—';
@@ -431,7 +436,31 @@ function renderCandidates(s) {
     return '<tr><td>' + yahoo(sym) + '</td><td><span class="pill purple">' + esc(bucket) + '</span></td><td>' + esc(c.source || c.model || c.llm_model || '—') + '</td>' +
       '<td class="num"><span class="pill ' + pillCls + '">' + conf + '</span></td><td>' + esc(c.payoff_time || c.outcome || '—') + '</td>' +
       '<td><span class="why" title="' + esc(reason) + '">' + esc(reason) + '</span></td></tr>';
-  }).join('') || '<tr><td colspan="6" class="empty">No candidate data — run a cycle first</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="empty">' + esc(emptyMsg) + '</td></tr>';
+}
+
+function renderResearchStatus(s) {
+  const el = document.getElementById('research-status-note');
+  if (!el) return;
+  const r = (s && s.research_status) || {};
+  const entry = r.entry_source || '';
+  let text = '';
+  let color = 'var(--muted)';
+  if (r.status === 'failed') {
+    const via = (entry === 'screener' || entry === 'mixed')
+      ? ' Entries from screener ensemble.'
+      : ' No screener universe to fall back on.';
+    text = 'Research failed (' + (r.reason || 'provider, parse, or budget') + ').' + via;
+    color = 'var(--red)';
+  } else if (r.status === 'empty') {
+    text = 'Research returned a valid empty set.' + (entry === 'screener' ? ' Entries from screener ensemble.' : '');
+    color = 'var(--yellow)';
+  } else if (r.status === 'ok') {
+    text = 'Research ok.' + (entry === 'research' ? ' Entries from LLM research.' : (entry ? ' Entries: ' + entry + '.' : ''));
+    color = 'var(--green)';
+  }
+  el.textContent = text;
+  el.style.color = color;
 }
 
 function flattenSources(src) {
@@ -710,7 +739,15 @@ function renderFunnel(s) {
   set('fun-blocked', (s.blocked_ideas || []).length);
   set('fun-orders', (s.last_orders || []).length);
   const note = document.getElementById('funnel-note');
-  if (note) note.textContent = s.last_run ? 'From cycle at ' + new Date(s.last_run).toLocaleString() : 'From latest SQLite-backed cycle projection';
+  if (note) {
+    const r = s.research_status || {};
+    const base = s.last_run ? 'From cycle at ' + new Date(s.last_run).toLocaleString() : 'From latest SQLite-backed cycle projection';
+    let extra = '';
+    if (r.status === 'failed') extra = ' · Research failed' + (r.entry_source === 'screener' ? ' (screener entries)' : '');
+    else if (r.status === 'empty') extra = ' · Research empty' + (r.entry_source === 'screener' ? ' (screener entries)' : '');
+    else if (r.entry_source) extra = ' · Entries: ' + r.entry_source;
+    note.textContent = base + extra;
+  }
 }
 
 function drawBarChart(canvasId, labels, values, opts) {

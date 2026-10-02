@@ -3,6 +3,7 @@
 import json
 import logging
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 import agent_config as cfg
@@ -19,12 +20,21 @@ from market_data import (
 log = logging.getLogger(__name__)
 
 
-def research_agent(tickers: list, bucket: Bucket) -> list:
+@dataclass
+class ResearchOutcome:
+    """LLM research result. ``empty`` is a valid no-pick parse, not a failure."""
+
+    candidates: list
+    status: str
+    reason: str = ""
+
+
+def research_agent(tickers: list, bucket: Bucket) -> ResearchOutcome:
     log.info("[%s/Research] Screening %d tickers (mode=%s)...", bucket.name, len(tickers), active_mode())
 
     if budget_exhausted():
-        log.warning("[%s/Research] Token budget exhausted — skipping.", bucket.name)
-        return []
+        log.warning("[%s/Research] Token budget exhausted — research failed, not an empty pick set.", bucket.name)
+        return ResearchOutcome([], "failed", "budget_exhausted")
 
     market_data = []
     fetcher = fetch_crypto_data if is_crypto_bucket(bucket) else fetch_stock_data
@@ -75,15 +85,26 @@ Respond ONLY with valid JSON — no other text:
 Return up to {cfg.RESEARCH_TOP_N} entries, ranked by confidence (highest first)."""
 
     result = query_research(prompt, agent_tag=f"{bucket.name}_research")
-    if not result:
-        log.error("[%s/Research] No result from LLM router.", bucket.name)
-        return []
+    if not isinstance(result, dict):
+        log.error("[%s/Research] No result from LLM router — research failed.", bucket.name)
+        return ResearchOutcome([], "failed", "no_result")
 
-    selected = trim_research_selections(result.get("selected", []), cfg.RESEARCH_TOP_N)
+    status = str(result.get("research_status") or "")
+    reason = str(result.get("research_reason") or "")
+    selected = result.get("selected")
+    if status == "failed" or not isinstance(selected, list):
+        log.error("[%s/Research] Research failed (%s).", bucket.name, reason or "invalid_result")
+        return ResearchOutcome([], "failed", reason or "research_failed")
+
+    selected = trim_research_selections(selected, cfg.RESEARCH_TOP_N)
+    if not selected:
+        log.info("[%s/Research] Valid empty candidate set (%s).", bucket.name, reason or "valid_empty_selected")
+        return ResearchOutcome([], "empty", reason or "valid_empty_selected")
+
     log.info(
         "[%s/Research] Selected: %s (dual_agree flags: %s)",
         bucket.name,
         [s["ticker"] for s in selected],
         [s.get("dual_agree") for s in selected],
     )
-    return selected
+    return ResearchOutcome(selected, "ok", reason)
