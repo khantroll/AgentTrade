@@ -256,6 +256,142 @@ def projection_utf8_size(payload: str) -> int:
     return len(payload.encode("utf-8"))
 
 
+# Broker order facts worth keeping. Everything else (dashboard state,
+# screener dumps, OHLCV, LLM bodies, and a previous raw_json string) is how
+# orders.raw_json grew to multiple megabytes per row.
+_ORDER_SCALAR_KEYS = (
+    "id",
+    "order_id",
+    "client_order_id",
+    "alpaca_order_id",
+    "symbol",
+    "ticker",
+    "side",
+    "qty",
+    "filled_qty",
+    "filled_avg_price",
+    "notional",
+    "notional_usd",
+    "shares",
+    "type",
+    "order_type",
+    "time_in_force",
+    "order_class",
+    "limit_price",
+    "stop_price",
+    "trail_price",
+    "trail_percent",
+    "hwm",
+    "status",
+    "submitted_at",
+    "created_at",
+    "filled_at",
+    "updated_at",
+    "expired_at",
+    "canceled_at",
+    "cancelled_at",
+    "asset_class",
+    "asset_id",
+    "strategy_name",
+    "bucket",
+    "stop_loss_price",
+    "take_profit_price",
+    "analysis_path",
+    "rationale",
+    "source",
+    "entry_source",
+    "candidate_source",
+    "extended_hours",
+)
+_ORDER_TEXT_CAP = 500
+MAX_ORDER_RAW_BYTES = 8 * 1024
+
+
+def _order_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= _ORDER_TEXT_CAP else value[:_ORDER_TEXT_CAP]
+    return None
+
+
+def _order_scalars(row: dict) -> dict:
+    """Copy allowlisted scalars. Never follow raw_json, legs, or state blobs."""
+    out = {}
+    for key in _ORDER_SCALAR_KEYS:
+        if key not in row:
+            continue
+        kept = _order_scalar(row.get(key))
+        if kept is not None:
+            out[key] = kept
+    return out
+
+
+def normalize_order_payload(order: Any) -> dict:
+    """Broker order reduced to KB-scale fields.
+
+    A previous ``raw_json`` value is ignored. Re-saving a loaded SQLite row
+    used to embed that string inside the next ``raw_json``, which doubled the
+    blob on every dashboard publish once Alpaca returned no open orders.
+    Nested screener, OHLCV, and LLM bodies are dropped the same way.
+    """
+    data = order
+    if isinstance(order, str):
+        if not order.strip():
+            return {}
+        try:
+            import json
+            data = json.loads(order)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(data, dict):
+        return {}
+    out = _order_scalars(data)
+    legs = data.get("legs")
+    if isinstance(legs, list):
+        slim_legs = []
+        for leg in legs[:4]:
+            if isinstance(leg, dict):
+                slim = _order_scalars(leg)
+                if slim:
+                    slim_legs.append(slim)
+        if slim_legs:
+            out["legs"] = slim_legs
+    for nest_key, fields in (("stop_loss", ("stop_price", "limit_price")), ("take_profit", ("limit_price", "stop_price"))):
+        sub = data.get(nest_key)
+        if not isinstance(sub, dict):
+            continue
+        kept = {}
+        for field in fields:
+            scalar = _order_scalar(sub.get(field))
+            if scalar is not None:
+                kept[field] = scalar
+        if kept:
+            out[nest_key] = kept
+    return out
+
+
+def order_raw_json(order: Any) -> str:
+    """Compact JSON for ``orders.raw_json``. Always at most 8 KiB."""
+    import json
+
+    payload = normalize_order_payload(order)
+    encoded = json.dumps(payload, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) <= MAX_ORDER_RAW_BYTES:
+        return encoded
+    payload.pop("legs", None)
+    payload.pop("rationale", None)
+    encoded = json.dumps(payload, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) <= MAX_ORDER_RAW_BYTES:
+        return encoded
+    tiny = {
+        key: payload[key]
+        for key in ("id", "order_id", "symbol", "ticker", "side", "qty", "status", "stop_price", "limit_price")
+        if key in payload
+    }
+    return json.dumps(tiny, separators=(",", ":"))
+
+
 def fit_dashboard_projection(state: dict, limit: int) -> tuple[Optional[str], dict]:
     """Serialize state under ``limit`` bytes.
 
