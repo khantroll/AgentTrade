@@ -4,6 +4,7 @@ import json
 import logging
 
 import agent_config as cfg
+from agents.screener_fallback import analysis_result_failed, deterministic_signal_decision
 from analysis_funnel import partition_for_analysis
 from buckets import Bucket
 from llm_router import active_mode, budget_exhausted, query_analysis
@@ -162,17 +163,39 @@ Respond ONLY with valid JSON — no other text:
 {response_schema}"""
 
         result = query_analysis(prompt, agent_tag=f"{bucket.name}_analysis")
-        if not result:
-            log.error("[%s/Analysis] No result for %s.", bucket.name, ticker)
-            decisions.append({
-                "ticker": ticker,
-                "action": "SKIP",
-                "skip_reason": "llm_no_result",
-                "blocked_reason": "llm_no_result",
-                "rationale": "Analysis LLM returned no result",
-                "bucket": bucket.name,
-                "current_price": (data or {}).get("current_price") if data else None,
-            })
+        if analysis_result_failed(result):
+            # A failed or empty analysis parse is not a SKIP vote. Screener
+            # strength decides; risk and Tier 2 still gate the order.
+            stamped = dict(candidate)
+            stamped["signal_strength"] = strength
+            stamped["total_score"] = strength
+            if components:
+                stamped["signal_mix"] = components
+                stamped["signal_components"] = components
+            decision = deterministic_signal_decision(
+                stamped,
+                bucket,
+                market=data if isinstance(data, dict) else None,
+                failure=result if isinstance(result, dict) else None,
+            )
+            decision["reddit_detail"] = reddit_detail or decision.get("reddit_detail")
+            log.warning(
+                "[%s/Analysis] %s: LLM analysis failed (%s) — %s via signal_strength %s",
+                bucket.name,
+                ticker,
+                decision.get("analysis_reason") or "analysis_failed",
+                decision.get("action"),
+                decision.get("signal_strength"),
+            )
+            audit_log(
+                decision.get("action", "SKIP"),
+                ticker,
+                prompt,
+                result,
+                decision,
+                data if isinstance(data, dict) else {},
+            )
+            decisions.append(decision)
             continue
 
         # Normalize LLM contract: decision → action; strip executable sizing
