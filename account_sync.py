@@ -17,11 +17,15 @@ log = logging.getLogger(__name__)
 EQUITY_MISMATCH_THRESHOLD = 5.0
 
 # Dashboard projection cap. The public agent_state.json once grew to ~1.4GB
-# from nested escape bloat. Refuse that write instead of replacing the file.
-# Default is 8 MiB — a few megabytes, not gigabytes. Override with
-# AGENT_STATE_MAX_BYTES. This does not delete or rewrite the SQLite ledger.
-# A multi-gigabyte sqlite file that OOMs the host is a separate ops follow-up.
+# from nested escape bloat, and later cycles refused to write once screener
+# mention dumps and duplicated funnel blobs passed 8 MiB — leaving the
+# dashboard on the last successful SKIP snapshot. Writers prune those bodies
+# first (see agenttrade.state_size). The default cap stays 8 MiB. Override
+# with AGENT_STATE_MAX_BYTES; values above the hard ceiling are clamped so a
+# workaround cannot recreate a multi-hundred-megabyte projection.
+# Refusing a projection does not roll back SQLite rows already committed.
 DEFAULT_AGENT_STATE_MAX_BYTES = 8 * 1024 * 1024
+HARD_AGENT_STATE_MAX_BYTES = 32 * 1024 * 1024
 
 
 def _fetch_open_orders(limit: int = 200) -> list:
@@ -196,27 +200,51 @@ def agent_state_max_bytes() -> int:
         return DEFAULT_AGENT_STATE_MAX_BYTES
     if value < 1:
         return DEFAULT_AGENT_STATE_MAX_BYTES
+    if value > HARD_AGENT_STATE_MAX_BYTES:
+        log.warning(
+            "[State] AGENT_STATE_MAX_BYTES=%d exceeds hard ceiling %d; clamping",
+            value,
+            HARD_AGENT_STATE_MAX_BYTES,
+        )
+        return HARD_AGENT_STATE_MAX_BYTES
     return value
 
 
 def dumps_dashboard_projection(state: dict) -> Optional[str]:
-    """Serialize the dashboard projection, or None if it exceeds the write cap.
+    """Serialize a pruned dashboard projection, or None if it still exceeds the cap.
 
-    Callers must skip both the private agent_state.json replace and the public
-    copy when this returns None. SQLite is not touched here.
+    Bulky screener/LLM bodies are removed first so a normal cycle stays under
+    the cap and the dashboard receives this cycle's decisions, positions, and
+    fills. Callers must skip both JSON replaces when this returns None.
+    SQLite is not touched here, and a refusal does not roll back ledger rows
+    the cycle already committed.
     """
-    payload = json.dumps(state, indent=2)
-    size = len(payload.encode("utf-8"))
+    from agenttrade.state_size import fit_dashboard_projection
+
     limit = agent_state_max_bytes()
-    if size > limit:
+    payload, info = fit_dashboard_projection(state, limit)
+    if payload is None:
         log.error(
-            "[State] Refusing agent_state.json write: %d bytes exceeds "
-            "AGENT_STATE_MAX_BYTES=%d. Existing projection left in place. "
-            "SQLite ledger was not modified.",
-            size,
+            "[State] Refusing agent_state.json write: pruned projection is "
+            "%d bytes, above AGENT_STATE_MAX_BYTES=%d. Existing projection "
+            "left in place. SQLite rows already committed this cycle are not "
+            "rolled back.",
+            int(info.get("bytes") or 0),
             limit,
         )
         return None
+    if info.get("shed"):
+        log.warning(
+            "[State] Dropped optional dashboard sections to fit %d-byte cap: %s",
+            limit,
+            ", ".join(info["shed"]),
+        )
+    elif not info.get("pretty"):
+        log.info(
+            "[State] Wrote compact agent_state.json (%d bytes, cap %d)",
+            info.get("bytes"),
+            limit,
+        )
     return payload
 
 
@@ -237,7 +265,25 @@ def atomic_write_text(path: str, payload: str, chmod: Optional[int] = None) -> N
 
 
 def load_state_file() -> dict:
-    """NON-AUTHORITATIVE: read dashboard projection cache if present."""
+    """NON-AUTHORITATIVE: read dashboard projection cache if present.
+
+    A file already over the cap is ignored. The next successful publish
+    replaces it, so a bloated on-disk cache does not have to be truncated
+    by hand and is not merged back into the following cycle.
+    """
+    try:
+        size = os.path.getsize(cfg.STATE_FILE)
+    except OSError:
+        return {}
+    limit = agent_state_max_bytes()
+    if size > limit:
+        log.error(
+            "[State] Ignoring on-disk agent_state.json (%d bytes > %d). "
+            "The next successful publish replaces it with a pruned projection.",
+            size,
+            limit,
+        )
+        return {}
     try:
         with open(cfg.STATE_FILE, encoding="utf-8") as f:
             return json.load(f)

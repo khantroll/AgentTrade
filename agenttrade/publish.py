@@ -431,9 +431,11 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
 def publish_dashboard_state(state: dict) -> None:
     """Write cache JSON for dashboard (non-authoritative).
 
-    Refuses the replace when the serialized payload exceeds
-    AGENT_STATE_MAX_BYTES (default 8 MiB). The previous projection files stay
-    in place. SQLite is not modified.
+    Prunes bulky screener and LLM bodies first, then refuses the replace only
+    if the pruned payload still exceeds AGENT_STATE_MAX_BYTES (default 8 MiB).
+    The previous projection files stay in place on a refusal. SQLite is not
+    modified by this function, and a refusal does not roll back rows the
+    cycle already committed.
     """
     payload = dumps_dashboard_projection(state)
     if payload is None:

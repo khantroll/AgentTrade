@@ -14,6 +14,24 @@ log = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 4
 
+
+def _json_for_store(value: Any) -> str:
+    """Persist a slim JSON body so later dashboard reloads stay under the cap."""
+    from agenttrade.state_size import slim_persisted_json
+
+    return json.dumps(slim_persisted_json(value))
+
+
+def _json_from_store(raw: Optional[str]) -> Any:
+    """Parse stored JSON and drop bulky nested bodies from older rows."""
+    from agenttrade.state_size import slim_persisted_json
+
+    try:
+        parsed = json.loads(raw if raw else "null")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return slim_persisted_json(parsed)
+
 _DB_INITIALIZED = False
 
 SCHEMA_SQL = """
@@ -808,7 +826,7 @@ def insert_strategy_signal(cycle_run_id: int, row: dict) -> None:
                 row.get("confidence"),
                 row.get("score"),
                 row.get("reason") or row.get("rationale"),
-                json.dumps(row),
+                _json_for_store(row),
             ),
         )
 
@@ -830,7 +848,7 @@ def insert_sentiment_score(cycle_run_id: int, row: dict) -> None:
                 row.get("score"),
                 row.get("confidence"),
                 row.get("summary"),
-                json.dumps(row),
+                _json_for_store(row),
             ),
         )
 
@@ -1129,7 +1147,7 @@ def insert_signal_attribution(cycle_run_id: int, row: dict) -> int:
                 _f(row.get("total_score")),
                 json.dumps(row.get("components") or {}),
                 json.dumps(row.get("pipelines") or {}),
-                json.dumps(row),
+                _json_for_store(row),
             ),
         )
         return int(cur.lastrowid)
@@ -1211,7 +1229,7 @@ def insert_signal_snapshot(cycle_run_id: int, row: dict) -> int:
                 _f(row.get("total_score")),
                 json.dumps(row.get("components") or {}),
                 json.dumps(row.get("explainability") or {}),
-                json.dumps(row),
+                _json_for_store(row),
             ),
         )
         return int(cur.lastrowid)
@@ -1571,7 +1589,7 @@ def insert_funnel_event(
             (
                 cycle_run_id, utc_now(), str(stage).upper(),
                 sym, bkt,
-                status or "", reason or "", json.dumps(payload or {}),
+                status or "", reason or "", _json_for_store(payload or {}),
             ),
         )
         return int(cur.lastrowid or 0)
@@ -1612,7 +1630,7 @@ def upsert_cycle_artifact(cycle_run_id: int, artifact_key: str, payload: Any) ->
             ON CONFLICT(cycle_run_id, artifact_key) DO UPDATE SET
                 created_at=excluded.created_at, payload_json=excluded.payload_json
             """,
-            (cycle_run_id, utc_now(), artifact_key, json.dumps(payload)),
+            (cycle_run_id, utc_now(), artifact_key, _json_for_store(payload)),
         )
 
 
@@ -1625,10 +1643,8 @@ def get_cycle_artifacts(cycle_run_id: int) -> dict:
         ).fetchall()
     out = {}
     for row in rows:
-        try:
-            out[row["artifact_key"]] = json.loads(row["payload_json"] or "null")
-        except (TypeError, json.JSONDecodeError):
-            out[row["artifact_key"]] = None
+        parsed = _json_from_store(row["payload_json"])
+        out[row["artifact_key"]] = parsed
     return out
 
 
@@ -1650,12 +1666,9 @@ def get_cycle_funnel(cycle_run_id: int) -> dict:
     }
     for row in rows:
         d = dict(row)
-        try:
-            payload = json.loads(d.get("raw_json") or "{}")
-        except json.JSONDecodeError:
-            payload = {}
+        payload = _json_from_store(d.get("raw_json"))
         if not isinstance(payload, dict):
-            payload = {"value": payload}
+            payload = {} if payload is None else {"value": payload}
         payload.setdefault("ticker", d.get("symbol"))
         payload.setdefault("bucket", d.get("bucket") or None)
         if d.get("status") and not payload.get("status"):
