@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime
 
 import yfinance as yf
@@ -12,6 +13,17 @@ from buckets import Bucket
 log = logging.getLogger(__name__)
 
 AUDIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audit")
+
+_UNSAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def audit_filename_symbol(symbol: str) -> str:
+    """Symbol safe to embed in an audit filename.
+
+    ``SOL/USD`` becomes ``SOL-USD``. The record body keeps the original symbol.
+    """
+    cleaned = _UNSAFE_FILENAME.sub("-", str(symbol or "").strip()).strip(".-_")
+    return cleaned or "UNKNOWN"
 
 
 def compact_stock_data_rows(rows: list, limit: int = 18) -> list:
@@ -40,7 +52,8 @@ def audit_log(event, ticker, prompt, raw_response, decision, market_snapshot):
     try:
         os.makedirs(AUDIT_DIR, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        fname = os.path.join(AUDIT_DIR, f"{ts}_{ticker}_{event}.log")
+        safe_ticker = audit_filename_symbol(ticker)
+        fname = os.path.join(AUDIT_DIR, f"{ts}_{safe_ticker}_{event}.log")
         with open(fname, "w", encoding="utf-8") as f:
             f.write(
                 f"=== AgentTrade Audit ===\nTime: {datetime.now().isoformat()}\n"

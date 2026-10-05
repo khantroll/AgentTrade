@@ -31,7 +31,7 @@
   <div class="metric"><div class="label">Open Positions</div><div class="value" id="positions-count">—</div><div class="sub" id="positions-sub"></div></div>
   <div class="metric"><div class="label">Tokens Today</div><div class="value" id="tokens-today">—</div><div class="sub" id="tokens-sub"></div></div>
   <div class="metric"><div class="label">Est. Cost Today</div><div class="value" id="cost-today">—</div><div class="sub" id="calls-sub"></div></div>
-  <div class="metric"><div class="label">Trades Today</div><div class="value" id="trades-today">—</div><div class="sub">max 5 / day</div></div>
+  <div class="metric"><div class="label">Trades Today</div><div class="value" id="trades-today">—</div><div class="sub" id="trades-cap">—</div></div>
 </div>
 <div class="wrap"><main>
 <section class="section"><div class="section-title">Bucket Allocations <span id="last-upd" class="mini"></span></div><div class="grid bucket-grid" id="bucket-grid"></div></section>
@@ -61,7 +61,7 @@
 <div class="card"><p class="mini" style="margin:0 0 8px">Simulate momentum screener + rule-based decisions on historical prices (30–90s).</p><button type="button" class="btn warn" style="width:100%" onclick="switchTab('backtest')">OPEN BACKTEST TAB</button></div>
 <div class="section-title">Rebalance Status</div><div class="card" id="rebalance">No data</div>
 <div class="section-title">Risk Gauges</div>
-<div class="card"><div class="kv"><span>Cash utilized</span><span id="cash-util">—</span></div><div class="kv"><span>Positions / 15</span><span id="risk-pos">—</span></div><div class="kv"><span>Daily trades / 5</span><span id="risk-trades">—</span></div><div class="kv"><span>Token budget</span><span id="risk-token">—</span></div></div>
+<div class="card"><div class="kv"><span>Cash utilized</span><span id="cash-util">—</span></div><div class="kv"><span>Positions / 15</span><span id="risk-pos">—</span></div><div class="kv"><span id="risk-trades-label">Daily trades</span><span id="risk-trades">—</span></div><div class="kv"><span>Token budget</span><span id="risk-token">—</span></div></div>
 <div class="section-title">Load State</div>
 <div class="card"><div class="mini">Dashboard reads a generated <b>agent_state.json</b> projection backed by Alpaca + SQLite. Auto-refreshes every 30s.</div><button class="btn" onclick="loadState(true)">LOAD AGENT_STATE.JSON</button></div>
 <div class="section-title">Bucket Config</div>
@@ -254,6 +254,33 @@ function apiUrl(path) {
 }
 
 function n(v) { return Number(String(v ?? '0').replace(/[$,%]/g, '').replace(/,/g, '')) || 0; }
+let healthTradeLimit = null;
+function configuredDailyCap(s) {
+  if (!s || s.max_daily_trades == null || s.max_daily_trades === '') return null;
+  return n(s.max_daily_trades);
+}
+function dailyTradeBanner(used, limit) {
+  const u = n(used);
+  const msg = u + '/' + limit + ' used';
+  return u >= n(limit) ? msg + ' · no new orders today' : msg;
+}
+function applyDailyTradeStrip(used, limit) {
+  const trades = document.getElementById('trades-today');
+  const sub = document.getElementById('trades-cap');
+  const risk = document.getElementById('risk-trades');
+  const label = document.getElementById('risk-trades-label');
+  if (trades && used != null) trades.textContent = String(n(used));
+  if (limit == null || limit === '') {
+    if (sub) sub.textContent = '—';
+    if (label) label.textContent = 'Daily trades';
+    if (risk && used != null) risk.textContent = String(n(used));
+    return;
+  }
+  const lim = n(limit);
+  if (sub) sub.textContent = 'max ' + lim + ' / day';
+  if (label) label.textContent = 'Daily trades / ' + lim;
+  if (risk) risk.textContent = n(used) + '/' + lim;
+}
 function money(v) { const x = n(v); return '$' + x.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
 function pct(v) { const x = n(v); return (Math.abs(x) <= 1 ? x * 100 : x).toFixed(1) + '%'; }
 function cls(v) { return n(v) >= 0 ? 'pos' : 'neg'; }
@@ -587,7 +614,9 @@ function renderAll(s, silent) {
   document.getElementById('cash-sub').textContent = pv ? pct(cash / pv) + ' of portfolio' : '';
   document.getElementById('positions-count').textContent = ps.length;
   document.getElementById('positions-sub').textContent = ps.length + ' active hold' + (ps.length === 1 ? '' : 's');
-  document.getElementById('trades-today').textContent = s.daily_trades ?? 0;
+  const tradeLimit = healthTradeLimit != null ? healthTradeLimit.limit : configuredDailyCap(s);
+  const tradesUsed = healthTradeLimit != null ? healthTradeLimit.daily : (s.daily_trades ?? 0);
+  applyDailyTradeStrip(tradesUsed, tradeLimit);
   lastRunMode = s.llm_mode || lastRunMode || 'tiered';
   const tok = s.token_usage || {};
   const budget = n(tok.budget || 200000);
@@ -597,7 +626,6 @@ function renderAll(s, silent) {
   document.getElementById('last-upd').textContent = s.last_run ? 'Last run: ' + new Date(s.last_run).toLocaleString() : '';
   document.getElementById('cash-util').textContent = pv ? pct(1 - (cash / pv)) : '—';
   document.getElementById('risk-pos').textContent = ps.length + '/15';
-  document.getElementById('risk-trades').textContent = (s.daily_trades ?? 0) + '/5';
   renderBuckets(s);
   renderPositions(s);
   renderOrders(s);
@@ -1874,9 +1902,14 @@ function buildClientHealth(apiError) {
     id: 'token_budget', label: 'Token budget', status: pct >= 100 ? 'error' : pct >= 80 ? 'warn' : 'ok',
     message: used.toLocaleString() + ' / ' + budget.toLocaleString() + ' (' + pct + '%)',
   });
+  const tradeCap = configuredDailyCap(s);
+  const tradesUsed = n(s.daily_trades);
   checks.push({
-    id: 'daily_trades', label: 'Daily trade limit', status: n(s.daily_trades) >= 5 ? 'warn' : 'ok',
-    message: n(s.daily_trades) + '/5 used',
+    id: 'daily_trades', label: 'Daily trade limit',
+    status: tradeCap != null && tradesUsed >= tradeCap ? 'warn' : 'ok',
+    message: tradeCap == null ? (tradesUsed + ' used') : dailyTradeBanner(tradesUsed, tradeCap),
+    daily: tradesUsed,
+    limit: tradeCap,
   });
   checks.push({
     id: 'positions', label: 'Open positions', status: 'ok',
@@ -1916,6 +1949,11 @@ function renderHealth(h) {
     const st = h.status || 'unknown';
     overall.textContent = (h.summary || st) + (h.checked_at ? ' · ' + String(h.checked_at).slice(0, 19).replace('T', ' ') : '');
     overall.className = 'mini ' + (st === 'ready' ? 'pos' : st === 'blocked' ? 'error' : '');
+  }
+  const daily = checks.find(c => c.id === 'daily_trades');
+  if (daily && daily.limit != null && daily.limit !== '') {
+    healthTradeLimit = {daily: daily.daily, limit: daily.limit};
+    applyDailyTradeStrip(daily.daily, daily.limit);
   }
 }
 

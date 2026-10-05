@@ -29,7 +29,20 @@ ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if ALPACA_PAPER else "https://api.alpaca.markets"
 
-MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "5"))
+
+def current_max_daily_trades() -> int:
+    """Daily order cap the trading cycle loads in ``refresh_config``.
+
+    ``apply_config_to_env()`` copies non-empty config.json values over the
+    process environment, so a saved config.json wins over ``.env``. The
+    fallback 5 applies only when neither source sets the key. This read does
+    not replace the in-memory cap; ``refresh_config`` does that at cycle start.
+    """
+    apply_config_to_env()
+    return int(os.getenv("MAX_DAILY_TRADES", "5"))
+
+
+MAX_DAILY_TRADES = current_max_daily_trades()
 
 STRATEGY_AGGRESSION = os.getenv("STRATEGY_AGGRESSION", "balanced").lower()
 MAX_BUYS_PER_BUCKET = {"conservative": 1, "balanced": 1, "aggressive": 2}.get(STRATEGY_AGGRESSION, 1)
@@ -117,7 +130,7 @@ def refresh_config() -> None:
     ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
     ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() == "true"
     ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if ALPACA_PAPER else "https://api.alpaca.markets"
-    MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "5"))
+    MAX_DAILY_TRADES = current_max_daily_trades()
     STRATEGY_AGGRESSION = os.getenv("STRATEGY_AGGRESSION", "balanced").lower()
     MAX_BUYS_PER_BUCKET = {"conservative": 1, "balanced": 1, "aggressive": 2}.get(STRATEGY_AGGRESSION, 1)
     MIN_CONFIDENCE_FOR_ANALYSIS = {"conservative": 0.70, "balanced": 0.55, "aggressive": 0.45}.get(
