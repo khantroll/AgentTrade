@@ -267,7 +267,8 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
     except Exception:
         state["completed_trades"] = []
 
-    # daily_trades: prefer live Alpaca count, fall back to SQLite fills table
+    # daily_trades: same AgentTrade entry count the cycle enforces.
+    # Live snapshot when Alpaca is reachable, otherwise the ledger.
     if state.get("daily_trades_live") is None:
         try:
             state["daily_trades"] = ledger.count_fills_today()

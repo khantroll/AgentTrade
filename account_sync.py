@@ -56,14 +56,15 @@ def _order_notional(order: dict) -> float:
 
 
 def _count_trades_today(fills: list, open_orders: list, now=None) -> int:
-    """Distinct orders in the America/Chicago trading day.
+    """AgentTrade entries in the America/Chicago day.
 
-    Partial fills share an order id. Cancelled, failed, and skipped orders
-    are ignored, as are protective bracket sell legs.
+    The health banner and ``count_fills_today`` use this same count. Partial
+    fills share a broker order id. Exits, protective legs, and orders from
+    another app on the account do not count.
     """
-    from trading_day import count_trades_for_day
+    from agenttrade.daily_trades import current_daily_trade_count
 
-    return count_trades_for_day(fills, open_orders, now=now)
+    return current_daily_trade_count(now, extra_fills=fills, extra_orders=open_orders)
 
 
 def refresh_alpaca_snapshot() -> dict:

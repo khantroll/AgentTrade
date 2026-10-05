@@ -68,8 +68,17 @@ def _resolve_equity_open_order_plan(ticker: str, snapshot: dict) -> dict:
 
 
 def _broker_payload(payload: dict) -> dict:
-    """Drop local bookkeeping keys before the Alpaca POST."""
-    return {key: value for key, value in payload.items() if not str(key).startswith("_")}
+    """Drop local bookkeeping keys before the Alpaca POST.
+
+    Stamp ``client_order_id`` so a later count can tell this order from
+    another app using the same Alpaca account.
+    """
+    from trading_day import new_client_order_id
+
+    body = {key: value for key, value in payload.items() if not str(key).startswith("_")}
+    if not body.get("client_order_id"):
+        body["client_order_id"] = new_client_order_id()
+    return body
 
 
 def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
@@ -380,7 +389,8 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                         ticker,
                     )
 
-            order = alpaca_post("/v2/orders", _broker_payload(payload))
+            broker_body = _broker_payload(payload)
+            order = alpaca_post("/v2/orders", broker_body)
             log.info(
                 "[%s/Execution] ✅ %s %s %s | ID: %s",
                 bucket.name,
@@ -399,6 +409,7 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                 "asset_class": "crypto" if is_crypto else "us_equity",
                 "bucket": bucket.name,
                 "order_id": order["id"],
+                "client_order_id": broker_body.get("client_order_id"),
                 "status": "placed",
                 "side": "buy",
                 "rationale": d.get("rationale"),
@@ -514,8 +525,10 @@ def hard_rebalance_agent(
                 "time_in_force": "gtc" if plan.get("is_crypto") else "day",
                 "qty": format_qty_for_asset(qty, asset),
             }
+            from trading_day import new_client_order_id
+            payload["client_order_id"] = new_client_order_id()
             order = alpaca_post("/v2/orders", payload)
-            cfg.increment_daily_trades()
+            # Exits do not consume a daily entry slot.
             log.info("[HardRebalance] ✅ SELL %s ×%s | %s", sym, qty, plan.get("reason", "")[:80])
 
             held = pos_by_sym.get(sym) or {}

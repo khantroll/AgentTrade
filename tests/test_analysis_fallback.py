@@ -411,3 +411,4 @@ def test_protective_sell_still_runs_without_analysis(monkeypatch):
     assert sells[0]["ticker"] == "GAIN"
     assert sells[0]["status"] == "placed"
     assert sells[0]["source"] == "position_review"
+    assert cfg.daily_trades == 0

@@ -378,7 +378,26 @@ def test_sqlite_fill_count_uses_chicago_day_and_distinct_orders():
                 json.dumps({"id": "act-legacy-2", "order_id": "order-legacy", "symbol": "AMD"}),
             ),
         )
-    # aaa, bbb, and the legacy AMD order. The 02:00Z SOL fill is still Sunday evening CT.
+    for order_id, symbol, submitted_at in (
+        ("order-aaa", "AAPL", "2026-10-05T15:00:00Z"),
+        ("order-bbb", "MSFT", "2026-10-05T16:00:00Z"),
+        ("order-legacy", "AMD", "2026-10-05T17:00:00Z"),
+    ):
+        db.record_submitted_order(None, {
+            "order_id": order_id,
+            "symbol": symbol,
+            "side": "buy",
+            "status": "filled",
+            "submitted_at": submitted_at,
+        }, strategy_name="Growth")
+    db.insert_fills_from_alpaca(0, [
+        {
+            "id": "act-foreign", "order_id": "order-pepe", "symbol": "PEPE/USD", "side": "buy",
+            "qty": 1, "price": 0.01, "transaction_time": "2026-10-05T15:30:00Z",
+        },
+    ])
+    # aaa, bbb, and the legacy AMD order. The 02:00Z SOL fill is still Sunday
+    # evening CT. PEPE is on the shared account but AgentTrade did not submit it.
     assert db.count_fills_today(now=CYCLE_NOW) == 3
 
 

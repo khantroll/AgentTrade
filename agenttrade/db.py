@@ -251,6 +251,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(account_snapshots)").fetchall()}
     if "multiplier" not in cols:
         conn.execute("ALTER TABLE account_snapshots ADD COLUMN multiplier REAL")
+    order_cols = {r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()}
+    if "client_order_id" not in order_cols:
+        conn.execute("ALTER TABLE orders ADD COLUMN client_order_id TEXT")
 
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS signal_attributions (
@@ -736,8 +739,9 @@ def insert_orders(cycle_run_id: int, open_orders: list, source: str = "alpaca") 
                     """
                     INSERT OR IGNORE INTO orders(
                         cycle_run_id, alpaca_order_id, submitted_at, symbol, side, qty, notional,
-                        order_type, time_in_force, limit_price, stop_price, status, strategy_name, raw_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        order_type, time_in_force, limit_price, stop_price, status, strategy_name,
+                        client_order_id, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         cycle_run_id,
@@ -753,6 +757,7 @@ def insert_orders(cycle_run_id: int, open_orders: list, source: str = "alpaca") 
                         _f(o.get("stop_price")),
                         o.get("status"),
                         o.get("strategy_name"),
+                        o.get("client_order_id"),
                         _order_raw_for_store(o),
                     ),
                 )
@@ -769,45 +774,56 @@ def record_submitted_order(cycle_run_id: int, order: dict, strategy_name: str = 
             """
             INSERT OR REPLACE INTO orders(
                 cycle_run_id, alpaca_order_id, submitted_at, symbol, side, qty, notional,
-                order_type, time_in_force, limit_price, stop_price, status, strategy_name, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                order_type, time_in_force, limit_price, stop_price, status, strategy_name,
+                client_order_id, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 cycle_run_id,
                 order.get("order_id") or order.get("id"),
-                utc_now(),
+                order.get("submitted_at") or utc_now(),
                 order.get("ticker") or order.get("symbol"),
                 order.get("side", "buy"),
                 _f(order.get("shares") or order.get("qty")),
                 _f(order.get("notional_usd") or order.get("notional")),
-                order.get("type"),
+                order.get("type") or order.get("order_type"),
                 order.get("time_in_force"),
                 _f(order.get("limit_price")),
                 _f(order.get("stop_price")),
                 order.get("status", "placed"),
                 strategy_name or order.get("strategy_name", ""),
+                order.get("client_order_id"),
                 _order_raw_for_store(order),
             ),
         )
 
 
 def insert_fills_from_alpaca(cycle_run_id: int, fills: list) -> int:
+    """Insert fills and store the broker order id, never the activity id.
+
+    A row already saved with the activity id in ``alpaca_order_id`` is
+    rewritten when this activity is seen again with the real ``order_id``.
+    The daily-trade diagnostic does not call this; it only reads.
+    """
+    from trading_day import broker_order_id_from_fill
+
     _ensure_db()
     added = 0
     with get_connection() as conn:
         for f in fills or []:
-            fill_id = f.get("id") or f.get("order_id")
+            fill_id = f.get("id") or f.get("alpaca_fill_id") or f.get("order_id")
             if not fill_id:
                 continue
+            broker_id = broker_order_id_from_fill(f)
             try:
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT OR IGNORE INTO fills(
                         alpaca_order_id, alpaca_fill_id, filled_at, symbol, side, qty, price, raw_json
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        f.get("order_id"),
+                        broker_id,
                         fill_id,
                         f.get("filled_at") or f.get("submitted_at") or f.get("transaction_time") or utc_now(),
                         f.get("ticker") or f.get("symbol"),
@@ -817,9 +833,24 @@ def insert_fills_from_alpaca(cycle_run_id: int, fills: list) -> int:
                         json.dumps(f),
                     ),
                 )
-                added += 1
+                if cur.rowcount:
+                    added += 1
             except sqlite3.IntegrityError:
                 pass
+            if broker_id:
+                conn.execute(
+                    """
+                    UPDATE fills
+                    SET alpaca_order_id = ?
+                    WHERE alpaca_fill_id = ?
+                      AND (
+                        alpaca_order_id IS NULL
+                        OR alpaca_order_id = ''
+                        OR alpaca_order_id = alpaca_fill_id
+                      )
+                    """,
+                    (broker_id, str(fill_id)),
+                )
     return added
 
 
@@ -981,13 +1012,15 @@ def sync_open_orders_from_alpaca(open_orders: list) -> dict:
                     INSERT INTO orders(
                         cycle_run_id, alpaca_order_id, submitted_at, symbol, side,
                         qty, notional, order_type, time_in_force,
-                        limit_price, stop_price, status, strategy_name, raw_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        limit_price, stop_price, status, strategy_name,
+                        client_order_id, raw_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(alpaca_order_id) DO UPDATE SET
                         status     = excluded.status,
                         stop_price = excluded.stop_price,
                         qty        = excluded.qty,
-                        raw_json   = excluded.raw_json
+                        raw_json   = excluded.raw_json,
+                        client_order_id = COALESCE(orders.client_order_id, excluded.client_order_id)
                     """,
                     (
                         None,
@@ -1003,6 +1036,7 @@ def sync_open_orders_from_alpaca(open_orders: list) -> dict:
                         _f(o.get("stop_price")),
                         o.get("status"),
                         o.get("strategy_name"),
+                        o.get("client_order_id"),
                         _order_raw_for_store(o),
                     ),
                 )
@@ -2128,7 +2162,7 @@ def fills_in_trading_day(now=None) -> list:
     with get_connection() as conn:
         rows = conn.execute(
             """
-            SELECT alpaca_order_id, alpaca_fill_id, filled_at, raw_json
+            SELECT alpaca_order_id, alpaca_fill_id, filled_at, symbol, side, qty, price, raw_json
             FROM fills
             WHERE filled_at >= ? AND filled_at < ?
             """,
@@ -2138,19 +2172,45 @@ def fills_in_trading_day(now=None) -> list:
     for row in rows:
         item = dict(row)
         item["submitted_at"] = item.get("filled_at")
+        item["_count_origin"] = "ledger"
         fills.append(item)
     return fills
 
 
-def count_fills_today(now=None) -> int:
-    """Distinct orders filled on the current America/Chicago trading day.
+def agent_submitted_order_ids() -> set[str]:
+    """Broker ids of orders AgentTrade submitted.
 
-    Partial fills of one order count once. The window is Chicago midnight to
-    midnight, not the UTC date prefix of ``filled_at``.
+    A synced account order with no strategy name and no ``agenttrade-``
+    client id is someone else's order on the shared Alpaca account.
     """
-    from trading_day import count_trades_for_day
+    from trading_day import CLIENT_ORDER_PREFIX
 
-    return count_trades_for_day(fills_in_trading_day(now), [], now=now)
+    _ensure_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT alpaca_order_id FROM orders
+            WHERE alpaca_order_id IS NOT NULL
+              AND (
+                (strategy_name IS NOT NULL AND TRIM(strategy_name) != '')
+                OR (client_order_id IS NOT NULL AND client_order_id LIKE ?)
+              )
+            """,
+            (CLIENT_ORDER_PREFIX + "%",),
+        ).fetchall()
+    return {str(row[0]) for row in rows if row[0]}
+
+
+def count_fills_today(now=None) -> int:
+    """AgentTrade entries placed on the current America/Chicago day.
+
+    Same count the health banner and the trading cycle enforce. Partial
+    fills count once. Other apps on the shared account, exits, and
+    protective legs do not count.
+    """
+    from agenttrade.daily_trades import current_daily_trade_count
+
+    return current_daily_trade_count(now)
 
 
 def _f(value) -> Optional[float]:

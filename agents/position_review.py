@@ -298,8 +298,10 @@ def _place_sell(symbol: str, qty, reason: str, bucket: Optional[Bucket], market_
             "type":          "market",
             "time_in_force": "gtc" if is_crypto else "day",
         }
+        from trading_day import new_client_order_id
+        payload["client_order_id"] = new_client_order_id()
         order = alpaca_post("/v2/orders", payload)
-        cfg.increment_daily_trades()
+        # Exits do not consume a daily entry slot.
         log.info("[PositionReview] ✅ SELL %s ×%s | %s | ID: %s",
                  symbol, qty, reason[:80], order.get("id", "?"))
         return {
