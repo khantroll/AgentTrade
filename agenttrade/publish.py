@@ -273,6 +273,11 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
             state["daily_trades"] = ledger.count_fills_today()
         except Exception:
             pass
+    # Same cap the cycle enforces, so the status strip is not a hardcoded 5.
+    try:
+        state["max_daily_trades"] = cfg.current_max_daily_trades()
+    except (TypeError, ValueError):
+        state["max_daily_trades"] = cfg.MAX_DAILY_TRADES
     state["position_sizing_source"] = ledger_data.get("position_sizing_source", "deterministic")
     state["risk_per_trade_pct"] = ledger_data.get("risk_per_trade_pct", 0.005)
     state["ignored_llm_sizing_count"] = ledger_data.get("ignored_llm_sizing_count", 0)

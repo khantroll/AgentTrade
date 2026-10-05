@@ -321,18 +321,68 @@ def _agent_state_check() -> dict:
         return _check("error", "agent_state", "Application ledger", str(e))
 
 
-def _daily_trades_check(state: dict) -> dict:
-    daily = int(state.get("daily_trades") or 0)
-    limit = 5
-    if daily >= limit:
-        return _check(
-            "warn", "daily_trades", "Daily trade limit",
-            f"{daily}/{limit} used · no new orders today",
-            daily=daily, limit=limit,
-        )
+def _orders_for_trade_count(orders: list) -> list:
+    """Alpaca-shaped orders for ``count_trades_for_day``.
+
+    Ledger rows store the broker id in ``alpaca_order_id`` and use ``id`` for
+    the local row. The counter keys on the broker id, matching the live snapshot.
+    """
+    shaped = []
+    for order in orders or []:
+        if not isinstance(order, dict):
+            continue
+        broker_id = order.get("alpaca_order_id")
+        if broker_id and not order.get("order_id"):
+            adapted = dict(order)
+            adapted["id"] = broker_id
+            if not adapted.get("type") and order.get("order_type"):
+                adapted["type"] = order["order_type"]
+            shaped.append(adapted)
+            continue
+        shaped.append(order)
+    return shaped
+
+
+def _enforced_daily_trade_count(state: dict, now=None) -> int:
+    """Distinct America/Chicago orders, the same count the cycle enforces.
+
+    Recomputed from ledger fills and open orders via ``count_trades_for_day``.
+    The ``daily_trades`` integer on agent state is a cycle-end projection and
+    is not read: it can lag the live cap the trader is applying.
+    """
+    from trading_day import count_trades_for_day
+
+    fills = [f for f in (state.get("recent_fills") or []) if isinstance(f, dict)]
+    orders = _orders_for_trade_count(state.get("open_orders") or [])
+    try:
+        from agenttrade import db as ledger
+        if ledger.db_available():
+            ledger.init_db()
+            fills = list(ledger.fills_in_trading_day(now)) + fills
+            if not orders:
+                orders = _orders_for_trade_count(ledger.get_latest_open_orders())
+    except Exception:
+        pass
+    if not fills and not orders:
+        return 0
+    return count_trades_for_day(fills, orders, now=now)
+
+
+def daily_trade_banner(used: int, limit: int) -> tuple:
+    """Status and banner text for the daily trade limit."""
+    if int(used) >= int(limit):
+        return "warn", f"{int(used)}/{int(limit)} used · no new orders today"
+    return "ok", f"{int(used)}/{int(limit)} used"
+
+
+def _daily_trades_check(state: dict, now=None) -> dict:
+    import agent_config as cfg
+
+    limit = int(cfg.current_max_daily_trades())
+    daily = _enforced_daily_trade_count(state or {}, now=now)
+    status, message = daily_trade_banner(daily, limit)
     return _check(
-        "ok", "daily_trades", "Daily trade limit",
-        f"{daily}/{limit} used",
+        status, "daily_trades", "Daily trade limit", message,
         daily=daily, limit=limit,
     )
 

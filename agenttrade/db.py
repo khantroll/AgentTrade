@@ -2110,15 +2110,16 @@ def _count_consecutive_losses_quick() -> int:
     return get_consecutive_loss_status(limit=20).get("count", 0)
 
 
-def count_fills_today(now=None) -> int:
-    """Distinct orders filled on the current America/Chicago trading day.
+def fills_in_trading_day(now=None) -> list:
+    """Fill rows in the loose window around the America/Chicago trading day.
 
-    Partial fills of one order count once. The window is Chicago midnight to
-    midnight, not the UTC date prefix of ``filled_at``.
+    Shaped for ``trading_day.count_trades_for_day``. The SQL window is a day
+    wider than Chicago midnight so a UTC date prefix cannot drop a fill that
+    still belongs to the Chicago day; the counter applies the exact bounds.
     """
     from datetime import timedelta
 
-    from trading_day import count_trades_for_day, trading_day_bounds
+    from trading_day import trading_day_bounds
 
     _ensure_db()
     start, end = trading_day_bounds(now)
@@ -2138,7 +2139,18 @@ def count_fills_today(now=None) -> int:
         item = dict(row)
         item["submitted_at"] = item.get("filled_at")
         fills.append(item)
-    return count_trades_for_day(fills, [], now=now)
+    return fills
+
+
+def count_fills_today(now=None) -> int:
+    """Distinct orders filled on the current America/Chicago trading day.
+
+    Partial fills of one order count once. The window is Chicago midnight to
+    midnight, not the UTC date prefix of ``filled_at``.
+    """
+    from trading_day import count_trades_for_day
+
+    return count_trades_for_day(fills_in_trading_day(now), [], now=now)
 
 
 def _f(value) -> Optional[float]:
