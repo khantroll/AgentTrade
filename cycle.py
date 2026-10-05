@@ -179,6 +179,7 @@ def run_trading_cycle() -> None:
 
     try:
         init_db()
+        cfg.init_daily_trades()
     except Exception as db_e:
         log.error("[DB] SQLite init failed — trading blocked: %s", db_e)
         return
@@ -268,6 +269,13 @@ def run_trading_cycle() -> None:
         log.warning("[Cycle] TRADING_PAUSED — %s (protective sells still allowed)", pause_reason)
 
     snapshot = recon.snapshot or refresh_alpaca_snapshot()
+    if snapshot.get("daily_trades_live") is not None:
+        cfg.set_daily_trades(snapshot["daily_trades_live"])
+        log.info(
+            "[Cycle] Daily trades %s / cap %s (America/Chicago)",
+            cfg.daily_trades,
+            cfg.MAX_DAILY_TRADES,
+        )
 
     hard_plans = []
     lock_ctx = load_prior_state()

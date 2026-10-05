@@ -2110,16 +2110,35 @@ def _count_consecutive_losses_quick() -> int:
     return get_consecutive_loss_status(limit=20).get("count", 0)
 
 
-def count_fills_today() -> int:
-    """Count distinct fills recorded in the SQLite fills table for today (UTC)."""
+def count_fills_today(now=None) -> int:
+    """Distinct orders filled on the current America/Chicago trading day.
+
+    Partial fills of one order count once. The window is Chicago midnight to
+    midnight, not the UTC date prefix of ``filled_at``.
+    """
+    from datetime import timedelta
+
+    from trading_day import count_trades_for_day, trading_day_bounds
+
     _ensure_db()
-    today = __import__("datetime").date.today().isoformat()
+    start, end = trading_day_bounds(now)
+    loose_start = (start - timedelta(days=1)).date().isoformat()
+    loose_end = (end + timedelta(days=1)).date().isoformat()
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM fills WHERE filled_at >= ?",
-            (today,),
-        ).fetchone()
-    return int(row[0]) if row else 0
+        rows = conn.execute(
+            """
+            SELECT alpaca_order_id, alpaca_fill_id, filled_at, raw_json
+            FROM fills
+            WHERE filled_at >= ? AND filled_at < ?
+            """,
+            (loose_start, loose_end),
+        ).fetchall()
+    fills = []
+    for row in rows:
+        item = dict(row)
+        item["submitted_at"] = item.get("filled_at")
+        fills.append(item)
+    return count_trades_for_day(fills, [], now=now)
 
 
 def _f(value) -> Optional[float]:

@@ -213,6 +213,44 @@ def momentum_screen(candidates: list, top_n: int = 30,
 # Pipeline 2: Alpaca Top Movers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Alpaca screener: market_type is the path segment. The only query param is
+# ``top`` (1–50). Sending market_type or feed as a query param is HTTP 400.
+# The endpoint is SIP-based and has no feed selector; a data plan that cannot
+# read it is a single warning, not a retry storm.
+ALPACA_STOCK_MOVERS_PATH = "/v1beta1/screener/stocks/movers"
+MOVERS_TOP_MIN = 1
+MOVERS_TOP_MAX = 50
+_MOVERS_PLAN_MARKERS = (
+    "subscription",
+    "not entitled",
+    "not permitted",
+    "data plan",
+    "insufficient subscription",
+    "recent sip",
+    "sip data",
+    "forbidden",
+)
+
+
+def movers_top_param(top_n: int) -> int:
+    """Clamp the movers ``top`` query to Alpaca's documented 1–50 range."""
+    try:
+        top = int(top_n)
+    except (TypeError, ValueError):
+        top = 10
+    return max(MOVERS_TOP_MIN, min(top, MOVERS_TOP_MAX))
+
+
+def _movers_plan_denied(status: int, body: str) -> bool:
+    """True when the account's market-data plan cannot serve stock movers."""
+    if status == 403:
+        return True
+    if status != 400:
+        return False
+    low = (body or "").lower()
+    return any(marker in low for marker in _MOVERS_PLAN_MARKERS)
+
+
 def alpaca_movers_screen(top_n: int = 15,
                          min_price: float = MIN_PRICE,
                          max_price: float = MAX_PRICE) -> list:
@@ -220,29 +258,56 @@ def alpaca_movers_screen(top_n: int = 15,
         log.info("[Screener/Alpaca] Keys not set — skipping.")
         return []
 
+    top = movers_top_param(top_n)
+    url = f"{ALPACA_DATA_URL}{ALPACA_STOCK_MOVERS_PATH}"
     log.info("[Screener/Alpaca] Fetching top movers...")
     try:
         r = requests.get(
-            f"{ALPACA_DATA_URL}/v1beta1/screener/stocks/movers",
-            params={"top": top_n, "market_type": "stocks"},
+            url,
+            params={"top": top},
             headers={
                 "APCA-API-KEY-ID":     ALPACA_API_KEY,
                 "APCA-API-SECRET-KEY": ALPACA_SECRET,
             },
             timeout=10,
         )
-        r.raise_for_status()
-        gainers = r.json().get("gainers", [])
-        result  = [
-            g["symbol"] for g in gainers
-            if g["symbol"] not in EXCLUSIONS
-            and min_price <= g.get("price", 0) <= max_price
-        ]
-        log.info(f"[Screener/Alpaca] Movers: {result}")
-        return result[:top_n]
     except Exception as e:
-        log.warning(f"[Screener/Alpaca] Error: {e}")
+        log.warning("[Screener/Alpaca] Movers request failed: %s", e)
         return []
+
+    if r.status_code != 200:
+        if _movers_plan_denied(r.status_code, r.text or ""):
+            log.warning(
+                "[Screener/Alpaca] Stock movers unavailable on this account's data plan "
+                "(HTTP %s). Continuing without Alpaca movers.",
+                r.status_code,
+            )
+            return []
+        detail = (r.text or "").strip().replace("\n", " ")[:180]
+        log.warning("[Screener/Alpaca] Movers HTTP %s: %s", r.status_code, detail)
+        return []
+
+    try:
+        payload = r.json()
+    except Exception:
+        log.warning("[Screener/Alpaca] Movers HTTP 200 was not JSON. Continuing without movers.")
+        return []
+    gainers = payload.get("gainers") if isinstance(payload, dict) else None
+    if not isinstance(gainers, list):
+        log.warning("[Screener/Alpaca] Movers response had no gainers list. Continuing without movers.")
+        return []
+    result = []
+    for g in gainers:
+        if not isinstance(g, dict) or not g.get("symbol") or g["symbol"] in EXCLUSIONS:
+            continue
+        try:
+            price = float(g.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if min_price <= price <= max_price:
+            result.append(g["symbol"])
+    log.info("[Screener/Alpaca] Movers: %s", result)
+    return result[:top]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
