@@ -87,7 +87,7 @@ def _sma_slope(closes, period=50):
 def fetch_stock_data(ticker: str) -> dict:
     """Lean pre-computed metrics — no raw arrays sent to LLM."""
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(yfinance_symbol(ticker))
         hist = t.history(period="3mo")
         info = t.info
         if hist.empty:
@@ -171,14 +171,59 @@ def is_crypto_bucket(bucket: Bucket) -> bool:
     return getattr(bucket, "asset_class", "us_equity") == "crypto" or bucket.mode == "crypto"
 
 
+# Yahoo crypto quotes are hyphenated. yfinance builds
+# ``/v8/finance/chart/{ticker}`` (see yfinance.base.TickerBase._fetch_ticker_tz)
+# and documents the form as ``BTC-USD`` (yfinance.scrapers.quote). A slash is a
+# path separator, so ``BTC/USD`` 404s and is logged as ``$BTC/USD: possibly
+# delisted``. Concatenated ``BTCUSD`` is a different symbol and is rejected
+# the same way. Alpaca order symbols stay slash-form.
+_YF_CRYPTO_QUOTES = ("USDT", "USDC", "USD")
+
+
 def crypto_to_yfinance(symbol: str) -> str:
-    return symbol.upper().replace("/", "-")
+    """Map an Alpaca-style crypto symbol to the Yahoo ticker yfinance accepts."""
+    sym = "".join((symbol or "").strip().upper().split())
+    if not sym:
+        return ""
+    sym = sym.replace("/", "-").replace("_", "-")
+    if "-" in sym:
+        return sym
+    for quote in _YF_CRYPTO_QUOTES:
+        if sym.endswith(quote) and len(sym) > len(quote) + 1:
+            base = sym[: -len(quote)]
+            if base.isalpha():
+                return f"{base}-{quote}"
+    return sym
+
+
+def yfinance_symbol(symbol: str) -> str:
+    """Ticker to pass into yfinance.
+
+    Equity symbols (``AAPL``, ``BRK-B``) are returned unchanged apart from
+    surrounding whitespace. Crypto symbols are rewritten to Yahoo's hyphen
+    form before the quote call. Callers that submit Alpaca orders must keep
+    the original slash symbol.
+    """
+    raw = (symbol or "").strip()
+    if not raw:
+        return raw
+    compact = "".join(raw.upper().split())
+    if "/" in compact or "_" in compact:
+        return crypto_to_yfinance(compact)
+    if "-" in compact:
+        return compact
+    # Imported lazily: order_utils does not import market_data.
+    from order_utils import is_crypto_symbol
+
+    if is_crypto_symbol(compact):
+        return crypto_to_yfinance(compact)
+    return compact
 
 
 def fetch_crypto_data(symbol: str) -> dict:
     """Fetch crypto market data via yFinance; trading symbol stays Alpaca-style BTC/USD."""
     try:
-        yf_symbol = crypto_to_yfinance(symbol)
+        yf_symbol = yfinance_symbol(symbol)
         t = yf.Ticker(yf_symbol)
         hist = t.history(period="90d", interval="1d")
         if hist.empty:

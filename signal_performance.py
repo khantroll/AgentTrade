@@ -124,7 +124,8 @@ def _fetch_price_history(symbol: str, start: datetime, end: datetime) -> list[fl
     """Lightweight price series for outcome evaluation."""
     try:
         import yfinance as yf
-        t = yf.Ticker(symbol)
+        from market_data import yfinance_symbol
+        t = yf.Ticker(yfinance_symbol(symbol))
         hist = t.history(start=start.date(), end=(end + timedelta(days=1)).date())
         if hist.empty:
             return []
