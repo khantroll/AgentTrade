@@ -42,6 +42,19 @@ def _banner(monkeypatch, tmp_path, cap: str, env_cap: str, state: dict) -> dict:
         os.environ.update(saved)
 
 
+def _own(order_id: str, symbol: str, submitted_at: str) -> None:
+    from agenttrade import db
+
+    db.record_submitted_order(None, {
+        "order_id": order_id,
+        "symbol": symbol,
+        "side": "buy",
+        "status": "accepted",
+        "submitted_at": submitted_at,
+        "client_order_id": f"agenttrade-{order_id}",
+    }, strategy_name="Growth")
+
+
 def test_health_banner_reads_config_cap_of_10_not_stale_counter(monkeypatch, tmp_path):
     from agenttrade import db
 
@@ -50,6 +63,9 @@ def test_health_banner_reads_config_cap_of_10_not_stale_counter(monkeypatch, tmp
         _fill("act-1", "ord-1", "AAPL", "2026-10-05T15:00:00Z"),
         _fill("act-2", "ord-1", "AAPL", "2026-10-05T15:01:00Z"),
     ])
+    _own("ord-1", "AAPL", "2026-10-05T15:00:00Z")
+    _own("ord-new", "MSFT", "2026-10-05T15:20:00Z")
+    _own("ord-ledger", "NVDA", "2026-10-05T15:25:00Z")
     state = {
         "daily_trades": 9,
         "open_orders": [
@@ -94,6 +110,8 @@ def test_health_banner_reads_config_cap_of_5_under_and_at_limit(monkeypatch, tmp
         _fill(f"act-{i}", f"ord-{i}", "MSFT", f"2026-10-05T15:{i:02d}:00Z")
         for i in range(4)
     ])
+    for i in range(4):
+        _own(f"ord-{i}", "MSFT", f"2026-10-05T15:{i:02d}:00Z")
     under = _banner(monkeypatch, tmp_path, "5", "10", {"daily_trades": 0, "open_orders": []})
     assert under["daily"] == 4
     assert under["limit"] == 5
@@ -103,6 +121,7 @@ def test_health_banner_reads_config_cap_of_5_under_and_at_limit(monkeypatch, tmp
     db.insert_fills_from_alpaca(0, [
         _fill("act-4", "ord-4", "NVDA", "2026-10-05T15:10:00Z"),
     ])
+    _own("ord-4", "NVDA", "2026-10-05T15:10:00Z")
     # Same config.json cap of 5. The stale projection says 1 and must not win.
     at_cap = _daily_trades_check({"daily_trades": 1, "open_orders": []}, now=CYCLE_NOW)
     assert at_cap["daily"] == 5

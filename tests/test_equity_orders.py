@@ -191,8 +191,9 @@ def test_execution_submits_valid_equity_bracket_and_replaces_resting_buy(monkeyp
     assert body["order_class"] == "bracket"
     assert set(body) <= {
         "symbol", "qty", "side", "type", "time_in_force", "limit_price",
-        "order_class", "stop_loss", "take_profit",
+        "order_class", "stop_loss", "take_profit", "client_order_id",
     }
+    assert str(body["client_order_id"]).startswith("agenttrade-")
     stop = float(body["stop_loss"]["stop_price"])
     take = float(body["take_profit"]["limit_price"])
     assert stop < 178.23
@@ -283,3 +284,4 @@ def test_crypto_market_notional_path_unchanged(monkeypatch):
     assert body["notional"] == "2600.25"
     assert "order_class" not in body
     assert "qty" not in body
+    assert str(body["client_order_id"]).startswith("agenttrade-")

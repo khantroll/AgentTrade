@@ -322,50 +322,29 @@ def _agent_state_check() -> dict:
 
 
 def _orders_for_trade_count(orders: list) -> list:
-    """Alpaca-shaped orders for ``count_trades_for_day``.
+    """Alpaca-shaped orders for the daily trade count.
 
     Ledger rows store the broker id in ``alpaca_order_id`` and use ``id`` for
     the local row. The counter keys on the broker id, matching the live snapshot.
     """
-    shaped = []
-    for order in orders or []:
-        if not isinstance(order, dict):
-            continue
-        broker_id = order.get("alpaca_order_id")
-        if broker_id and not order.get("order_id"):
-            adapted = dict(order)
-            adapted["id"] = broker_id
-            if not adapted.get("type") and order.get("order_type"):
-                adapted["type"] = order["order_type"]
-            shaped.append(adapted)
-            continue
-        shaped.append(order)
-    return shaped
+    from trading_day import shape_order_for_count
+
+    return [shape_order_for_count(order) for order in orders or [] if isinstance(order, dict)]
 
 
 def _enforced_daily_trade_count(state: dict, now=None) -> int:
-    """Distinct America/Chicago orders, the same count the cycle enforces.
+    """AgentTrade entries for this America/Chicago day.
 
-    Recomputed from ledger fills and open orders via ``count_trades_for_day``.
-    The ``daily_trades`` integer on agent state is a cycle-end projection and
-    is not read: it can lag the live cap the trader is applying.
+    Same count the cycle enforces. The ``daily_trades`` integer on agent
+    state is not read: it can lag, and it used to mix in another app's
+    orders plus duplicate activity ids. Stale open orders in ``state`` do
+    not block ledger rows, and they do not add exits or other days.
     """
-    from trading_day import count_trades_for_day
+    from agenttrade.daily_trades import current_daily_trade_count
 
     fills = [f for f in (state.get("recent_fills") or []) if isinstance(f, dict)]
     orders = _orders_for_trade_count(state.get("open_orders") or [])
-    try:
-        from agenttrade import db as ledger
-        if ledger.db_available():
-            ledger.init_db()
-            fills = list(ledger.fills_in_trading_day(now)) + fills
-            if not orders:
-                orders = _orders_for_trade_count(ledger.get_latest_open_orders())
-    except Exception:
-        pass
-    if not fills and not orders:
-        return 0
-    return count_trades_for_day(fills, orders, now=now)
+    return current_daily_trade_count(now, extra_fills=fills, extra_orders=orders)
 
 
 def daily_trade_banner(used: int, limit: int) -> tuple:
