@@ -279,8 +279,13 @@ def _place_sell(symbol: str, qty, reason: str, bucket: Optional[Bucket], market_
         log.info("[PositionReview] %s: market closed — deferring sell until next open", symbol)
         return None
 
-    if cfg.daily_trades >= cfg.MAX_DAILY_TRADES:
-        log.warning("[PositionReview] Daily trade limit reached — cannot sell %s", symbol)
+    if cfg.daily_trade_cap_reached():
+        log.warning(
+            "[PositionReview] Daily trade limit reached (%s/%s) — cannot sell %s",
+            cfg.daily_trades,
+            cfg.MAX_DAILY_TRADES,
+            symbol,
+        )
         return None
 
     try:

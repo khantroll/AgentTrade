@@ -6,7 +6,6 @@ Loaded once at startup; refreshed via refresh_config() at each cycle.
 
 import json
 import os
-from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -85,9 +84,11 @@ def _load_daily_trades() -> int:
         pass
     # NON-AUTHORITATIVE fallback: dashboard projection cache
     try:
+        from trading_day import chicago_trading_date
+
         with open(STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
-        if state.get("last_run", "")[:10] == datetime.now().strftime("%Y-%m-%d"):
+        if state.get("last_run", "")[:10] == chicago_trading_date().isoformat():
             return int(state.get("daily_trades", 0))
     except Exception:
         pass
@@ -190,6 +191,31 @@ def init_daily_trades() -> None:
 def increment_daily_trades(count: int = 1) -> None:
     global daily_trades
     daily_trades += count
+
+
+def set_daily_trades(count: int) -> None:
+    """Replace the in-memory counter with an authoritative day count."""
+    global daily_trades
+    try:
+        daily_trades = max(0, int(count))
+    except (TypeError, ValueError):
+        daily_trades = 0
+
+
+def daily_trade_cap_reached(count=None, limit=None) -> bool:
+    """True when another trade would push the day past the configured cap.
+
+    A count equal to the cap is already at the limit, so the number of trades
+    that may be placed stays ``<= MAX_DAILY_TRADES``.
+    """
+    if count is None:
+        count = daily_trades
+    if limit is None:
+        limit = MAX_DAILY_TRADES
+    try:
+        return int(count) >= int(limit)
+    except (TypeError, ValueError):
+        return True
 
 
 def reset_daily_counters() -> None:

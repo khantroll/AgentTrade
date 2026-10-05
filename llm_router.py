@@ -345,7 +345,10 @@ def _compact_prompt(prompt: str, provider: str, phase: str) -> str:
     return head + "\n\n[...auto-adaptive compression: removed lower-priority market/news rows to fit this provider...]\n\n" + tail
 
 def _json_system_prefix(phase: str) -> str:
-    return "Respond with compact valid JSON only. No markdown, no prose. "
+    return (
+        "Respond with one compact JSON object only. "
+        "No markdown, no prose, no preamble, and no thinking or reasoning tags. "
+    )
 
 def _max_tokens_for(provider: str, phase: str) -> int:
     # Small responses reduce cost and reduce free-tier rate-limit failures.
@@ -1088,6 +1091,117 @@ def _call_openai(model: str, prompt: str, max_tokens: int = 600, agent_tag: str 
     return text
 
 
+def _post_chat(url: str, api_key: str, payload: dict):
+    return requests.post(
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=45,
+    )
+
+
+def _error_object(body: str) -> dict:
+    """OpenAI-compatible error object, or {} when the body is not that shape."""
+    try:
+        data = json.loads(body or "")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    err = data.get("error")
+    return err if isinstance(err, dict) else data
+
+
+def _failed_generation_text(body: str) -> str:
+    """Model draft attached to a JSON-mode HTTP error, when the provider sends one.
+
+    Groq uses ``failed_generation`` with code ``json_validate_failed``. Other
+    OpenAI-compatible gateways use the same field. Nothing here is vendor-specific
+    beyond reading that draft so a preamble can be parsed locally.
+    """
+    err = _error_object(body)
+    for key in ("failed_generation", "failed_generations", "generation"):
+        value = err.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, list):
+            parts = [item for item in value if isinstance(item, str) and item.strip()]
+            if parts:
+                return parts[-1]
+    return ""
+
+
+def _json_mode_rejected(body: str) -> bool:
+    """True when the provider refused JSON mode or rejected the draft as JSON."""
+    err = _error_object(body)
+    code = str(err.get("code") or "").lower()
+    if code in {"json_validate_failed", "json_schema_validation_failed", "invalid_json"}:
+        return True
+    low = (body or "").lower()
+    markers = (
+        "json_validate_failed",
+        "response_format",
+        "json_object",
+        "json mode",
+        "json_schema",
+        "failed to generate json",
+        "failed to validate json",
+        "failed to validate the json",
+    )
+    return any(marker in low for marker in markers)
+
+
+def _message_text(data: dict) -> str:
+    """Assistant text. A separate reasoning field is used only when content is empty."""
+    try:
+        message = (data.get("choices") or [{}])[0].get("message") or {}
+    except (AttributeError, IndexError, TypeError):
+        return ""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    text = str(content or "")
+    if text.strip():
+        return text
+    for key in ("reasoning", "reasoning_content"):
+        extra = message.get(key)
+        if isinstance(extra, str) and extra.strip():
+            return extra
+    return text
+
+
+def _recovered_llm_text(draft: str) -> bool:
+    """True when a rejected draft still parses as research or analysis JSON."""
+    if not (draft or "").strip():
+        return False
+    parsed = _parse_json(draft)
+    return _research_payload_is_valid(parsed) or _analysis_payload_is_valid(parsed)
+
+
+def _payload_without_json_mode(payload: dict) -> dict:
+    """Drop response_format and ask once, plainly, for a bare JSON object."""
+    retry = dict(payload)
+    retry.pop("response_format", None)
+    messages = []
+    for msg in payload.get("messages") or []:
+        messages.append(dict(msg) if isinstance(msg, dict) else msg)
+    if messages and isinstance(messages[-1], dict):
+        content = str(messages[-1].get("content") or "")
+        suffix = (
+            "\n\nOutput exactly one JSON object. "
+            "Do not wrap it in markdown or thinking tags, and do not add a preamble."
+        )
+        if "Output exactly one JSON object." not in content:
+            messages[-1]["content"] = content.rstrip() + suffix
+    retry["messages"] = messages
+    return retry
+
+
 def _call_chat_endpoint(provider: str, model: str, prompt: str, max_tokens: int, agent_tag: str,
                         url: str, api_key: str) -> str:
     if not api_key:
@@ -1098,20 +1212,64 @@ def _call_chat_endpoint(provider: str, model: str, prompt: str, max_tokens: int,
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
-    r = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                      json=payload, timeout=45)
+
+    def _reject(response) -> None:
+        raise RuntimeError(f"{provider} HTTP {response.status_code}: {response.text[:300]}")
+
+    r = _post_chat(url, api_key, payload)
     # A 429 is a backoff, not a prompt-format problem. Do not immediately POST again.
     if r.status_code == 429:
-        raise RuntimeError(f"{provider} HTTP 429: {r.text[:300]}")
-    if r.status_code >= 400 and "response_format" in payload and ("response_format" in r.text.lower() or "json_object" in r.text.lower()):
-        payload.pop("response_format", None)
-        r = requests.post(url, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                          json=payload, timeout=45)
-    if r.status_code >= 400:
-        raise RuntimeError(f"{provider} HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json()
-    text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    usage = data.get("usage") or {}
+        _reject(r)
+
+    text = None
+    if r.status_code < 400:
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        text = _message_text(data if isinstance(data, dict) else {})
+    elif payload.get("response_format") and _json_mode_rejected(r.text):
+        draft = _failed_generation_text(r.text)
+        if _recovered_llm_text(draft):
+            log.info(
+                "[LLM] %s rejected JSON mode; recovered a parseable draft from the error body.",
+                provider,
+            )
+            text = draft
+        else:
+            log.info("[LLM] %s rejected JSON mode; retrying once without response_format.", provider)
+            r = _post_chat(url, api_key, _payload_without_json_mode(payload))
+            if r.status_code == 429:
+                _reject(r)
+            if r.status_code < 400:
+                try:
+                    data = r.json()
+                except ValueError:
+                    data = {}
+                text = _message_text(data if isinstance(data, dict) else {})
+            else:
+                draft = _failed_generation_text(r.text)
+                if _recovered_llm_text(draft):
+                    log.info(
+                        "[LLM] %s retry was rejected; recovered a parseable draft from the error body.",
+                        provider,
+                    )
+                    text = draft
+                else:
+                    _reject(r)
+    else:
+        _reject(r)
+
+    if text is None:
+        _reject(r)
+    usage = {}
+    if r.status_code < 400:
+        try:
+            body = r.json()
+        except ValueError:
+            body = {}
+        if isinstance(body, dict) and isinstance(body.get("usage"), dict):
+            usage = body["usage"]
     _record_usage(model, int(usage.get("prompt_tokens", _estimate_tokens(prompt))),
                   int(usage.get("completion_tokens", _estimate_tokens(text))), agent_tag)
     return text
@@ -1442,6 +1600,29 @@ _FENCE_INLINE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _LLM_PAYLOAD_KEYS = ("selected", "action", "decision")
+_REASONING_BLOCK = re.compile(
+    r"<(think|thinking|reasoning|thought)\b[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_REASONING_OPEN = re.compile(
+    r"<(think|thinking|reasoning|thought)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _strip_reasoning_blocks(text: str) -> str:
+    """Drop <think> / <reasoning> blocks, including an unclosed tag before the JSON."""
+    cleaned = _REASONING_BLOCK.sub("", text or "")
+    match = _REASONING_OPEN.search(cleaned)
+    if not match:
+        return cleaned.strip()
+    rest = cleaned[match.end():]
+    json_at = re.search(r"[\{\[]", rest)
+    if json_at:
+        cleaned = cleaned[:match.start()] + rest[json_at.start():]
+    else:
+        cleaned = cleaned[:match.start()]
+    return cleaned.strip()
 
 
 def _strip_code_fences(text: str) -> str:
@@ -1493,8 +1674,9 @@ def _strip_llm_preamble(text: str) -> str:
 
 
 def _prepare_llm_json_text(text: str) -> str:
-    """Strip common Gemini preambles and markdown fences before json.loads."""
-    return _strip_llm_preamble(_strip_code_fences(_strip_llm_preamble(text or "")))
+    """Strip reasoning tags, preambles, and markdown fences before json.loads."""
+    cleaned = _strip_reasoning_blocks(text or "")
+    return _strip_llm_preamble(_strip_code_fences(_strip_llm_preamble(cleaned)))
 
 
 def _extract_balanced_json(text: str) -> str:

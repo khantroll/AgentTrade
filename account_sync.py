@@ -55,31 +55,15 @@ def _order_notional(order: dict) -> float:
     return 0.0
 
 
-def _count_trades_today(fills: list, open_orders: list) -> int:
-    """Count today's fill events + open orders submitted today (deduped by order_id)."""
-    today = datetime.now().strftime("%Y-%m-%d")
-    seen = set()
-    count = 0
-    for fill in fills or []:
-        ts = str(fill.get("submitted_at") or fill.get("transaction_time") or "")
-        if ts[:10] != today:
-            continue
-        oid = fill.get("order_id") or fill.get("id")
-        key = oid or f"fill|{ts}|{fill.get('ticker')}"
-        if key in seen:
-            continue
-        seen.add(key)
-        count += 1
-    for order in open_orders or []:
-        ts = str(order.get("submitted_at") or order.get("created_at") or "")
-        if ts[:10] != today:
-            continue
-        oid = order.get("id") or order.get("order_id")
-        if not oid or oid in seen:
-            continue
-        seen.add(oid)
-        count += 1
-    return count
+def _count_trades_today(fills: list, open_orders: list, now=None) -> int:
+    """Distinct orders in the America/Chicago trading day.
+
+    Partial fills share an order id. Cancelled, failed, and skipped orders
+    are ignored, as are protective bracket sell legs.
+    """
+    from trading_day import count_trades_for_day
+
+    return count_trades_for_day(fills, open_orders, now=now)
 
 
 def refresh_alpaca_snapshot() -> dict:

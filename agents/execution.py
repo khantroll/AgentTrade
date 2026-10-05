@@ -132,8 +132,12 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
 
     for d in approved:
         ticker = d.get("ticker") or d.get("symbol") or ""
-        if cfg.daily_trades >= cfg.MAX_DAILY_TRADES:
-            log.warning("[Execution] Daily trade limit reached.")
+        if cfg.daily_trade_cap_reached():
+            log.warning(
+                "[Execution] Daily trade limit reached (%s/%s).",
+                cfg.daily_trades,
+                cfg.MAX_DAILY_TRADES,
+            )
             results.append({
                 "ticker": ticker,
                 "shares": d.get("shares"),
@@ -482,8 +486,12 @@ def hard_rebalance_agent(
 
     log.info("[HardRebalance] %d sell plan(s) (drift threshold %.0f%%)", len(plans), drift_pct * 100)
     for plan in plans:
-        if cfg.daily_trades >= cfg.MAX_DAILY_TRADES:
-            log.warning("[HardRebalance] Daily trade limit reached — stopping.")
+        if cfg.daily_trade_cap_reached():
+            log.warning(
+                "[HardRebalance] Daily trade limit reached (%s/%s) — stopping.",
+                cfg.daily_trades,
+                cfg.MAX_DAILY_TRADES,
+            )
             break
         if not plan.get("is_crypto") and not market_open:
             log.info("[HardRebalance] Skip %s — market closed (equity)", plan["symbol"])

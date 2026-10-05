@@ -146,13 +146,17 @@ def get_recent_fills(max_items: int = 30) -> list:
         acts = alpaca_get(f"/v2/account/activities/FILL?page_size={max_items}")
         return [
             {
+                # ``id`` is the fill activity. ``order_id`` is the broker order.
+                # Partial fills share an order id and must not be counted apart.
+                "id": a.get("id", ""),
                 "ticker": a.get("symbol", ""),
                 "side": a.get("side", ""),
                 "shares": a.get("qty", ""),
                 "price": a.get("price", ""),
                 "status": "filled",
                 "submitted_at": a.get("transaction_time", ""),
-                "order_id": a.get("id", ""),
+                "filled_at": a.get("transaction_time", ""),
+                "order_id": a.get("order_id") or "",
                 "source": "alpaca_fill",
             }
             for a in (acts if isinstance(acts, list) else [])
