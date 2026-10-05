@@ -107,11 +107,12 @@ def _benchmark_return(start_price, end_price, symbol: str, source: str, **extra)
 def _fetch_benchmark_yfinance(start_date: str, end_date: str, symbol: str = "SPY") -> dict:
     try:
         import yfinance as yf
+        from market_data import yfinance_symbol
 
         # yfinance's end date is exclusive; include the requested final day.
         end_exclusive = (datetime.fromisoformat(_date_str(end_date)) + timedelta(days=1)).date().isoformat()
         data = yf.download(
-            symbol,
+            yfinance_symbol(symbol),
             start=_date_str(start_date),
             end=end_exclusive,
             auto_adjust=True,

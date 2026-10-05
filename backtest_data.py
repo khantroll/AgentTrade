@@ -52,6 +52,7 @@ class PriceHistory:
         end: str | date,
     ) -> "PriceHistory":
         import yfinance as yf
+        from market_data import yfinance_symbol
 
         start_d = _parse_day(start)
         end_d = _parse_day(end)
@@ -63,9 +64,12 @@ class PriceHistory:
         chunk = 40
         for i in range(0, len(symbols), chunk):
             batch = symbols[i : i + chunk]
+            # Download with Yahoo tickers, store bars under the caller's symbol
+            # so equity keys stay AAPL / BRK-B and crypto keys stay BTC/USD.
+            yf_batch = [yfinance_symbol(sym) for sym in batch]
             try:
                 raw = yf.download(
-                    batch,
+                    yf_batch,
                     start=dl_start,
                     end=dl_end,
                     interval="1d",
@@ -80,11 +84,12 @@ class PriceHistory:
 
             multi = len(batch) > 1
             for sym in batch:
+                yf_sym = yfinance_symbol(sym)
                 try:
                     if multi:
-                        if sym not in raw.columns.get_level_values(0):
+                        if yf_sym not in raw.columns.get_level_values(0):
                             continue
-                        df = raw[sym].dropna(how="all")
+                        df = raw[yf_sym].dropna(how="all")
                     else:
                         df = raw.dropna(how="all")
                     sym_bars = {}

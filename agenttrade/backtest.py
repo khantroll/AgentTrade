@@ -39,7 +39,8 @@ def _fetch_prices(symbol: str, start: datetime, end: datetime) -> dict[str, floa
     out: dict[str, float] = {}
     try:
         import yfinance as yf
-        hist = yf.Ticker(symbol).history(
+        from market_data import yfinance_symbol
+        hist = yf.Ticker(yfinance_symbol(symbol)).history(
             start=start.date(),
             end=(end + timedelta(days=1)).date(),
         )

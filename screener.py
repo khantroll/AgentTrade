@@ -115,8 +115,10 @@ def crypto_universe_screen(symbols: list = None, top_n: int = 20) -> list:
     """
     symbols = symbols or DEFAULT_CRYPTO_SYMBOLS
     scored = []
+    from market_data import yfinance_symbol
     for sym in symbols:
-        yf_sym = sym.replace("/", "-")
+        # Quote Yahoo as BTC-USD; the ranked universe stays Alpaca's BTC/USD.
+        yf_sym = yfinance_symbol(sym)
         try:
             hist = yf.Ticker(yf_sym).history(period="60d", interval="1d")
             if hist.empty or len(hist) < 10:
@@ -151,10 +153,12 @@ def momentum_screen(candidates: list, top_n: int = 30,
     Now accepts a candidates list so bucket-specific pools can be passed in.
     """
     log.info(f"[Screener/Momentum] Scoring {len(candidates)} candidates...")
+    from market_data import yfinance_symbol
+    yf_candidates = [yfinance_symbol(ticker) for ticker in candidates]
 
     try:
         raw = yf.download(
-            candidates, period="3mo", interval="1d",
+            yf_candidates, period="3mo", interval="1d",
             group_by="ticker", auto_adjust=True,
             progress=False, threads=True,
         )
@@ -167,8 +171,9 @@ def momentum_screen(candidates: list, top_n: int = 30,
 
     for ticker in candidates:
         try:
-            closes  = (raw[ticker]["Close"] if multi else raw["Close"]).dropna().tolist()
-            volumes = (raw[ticker]["Volume"] if multi else raw["Volume"]).dropna().tolist()
+            yf_sym = yfinance_symbol(ticker)
+            closes  = (raw[yf_sym]["Close"] if multi else raw["Close"]).dropna().tolist()
+            volumes = (raw[yf_sym]["Volume"] if multi else raw["Volume"]).dropna().tolist()
 
             if len(closes) < 25:
                 continue
@@ -562,11 +567,12 @@ def dividend_quality_screen(candidates: list, top_n: int = 25) -> list:
     Returns top_n sorted by composite dividend quality score.
     """
     log.info(f"[Screener/Dividend] Evaluating {len(candidates)} dividend candidates...")
+    from market_data import yfinance_symbol
     scored = []
 
     for ticker in candidates:
         try:
-            info = yf.Ticker(ticker).info
+            info = yf.Ticker(yfinance_symbol(ticker)).info
             yield_    = info.get("dividendYield") or 0
             payout    = info.get("payoutRatio")   or 1.0
             eps       = info.get("trailingEps")   or 0
@@ -629,7 +635,8 @@ TRADINGVIEW_SCREENER_REGION = os.getenv("TRADINGVIEW_SCREENER_REGION", "america"
 def _tv_single_rating(ticker: str) -> tuple:
     """Returns (rating_str, score -1.0 to +1.0) for a single ticker."""
     try:
-        t  = yf.Ticker(ticker)
+        from market_data import yfinance_symbol
+        t  = yf.Ticker(yfinance_symbol(ticker))
         df = t.history(period="6mo", interval="1d", auto_adjust=True)
         if df.empty or len(df) < 55:
             return "NEUTRAL", 0.0
