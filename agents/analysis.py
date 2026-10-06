@@ -180,7 +180,7 @@ Respond ONLY with valid JSON — no other text:
             )
             decision["reddit_detail"] = reddit_detail or decision.get("reddit_detail")
             log.warning(
-                "[%s/Analysis] %s: LLM analysis failed (%s) — %s via signal_strength %s",
+                "[%s/Analysis] %s: LLM analysis failed (%s) — fail-closed %s; signal_strength=%s",
                 bucket.name,
                 ticker,
                 decision.get("analysis_reason") or "analysis_failed",
