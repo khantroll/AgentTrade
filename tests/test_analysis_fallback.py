@@ -383,6 +383,24 @@ def test_failed_analysis_never_buys_on_signal_strength_or_price():
     assert no_price["action"] == "SKIP"
     assert no_price["skip_reason"] == "analysis_failed"
 
+def test_provider_exhaustion_failure_is_fail_closed():
+    from agents.screener_fallback import deterministic_signal_decision
+
+    decision = deterministic_signal_decision(
+        {"ticker": "MSFT", "signal_strength": 95.0, "entry_source": "research"},
+        _growth(),
+        market={"current_price": 500.0},
+        failure={
+            "analysis_status": "failed",
+            "tiered_status": "error",
+            "analysis_reason": "analysis_failed",
+        },
+    )
+    assert decision["action"] == "SKIP"
+    assert decision["analysis_reason"] == "analysis_failed"
+    assert decision["skip_reason"] == "analysis_failed"
+
+
 def test_protective_sell_still_runs_without_analysis(monkeypatch):
     import agents.position_review as review
 
