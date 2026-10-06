@@ -312,7 +312,9 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                 "qty": shares,
                 "shares": shares,
                 "notional": notional,
-                "notional_usd": notional,
+                "notional_usd": round(float(order_notional), 2),
+                "estimated_notional": round(float(order_notional), 2),
+                "current_price": _p or d.get("current_price"),
                 "current_price": _p or d.get("current_price"),
             }
             ok, guard_reason = enforce_no_margin_order_guard(live_account, proposed)
