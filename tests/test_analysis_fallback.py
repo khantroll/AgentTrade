@@ -1,9 +1,9 @@
-"""Analysis LLM failure must not freeze every candidate into SKIP.
+"""Analysis LLM failures fail closed while valid model votes remain authoritative.
 
-Screener signal strength decides when tiered analysis errors, returns invalid
-JSON, or produces no schema-valid decision. A real model vote is left alone.
-Milestone C risk gates and Tier 2 sizing still apply. Protective sells do not
-wait on the analysis models.
+Research-stage screener fallback is a separate degraded entry path. Once an
+analysis LLM is invoked, provider exhaustion, invalid JSON, or otherwise
+unusable output must become SKIP regardless of signal strength. Protective
+sells remain independent of analysis availability.
 """
 
 import copy
@@ -12,10 +12,7 @@ import json
 import pytest
 
 import agent_config as cfg
-from agents.screener_fallback import (
-    ANALYSIS_FALLBACK_MIN_STRENGTH,
-    analysis_result_failed,
-)
+from agents.screener_fallback import analysis_result_failed
 from buckets import Bucket
 
 
@@ -245,10 +242,9 @@ def test_valid_skip_vote_is_not_treated_as_analysis_failure(isolated_llm, monkey
     assert analysis_result_failed(result) is False
 
 
-def test_analysis_failure_buys_strong_evidence_and_skips_weak(monkeypatch):
-    """Live shape: research names exist, every analysis model returns invalid JSON."""
+def test_analysis_failure_fails_closed_regardless_of_signal_strength(monkeypatch):
+    """Research names exist, but every analysis model returns invalid JSON."""
     from agenttrade import db
-    from agenttrade.risk import CycleRiskState, evaluate_batch
     from agents.analysis import analysis_agent
     from agents.risk import risk_agent
 
@@ -268,54 +264,53 @@ def test_analysis_failure_buys_strong_evidence_and_skips_weak(monkeypatch):
         ("mistral_small", "mistral", "still-bad"),
     ])
     monkeypatch.setattr(llm_router, "_mark_provider_success", lambda provider: None)
+    monkeypatch.setattr(
+        llm_router,
+        "_call_provider",
+        lambda provider, model, prompt, max_tokens=600, agent_tag="", mark_success=True: "not json at all",
+    )
 
-    def fake_call(provider, model, prompt, max_tokens=600, agent_tag="", mark_success=True):
-        return "not json at all"
+    candidates = _candidates()
+    candidates[0]["signal_strength"] = 70.0
+    candidates[0]["total_score"] = 70.0
+    candidates[1]["signal_strength"] = 39.1
+    candidates[1]["total_score"] = 39.1
+    attribution = {
+        "NVDA": {"signal_strength": 70.0, "signal_mix": {"news_sentiment": 50, "congress": 50}},
+        "SO": {"signal_strength": 39.1, "signal_mix": {"momentum": 100}},
+    }
 
-    monkeypatch.setattr(llm_router, "_call_provider", fake_call)
-
-    decisions = analysis_agent(_candidates(), {"cash": 85000, "portfolio_value": 107000}, _held_positions(), _growth(), _attribution())
+    decisions = analysis_agent(
+        candidates,
+        {"cash": 85000, "portfolio_value": 107000},
+        _held_positions(),
+        _growth(),
+        attribution,
+    )
     by_ticker = {d["ticker"]: d for d in decisions}
-    assert by_ticker["NVDA"]["action"] == "BUY"
-    assert by_ticker["NVDA"]["analysis_path"] == "deterministic_signal"
-    assert by_ticker["NVDA"]["analysis_status"] == "fallback"
-    assert by_ticker["NVDA"]["signal_strength"] == 60.0
-    assert by_ticker["NVDA"]["entry_source"] == "research"
-    assert "shares" not in by_ticker["NVDA"]
-    assert by_ticker["NVDA"].get("notional_usd") in (None, 0, 0.0)
+    assert by_ticker["NVDA"]["action"] == "SKIP"
+    assert by_ticker["NVDA"]["analysis_path"] == "fail_closed"
+    assert by_ticker["NVDA"]["analysis_status"] == "failed"
+    assert by_ticker["NVDA"]["analysis_reason"] == "invalid_parse"
+    assert by_ticker["NVDA"]["skip_reason"] == "analysis_failed"
+    assert by_ticker["NVDA"]["signal_strength"] == 70.0
     assert by_ticker["SO"]["action"] == "SKIP"
-    assert by_ticker["SO"]["skip_reason"] == "weak_or_missing_signal"
-    assert by_ticker["SO"]["signal_strength"] == 10.0
+    assert by_ticker["SO"]["signal_strength"] == 39.1
+    assert by_ticker["SO"]["skip_reason"] == "analysis_failed"
     assert by_ticker["GBDC"]["action"] == "SKIP"
-    assert by_ticker["GBDC"]["skip_reason"] == "weak_or_missing_signal"
-    assert by_ticker["GBDC"]["signal_strength"] is None
-    assert ANALYSIS_FALLBACK_MIN_STRENGTH == 20.0
+    assert by_ticker["GBDC"]["skip_reason"] == "analysis_failed"
     assert all(d["action"] != "SELL" for d in decisions)
 
-    positions = _held_positions()
-    snap = _paper_snapshot(positions=positions)
-    state = CycleRiskState.from_snapshot(snap, positions)
+    snap = _paper_snapshot(positions=_held_positions())
     approved = risk_agent(
-        decisions, snap["account"], positions, _growth(), None,
-        account_snapshot=snap, cycle_state=state,
+        decisions,
+        snap["account"],
+        _held_positions(),
+        _growth(),
+        None,
+        account_snapshot=snap,
     )
-    assert [d["ticker"] for d in approved] == ["NVDA"]
-    sized = evaluate_batch(approved, snap, _growth(), cycle_state=state)
-    assert len(sized) == 1
-    assert sized[0]["ticker"] == "NVDA"
-    assert sized[0]["position_sizing_source"] == "deterministic"
-    assert int(sized[0]["shares"]) > 0
-    assert float(sized[0]["estimated_notional"]) > 0
-    assert float(sized[0]["estimated_notional"]) < snap["account"]["cash"]
-
-    drawn = _paper_snapshot(cash=85000.0, equity=90000.0, long_mv=22000.0, high_water=107000.0, positions=positions)
-    blocked = copy.deepcopy(by_ticker["NVDA"])
-    refused = risk_agent(
-        [blocked], drawn["account"], positions, _growth(), None, account_snapshot=drawn,
-    )
-    assert refused == []
-    assert blocked["blocked_reason"] == "drawdown_pause"
-
+    assert approved == []
 
 def test_valid_model_skip_is_not_overridden_by_strong_screener_evidence(monkeypatch):
     from agents.analysis import analysis_agent
@@ -347,7 +342,7 @@ def test_valid_model_skip_is_not_overridden_by_strong_screener_evidence(monkeypa
     assert "RSI extended" in decisions[0]["rationale"] or "BUY threshold" in decisions[0]["rationale"] or decisions[0]["tiered_status"] == "no_buy_consensus"
 
 
-def test_boundary_strength_and_missing_price():
+def test_failed_analysis_never_buys_on_signal_strength_or_price():
     from agents.screener_fallback import deterministic_signal_decision
 
     bucket = _growth()
@@ -358,34 +353,35 @@ def test_boundary_strength_and_missing_price():
         "rationale": "All tiered analysis models failed or returned invalid JSON",
     }
     priced = {"current_price": 50.0, "atr14": 1.5}
-    at_bar = deterministic_signal_decision(
-        {"ticker": "MSFT", "signal_strength": ANALYSIS_FALLBACK_MIN_STRENGTH, "entry_source": "research"},
-        bucket,
-        market=priced,
-        failure=failure,
-    )
-    assert at_bar["action"] == "BUY"
-    assert at_bar["analysis_path"] == "deterministic_signal"
-    assert "shares" not in at_bar
 
-    just_under = deterministic_signal_decision(
-        {"ticker": "S", "signal_strength": ANALYSIS_FALLBACK_MIN_STRENGTH - 0.1},
+    strong = deterministic_signal_decision(
+        {"ticker": "MSFT", "signal_strength": 70.0, "entry_source": "research"},
         bucket,
         market=priced,
         failure=failure,
     )
-    assert just_under["action"] == "SKIP"
-    assert just_under["skip_reason"] == "weak_or_missing_signal"
+    assert strong["action"] == "SKIP"
+    assert strong["analysis_path"] == "fail_closed"
+    assert strong["skip_reason"] == "analysis_failed"
+    assert strong["signal_strength"] == 70.0
+
+    medium = deterministic_signal_decision(
+        {"ticker": "S", "signal_strength": 39.1, "entry_source": "research"},
+        bucket,
+        market=priced,
+        failure=failure,
+    )
+    assert medium["action"] == "SKIP"
+    assert medium["skip_reason"] == "analysis_failed"
 
     no_price = deterministic_signal_decision(
-        {"ticker": "NVDA", "signal_strength": 60},
+        {"ticker": "NVDA", "signal_strength": 90.0},
         bucket,
         market={"current_price": 0},
         failure=failure,
     )
     assert no_price["action"] == "SKIP"
-    assert no_price["skip_reason"] == "screener_fallback_no_price"
-
+    assert no_price["skip_reason"] == "analysis_failed"
 
 def test_protective_sell_still_runs_without_analysis(monkeypatch):
     import agents.position_review as review
