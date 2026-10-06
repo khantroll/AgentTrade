@@ -288,6 +288,19 @@ def test_recent_fills_keep_activity_id_separate_from_order_id(monkeypatch):
     assert row["id"] == "202610051500::act"
     assert row["order_id"] == "ord-real"
     assert row["filled_at"] == "2026-10-05T15:00:00Z"
+    assert row["notional_usd"] == 140.0
+
+
+def test_dashboard_recent_fills_include_only_agenttrade_owned_orders():
+    from agenttrade.publish import filter_agenttrade_recent_fills
+
+    fills = [
+        {"order_id": "ord-agent", "ticker": "MSFT", "side": "buy"},
+        {"order_id": "ord-foreign-equity", "ticker": "AAPL", "side": "buy"},
+        {"order_id": "ord-pepe", "ticker": "PEPE/USD", "side": "buy"},
+    ]
+    filtered = filter_agenttrade_recent_fills(fills, {"ord-agent"})
+    assert filtered == [fills[0]]
 
 
 def test_chicago_day_collapses_partials_and_ignores_non_trades():
