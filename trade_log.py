@@ -127,6 +127,17 @@ def _load_order_meta() -> dict:
     return meta
 
 
+def _agenttrade_owned_order_ids(meta: dict = None) -> set[str]:
+    """Known AgentTrade broker order ids without mutating historical logs."""
+    owned = set((meta or _load_order_meta()).keys())
+    try:
+        from agenttrade import db as ledger
+        owned.update(ledger.agent_submitted_order_ids())
+    except Exception:
+        pass
+    return {str(oid) for oid in owned if oid}
+
+
 def _alpaca_headers() -> tuple:
     _load_config_env()
     key = os.getenv("ALPACA_API_KEY", "")
@@ -310,8 +321,12 @@ def sync_trade_log(state=None, days: int = 90) -> dict:
         for r in load_trades(max_days=max(days, 365), limit=MAX_LINES):
             existing_by_key[_fill_dedupe_key(r)] = r
 
+        owned_order_ids = _agenttrade_owned_order_ids(meta)
         added = 0
         for act in raw:
+            broker_order_id = str(act.get("order_id") or "")
+            if owned_order_ids and broker_order_id not in owned_order_ids:
+                continue
             row = normalize_fill(act, tags, meta)
             key = _fill_dedupe_key(row)
             if key not in existing_by_key:
@@ -377,6 +392,12 @@ def summarize_trades(trades: list) -> dict:
 
 def get_trades(max_days: int = 90) -> dict:
     trades = load_trades(max_days=max_days)
+    owned_order_ids = _agenttrade_owned_order_ids()
+    if owned_order_ids:
+        trades = [
+            row for row in trades
+            if str(row.get("order_id") or "") in owned_order_ids
+        ]
     payload = {
         "ok": True,
         "max_days": max_days,
