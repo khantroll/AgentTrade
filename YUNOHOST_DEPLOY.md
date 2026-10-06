@@ -101,6 +101,15 @@ ALPACA_PAPER=true          # ← keep true until you fully trust the agent
 ANTHROPIC_API_KEY=sk-ant-...   # or OPENAI_API_KEY / GEMINI_API_KEY / MISTRAL_API_KEY / DEEPSEEK_API_KEY / GROQ_API_KEY
 LLM_MODE=tiered
 DAILY_TOKEN_BUDGET=200000
+
+# Optional. Leave blank to keep today's Groq/Gemini/Mistral list unchanged.
+# A real key is enough; do not commit the key. Restart the agent after saving.
+OPENROUTER_API_KEY=
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=openrouter/free
+NVIDIA_API_KEY=
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+LLM_TIERED_AUTO_FAILOVER=1
 ```
 
 ---

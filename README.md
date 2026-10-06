@@ -88,7 +88,21 @@ Every symbol in a cycle is traceable by `cycle_run_id` through
 - **Alpaca** (paper trading) — free at https://alpaca.markets → Paper Trading → API Keys
 - At least one LLM key: Anthropic, OpenAI, Google Gemini, Mistral, DeepSeek, or Groq.
 
-Supported `LLM_MODE` values include `tiered`, `dual`, `claude_haiku`, `claude_sonnet`, `gpt4o_mini`, `gpt4o`, `gemini_flash`, `gemini_pro`, `mistral_small`, `mistral_large`, `deepseek_chat`, `deepseek_reasoner`, `groq_llama`, and `groq_qwen`.
+Supported `LLM_MODE` values include `tiered`, `dual`, `claude_haiku`, `claude_sonnet`, `gpt4o_mini`, `gpt4o`, `gemini_flash`, `gemini_pro`, `mistral_small`, `mistral_large`, `deepseek_chat`, `deepseek_reasoner`, `groq_llama`, `groq_qwen`, `nvidia_llama`, `nvidia_qwen`, `nvidia_deepseek`, and `openrouter_free`.
+
+Optional cheap failover (off until a real key is set; paper defaults do not require these):
+
+```
+OPENROUTER_API_KEY=
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=openrouter/free
+NVIDIA_API_KEY=
+NIM_API_KEY=
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+LLM_TIERED_AUTO_FAILOVER=1
+```
+
+`OPENROUTER_MODEL=openrouter/free` is OpenRouter's free-model router (OpenAI-compatible, $0). NVIDIA NIM uses the same chat-completions shape. With `LLM_TIERED_AUTO_FAILOVER=1` (the default), a real key appends that provider after the explicit tier list. Placeholder values such as `<SET_NVIDIA_API_KEY>` do not enable it. Set `LLM_TIERED_AUTO_FAILOVER=0` to keep the explicit list exclusive. You can also name `openrouter_free` or `nvidia_llama` yourself in `LLM_TIERED_RESEARCH_MODELS` / `LLM_TIERED_ANALYSIS_MODELS`.
 
 **Optional (unlock more screener pipelines):**
 - **NewsAPI** — free at https://newsapi.org (100 req/day free tier) → enables news sentiment pipeline
@@ -155,12 +169,12 @@ LLM research is a narrator and a fallback, not the only way into a trade.
 
 - A schema-valid research object with picks (`research_status=ok`) is still used. The research prompt for that call includes the screener evidence from the same universe (ranks, pipeline hits, `signal_strength`, `signal_mix`).
 - If research **fails** (provider error, 429, parse failure, budget exhaustion, model-not-found, no healthy model) or returns a **valid empty** set, and the screener already built a universe, entries come from that universe (`source=screener`) ordered by `signal_strength`. Analysis for those names is deterministic; risk and execution gates are unchanged.
-- If research did return names but analysis **fails** (every model errors, or returns prose / invalid JSON / an empty object / no BUY/SELL/HOLD/SKIP), that failure is not a SKIP vote. The decision uses screener `signal_strength`: at or above one full-rank news hit (`ANALYSIS_FALLBACK_MIN_STRENGTH`, 20) with a live price becomes BUY (`analysis_path=deterministic_signal`); weaker or missing strength stays SKIP. A schema-valid model BUY, SELL, HOLD, or SKIP is still the decision, including a real multi-model SKIP. Tiered analysis walks the configured list until `LLM_TIERED_ANALYSIS_FANOUT` (or `LLM_TIERED_FANOUT`) valid decisions; an unusable body gets one strict retry, then the next model, and is not marked healthy. Tier 2 still sizes the order. Milestone C cash, held-name, average-down, drawdown, and max-invested gates are unchanged. Protective sells stay on position review and do not wait on this path.
+- If research did return names but analysis **fails** (every model errors, or returns prose / invalid JSON / an empty object / no BUY/SELL/HOLD/SKIP), that failure is not a model opinion. The decision is a fail-closed SKIP (`analysis_path=fail_closed`). Signal strength is kept for diagnostics and does not authorize a BUY after an invoked analysis LLM fails. A schema-valid model BUY, SELL, HOLD, or SKIP is still the decision, including a real multi-model SKIP. Tiered analysis walks the configured list until `LLM_TIERED_ANALYSIS_FANOUT` (or `LLM_TIERED_FANOUT`) valid decisions; an unusable body gets one strict retry, then the next model, and is not marked healthy. Tier 2 still sizes the order. Milestone C cash, held-name, average-down, drawdown, and max-invested gates are unchanged. Protective sells stay on position review and do not wait on this path.
 - `failed` and `empty` stay distinct on `research_status` in the cycle log, SQLite artifact, and dashboard. An empty candidate table is not how a broken research gate is reported.
 - Protective exits (position review and hard rebalance) run even when the token budget blocks LLM calls.
-- Tiered research keeps walking the provider list until `LLM_TIERED_FANOUT` (or `LLM_TIERED_VALID_PARSES`) valid JSON parses, or the list is exhausted. HTTP 200 with prose, a code fence, or `{}` is not success. A 429 backs the provider off (`LLM_RATE_LIMIT_COOLDOWN_MINUTES`, default 120) and tries the next tier. Model-not-found / HTTP 404 suppresses that model for `LLM_MODEL_NOT_FOUND_SUPPRESS_HOURS` (default 24).
+- Tiered research keeps walking the provider list until `LLM_TIERED_FANOUT` (or `LLM_TIERED_VALID_PARSES`) valid JSON parses, or the list is exhausted. HTTP 200 with prose, a code fence, or `{}` is not success. A 429 backs **that provider** off (`LLM_RATE_LIMIT_COOLDOWN_MINUTES`, default 120) and tries the next ready tier. One provider's cooldown does not drop the others. The research gate returns `no_models_available` only when every explicit tier and every enabled failover is missing a key, cooling, or model-suppressed. Model-not-found / HTTP 404 suppresses that model for `LLM_MODEL_NOT_FOUND_SUPPRESS_HOURS` (default 24) and does not cool the whole provider. A message that merely contains the letters "rate" (for example "separate") is not a 429.
 - Repo Groq defaults are `GROQ_QWEN_MODEL=qwen/qwen3.8-27b` and `GROQ_LLAMA_MODEL=openai/gpt-oss-120b`. `llama-3.1-8b-instant` and `llama-3.3-70b-versatile` 404 on the current host.
-- Built-in bucket defaults are Growth 45% / Dividend 25% / Swing 20% / Crypto 10% (`CRYPTO_MAX_ALLOCATION`, default `0.10`). Override with `GROWTH_ALLOCATION`, `DIVIDEND_ALLOCATION`, `SWING_ALLOCATION`, and `CRYPTO_MAX_ALLOCATION`. A recommended tiered list is in `config.example.json` (`groq_qwen,gemini_flash,mistral_small` for research).
+- Built-in bucket defaults are Growth 45% / Dividend 25% / Swing 20% / Crypto 10% (`CRYPTO_MAX_ALLOCATION`, default `0.10`). Override with `GROWTH_ALLOCATION`, `DIVIDEND_ALLOCATION`, `SWING_ALLOCATION`, and `CRYPTO_MAX_ALLOCATION`. A recommended tiered list is in `config.example.json` (`groq_qwen,gemini_flash,mistral_small` for research). That list stays the primary walk. A real `OPENROUTER_API_KEY` or `NVIDIA_API_KEY` is appended after it when `LLM_TIERED_AUTO_FAILOVER` is on, so a Groq or Mistral 429 does not end research while the failover is still ready. Analysis that has already invoked an LLM still fail-closes to SKIP when every model fails or returns invalid JSON; that path does not become a screener BUY. Research-stage failure still may use the screener universe.
 
 `signal_strength` is the capped raw conviction (a one-pipeline name stays weak). `signal_mix` is the relative composition and can sum to 100. `total_score` is the strength alias and `components` is the mix alias, so older readers follow the split. Reddit raw points are capped at one full-rank Congress hit (`REDDIT_RAW_CAP`, weight 3 × 10 = 30) before that mix is computed, which keeps Reddit below the combined congress + news + movers + momentum ceiling (80).
 
@@ -245,11 +259,18 @@ Reddit's ensemble weight is 2.5, between news and Congress. A separate raw-point
 - **Track P&L over time** — log to SQLite and chart performance week-over-week
 
 
-# NVIDIA NIM (OpenAI-compatible)
+# NVIDIA NIM (OpenAI-compatible). Base URL only — the client appends /chat/completions.
+# A saved URL that already ends in /chat/completions is used as-is.
 NVIDIA_API_KEY=
 NIM_API_KEY=
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 NVIDIA_LLAMA_MODEL=meta/llama-3.1-70b-instruct
 NVIDIA_QWEN_MODEL=qwen/qwen3-235b-a22b
 NVIDIA_DEEPSEEK_MODEL=deepseek-ai/deepseek-r1
-# Add nvidia_llama/nvidia_qwen/nvidia_deepseek to tiered lists when desired.
+
+# OpenRouter free/cheap failover. Blank key = disabled. No secret belongs in git.
+OPENROUTER_API_KEY=
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_MODEL=openrouter/free
+# 1 appends openrouter_free and nvidia_llama after the explicit tier list when those keys are real.
+LLM_TIERED_AUTO_FAILOVER=1

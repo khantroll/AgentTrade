@@ -301,6 +301,17 @@ input[type=range]{flex:1;accent-color:var(--accent)}
     </div>
   </div>
 
+  <!-- ── OpenRouter ── -->
+  <div class="card" id="card-openrouter">
+    <div class="card-header"><div class="card-title"><span class="card-icon">🔀</span><div><div class="card-name">OpenRouter</div><div class="card-desc">Optional free/cheap failover when Groq, Gemini, or Mistral is cooling</div></div></div><div class="card-status untested" id="status-openrouter"><span class="status-dot"></span>Not tested</div></div>
+    <div class="card-body">
+      <div class="field-group"><div class="field-label">API Key <a href="https://openrouter.ai/keys" target="_blank">Get key ↗</a></div><div class="field-row"><input class="field-input" type="password" id="OPENROUTER_API_KEY" placeholder="sk-or-…"><button class="toggle-vis" onclick="toggleVis('OPENROUTER_API_KEY')">👁</button><button class="save-key-btn" onclick="saveKey('OPENROUTER_API_KEY')">Save</button></div><div class="hint">Leave blank to keep the current tier list. A real key appends <code>openrouter_free</code> after the explicit tiers. It is not called while earlier tiers already fill the fanout.</div></div>
+      <div class="field-group"><div class="field-label">Base URL</div><div class="field-row"><input class="field-input" id="OPENROUTER_BASE_URL" placeholder="https://openrouter.ai/api/v1"><button class="save-key-btn" onclick="saveKey('OPENROUTER_BASE_URL')">Save</button></div></div>
+      <div class="field-group"><div class="field-label">Model</div><div class="field-row"><input class="field-input" id="OPENROUTER_MODEL" placeholder="openrouter/free"><button class="save-key-btn" onclick="saveKey('OPENROUTER_MODEL')">Save</button></div><div class="hint">Default <code>openrouter/free</code> routes to a free model that accepts JSON. Set any OpenRouter model id to use a different one.</div></div>
+      <button class="test-btn" onclick="testOpenRouter()">🔌 Test Connection</button><div class="test-result" id="tr-openrouter"></div>
+    </div>
+  </div>
+
   <!-- ── LLM Mode & Budget ── -->
   <div class="card">
     <div class="card-header">
@@ -352,6 +363,7 @@ input[type=range]{flex:1;accent-color:var(--accent)}
           <div class="mode-opt" id="mode-nvidia_llama" onclick="selectMode('nvidia_llama')"><div class="mode-opt-name gpt">NVIDIA Llama</div><div class="mode-opt-desc">NVIDIA NIM hosted Llama.</div></div>
           <div class="mode-opt" id="mode-nvidia_qwen" onclick="selectMode('nvidia_qwen')"><div class="mode-opt-name gpt">NVIDIA Qwen</div><div class="mode-opt-desc">NVIDIA NIM hosted Qwen.</div></div>
           <div class="mode-opt" id="mode-nvidia_deepseek" onclick="selectMode('nvidia_deepseek')"><div class="mode-opt-name dual">NVIDIA DeepSeek</div><div class="mode-opt-desc">NVIDIA NIM hosted DeepSeek.</div></div>
+          <div class="mode-opt" id="mode-openrouter_free" onclick="selectMode('openrouter_free')"><div class="mode-opt-name gpt">OpenRouter Free</div><div class="mode-opt-desc">OpenRouter free-model router for every call.</div></div>
         </div>
         <input type="hidden" id="LLM_MODE" value="tiered">
       </div>
@@ -607,7 +619,7 @@ function fieldVal(id) {
 // ── Populate form fields from loaded config ───────────────────────────────────
 function populateFields() {
   const textFields = [
-    'ALPACA_API_KEY','ALPACA_SECRET_KEY','ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL',
+    'ALPACA_API_KEY','ALPACA_SECRET_KEY','ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL','OPENROUTER_API_KEY','OPENROUTER_BASE_URL','OPENROUTER_MODEL',
     'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT',
     'NEWS_API_KEY','QUIVER_API_KEY',
   ];
@@ -697,7 +709,7 @@ async function saveKey(key) {
 async function saveAll() {
   const allKeys = [
     'ALPACA_API_KEY','ALPACA_SECRET_KEY','ALPACA_PAPER',
-    'ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL',
+    'ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL','OPENROUTER_API_KEY','OPENROUTER_BASE_URL','OPENROUTER_MODEL',
     'LLM_MODE','DAILY_TOKEN_BUDGET','MAX_DAILY_TRADES','HARD_REBALANCE','HARD_REBALANCE_DRIFT_PCT','SCREENER_CACHE','SCREENER_CACHE_TTL_MINUTES',
     'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT',
     'NEWS_API_KEY','QUIVER_API_KEY',
@@ -742,7 +754,7 @@ function selectMode(mode, save=true) {
 
 // ── Budget slider ─────────────────────────────────────────────────────────────
 const COST_PER_TOK = { tiered:0.0000009, claude_sonnet:0.000009, claude_haiku:0.0000012,
-  gpt4o_mini:0.00000038, gpt4o:0.00000625, dual:0.0000045, gemini_flash:0.0000007, gemini_pro:0.0000045, mistral_small:0.0000004, mistral_large:0.000004, deepseek_chat:0.0000007, deepseek_reasoner:0.0000025, groq_llama:0.0000006, groq_qwen:0.0000004 };
+  gpt4o_mini:0.00000038, gpt4o:0.00000625, dual:0.0000045, gemini_flash:0.0000007, gemini_pro:0.0000045, mistral_small:0.0000004, mistral_large:0.000004, deepseek_chat:0.0000007, deepseek_reasoner:0.0000025, groq_llama:0.0000006, groq_qwen:0.0000004, openrouter_free:0, nvidia_llama:0.0000006 };
 
 function updateBudget(val) {
   val = parseInt(val);
@@ -816,6 +828,7 @@ function testMistral()   { runTest('mistral',   {api_key:fieldVal('MISTRAL_API_K
 function testDeepSeek()  { runTest('deepseek',  {api_key:fieldVal('DEEPSEEK_API_KEY')},                                                                    'tr-deepseek', 'status-deepseek'); }
 function testGroq()      { runTest('groq',      {api_key:fieldVal('GROQ_API_KEY')},                                                                        'tr-groq',     'status-groq');     }
 function testNvidia()    { runTest('nvidia',    {api_key:fieldVal('NVIDIA_API_KEY')},                                                                     'tr-nvidia',   'status-nvidia');  }
+function testOpenRouter(){ runTest('openrouter',{api_key:fieldVal('OPENROUTER_API_KEY')},                                                               'tr-openrouter','status-openrouter'); }
 function testReddit()    { runTest('reddit',    {client_id:fieldVal('REDDIT_CLIENT_ID'), client_secret:fieldVal('REDDIT_CLIENT_SECRET'), user_agent:v('REDDIT_USER_AGENT')}, 'tr-reddit', 'status-reddit'); }
 function testNewsAPI()   { runTest('newsapi',   {api_key:fieldVal('NEWS_API_KEY')},                                                                        'tr-newsapi',  'status-newsapi');  }
 function testQuiver()    { runTest('quiver',    {api_key:fieldVal('QUIVER_API_KEY')},                                                                      'tr-quiver',   'status-quiver');   }
@@ -833,7 +846,7 @@ function showResult(id, ok, msg) {
 function exportEnv(overridePayload) {
   const keys = [
     'ALPACA_API_KEY','ALPACA_SECRET_KEY','ALPACA_PAPER',
-    'ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL',
+    'ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL','OPENROUTER_API_KEY','OPENROUTER_BASE_URL','OPENROUTER_MODEL',
     'LLM_MODE','DAILY_TOKEN_BUDGET','MAX_DAILY_TRADES','HARD_REBALANCE','HARD_REBALANCE_DRIFT_PCT','SCREENER_CACHE','SCREENER_CACHE_TTL_MINUTES',
     'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT',
     'NEWS_API_KEY','QUIVER_API_KEY',
