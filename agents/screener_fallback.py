@@ -21,9 +21,8 @@ from signal_attribution import (
     resolve_signal_strength,
 )
 
-# A lone momentum hit is weight 1 × 10 = 10 and stays below this bar.
-# One full-rank news hit (weight 2 × 10 = 20) is enough evidence to buy
-# when the analysis models produced no decision.
+# Legacy compatibility constant retained for callers/tests that imported it.
+# It no longer authorizes BUY after an invoked analysis fails.
 ANALYSIS_FALLBACK_MIN_STRENGTH = PIPELINE_WEIGHTS["news_sentiment"] * PIPELINE_HIT_SCALE
 
 _ANALYSIS_ACTIONS = {"BUY", "SELL", "HOLD", "SKIP"}
