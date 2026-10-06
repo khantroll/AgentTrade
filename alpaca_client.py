@@ -153,6 +153,9 @@ def get_recent_fills(max_items: int = 30) -> list:
                 "side": a.get("side", ""),
                 "shares": a.get("qty", ""),
                 "price": a.get("price", ""),
+                "notional_usd": round(
+                    float(a.get("qty") or 0) * float(a.get("price") or 0), 2
+                ),
                 "status": "filled",
                 "submitted_at": a.get("transaction_time", ""),
                 "filled_at": a.get("transaction_time", ""),
