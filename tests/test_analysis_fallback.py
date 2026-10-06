@@ -6,7 +6,6 @@ unusable output must become SKIP regardless of signal strength. Protective
 sells remain independent of analysis availability.
 """
 
-import copy
 import json
 
 import pytest
@@ -312,6 +311,7 @@ def test_analysis_failure_fails_closed_regardless_of_signal_strength(monkeypatch
     )
     assert approved == []
 
+
 def test_valid_model_skip_is_not_overridden_by_strong_screener_evidence(monkeypatch):
     from agents.analysis import analysis_agent
 
@@ -382,6 +382,7 @@ def test_failed_analysis_never_buys_on_signal_strength_or_price():
     )
     assert no_price["action"] == "SKIP"
     assert no_price["skip_reason"] == "analysis_failed"
+
 
 def test_provider_exhaustion_failure_is_fail_closed():
     from agents.screener_fallback import deterministic_signal_decision
