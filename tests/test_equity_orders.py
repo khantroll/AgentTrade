@@ -184,6 +184,9 @@ def test_execution_submits_valid_equity_bracket_and_replaces_resting_buy(monkeyp
         account_snapshot=snapshot,
     )
     assert results[0]["status"] == "placed"
+    assert results[0]["notional_usd"] == pytest.approx(356.46)
+    assert results[0]["estimated_notional"] == pytest.approx(356.46)
+    assert results[0]["current_price"] == pytest.approx(178.23)
     assert cancelled == ["/v2/orders/ord-old"]
     body = posted["payload"]
     assert body["qty"] == "2"
