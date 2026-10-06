@@ -88,6 +88,15 @@ def _log_signals_publish_summary(state: dict, cached: dict) -> None:
     )
 
 
+def filter_agenttrade_recent_fills(fills: list, owned_order_ids: set[str]) -> list:
+    """Return only broker fills attributable to AgentTrade-submitted orders."""
+    owned = {str(oid) for oid in (owned_order_ids or set()) if oid}
+    return [
+        fill for fill in (fills or [])
+        if str(fill.get("order_id") or fill.get("alpaca_order_id") or "") in owned
+    ]
+
+
 def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: Optional[dict] = None) -> dict:
     """
     Merge SQLite ledger + live Alpaca + projection-cache compatibility data.
@@ -131,6 +140,21 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
         snapshot["open_orders"] = ledger_data.get("open_orders") or []
 
     state = merge_snapshot_into_state(cached, snapshot, source="dashboard")
+
+    # Broker activity is account-wide. Keep it available as account truth, but
+    # expose only AgentTrade-owned fills through the strategy/dashboard field.
+    # Legacy AgentTrade orders without the client_order_id prefix remain owned
+    # when they were persisted with a strategy_name in SQLite.
+    broker_recent_fills = list(snapshot.get("recent_fills") or [])
+    try:
+        owned_order_ids = ledger.agent_submitted_order_ids()
+    except Exception:
+        owned_order_ids = set()
+    state["account_recent_fills"] = broker_recent_fills
+    state["recent_fills"] = filter_agenttrade_recent_fills(
+        broker_recent_fills, owned_order_ids
+    )
+
     state["ledger_source"] = "sqlite"
     state["broker_source"] = "alpaca"
     state["state_cache_role"] = "projection_only"

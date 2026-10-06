@@ -288,6 +288,40 @@ def test_recent_fills_keep_activity_id_separate_from_order_id(monkeypatch):
     assert row["id"] == "202610051500::act"
     assert row["order_id"] == "ord-real"
     assert row["filled_at"] == "2026-10-05T15:00:00Z"
+    assert row["notional_usd"] == 140.0
+
+
+def test_dashboard_recent_fills_include_only_agenttrade_owned_orders():
+    from agenttrade.publish import filter_agenttrade_recent_fills
+
+    fills = [
+        {"order_id": "ord-agent", "ticker": "MSFT", "side": "buy"},
+        {"order_id": "ord-foreign-equity", "ticker": "AAPL", "side": "buy"},
+        {"order_id": "ord-pepe", "ticker": "PEPE/USD", "side": "buy"},
+    ]
+    filtered = filter_agenttrade_recent_fills(fills, {"ord-agent"})
+    assert filtered == [fills[0]]
+
+
+def test_trade_history_filters_foreign_orders_without_rewriting_log(tmp_path, monkeypatch):
+    import trade_log
+
+    rows = [
+        {"date": "2026-10-06", "time": "2026-10-06T13:00:00+00:00", "order_id": "ord-agent", "symbol": "MSFT", "side": "buy", "qty": 1, "price": 100, "notional": 100},
+        {"date": "2026-10-06", "time": "2026-10-06T13:01:00+00:00", "order_id": "ord-foreign", "symbol": "AAPL", "side": "buy", "qty": 1, "price": 200, "notional": 200},
+        {"date": "2026-10-06", "time": "2026-10-06T13:02:00+00:00", "order_id": "ord-pepe", "symbol": "PEPE/USD", "side": "buy", "qty": 1000, "price": 0.01, "notional": 10},
+    ]
+    (tmp_path / trade_log.TRADE_LOG_FILE).write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(trade_log, "_app_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(trade_log, "_agenttrade_owned_order_ids", lambda meta=None: {"ord-agent"})
+
+    payload = trade_log.get_trades(max_days=30)
+    assert [row["order_id"] for row in payload["trades"]] == ["ord-agent"]
+    # Foreign history remains on disk; it is merely excluded from AgentTrade attribution.
+    assert "ord-pepe" in (tmp_path / trade_log.TRADE_LOG_FILE).read_text(encoding="utf-8")
 
 
 def test_chicago_day_collapses_partials_and_ignores_non_trades():

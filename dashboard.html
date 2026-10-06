@@ -428,7 +428,13 @@ function renderOrders(s) {
     const sym = val(o, 'symbol', 'ticker', 'asset');
     const bucket = val(o, 'bucket', 'bucket_name') || bucketForSymbol(sym, s) || '—';
     const qty = val(o, 'qty', 'quantity', 'filled_qty', 'shares');
-    const amount = val(o, 'notional_usd', 'notional', 'amount', 'filled_avg_price', 'price', 'market_value');
+    const explicitAmount = val(o, 'notional_usd', 'notional', 'amount', 'estimated_notional', 'market_value');
+    const unitPrice = val(o, 'filled_avg_price', 'price', 'current_price', 'limit_price');
+    const amount = explicitAmount != null && explicitAmount !== ''
+      ? explicitAmount
+      : (qty != null && qty !== '' && unitPrice != null && unitPrice !== ''
+          ? n(qty) * n(unitPrice)
+          : null);
     const time = val(o, 'submitted_at', 'filled_at', 'created_at', 'date', 'time');
     return '<tr><td>' + esc(time ? String(time).slice(0, 19) : '—') + '</td><td>' + yahoo(sym) + '</td>' +
       '<td><span class="pill purple">' + esc(bucket) + '</span></td><td>' + esc(val(o, 'side', 'action') || '—') + '</td>' +
