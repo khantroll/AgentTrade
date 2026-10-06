@@ -131,6 +131,22 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
         snapshot["open_orders"] = ledger_data.get("open_orders") or []
 
     state = merge_snapshot_into_state(cached, snapshot, source="dashboard")
+
+    # Broker activity is account-wide. Keep it available as account truth, but
+    # expose only AgentTrade-owned fills through the strategy/dashboard field.
+    # Legacy AgentTrade orders without the client_order_id prefix remain owned
+    # when they were persisted with a strategy_name in SQLite.
+    broker_recent_fills = list(snapshot.get("recent_fills") or [])
+    try:
+        owned_order_ids = ledger.agent_submitted_order_ids()
+    except Exception:
+        owned_order_ids = set()
+    state["account_recent_fills"] = broker_recent_fills
+    state["recent_fills"] = [
+        fill for fill in broker_recent_fills
+        if str(fill.get("order_id") or fill.get("alpaca_order_id") or "") in owned_order_ids
+    ]
+
     state["ledger_source"] = "sqlite"
     state["broker_source"] = "alpaca"
     state["state_cache_role"] = "projection_only"
