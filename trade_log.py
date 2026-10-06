@@ -407,7 +407,10 @@ def get_trades(max_days: int = 90) -> dict:
     }
     try:
         from pnl_attribution import compute_attribution, _load_agent_state
-        all_trades = load_trades(max_days=max(max_days, 365), limit=3000)
+        all_trades = [
+            row for row in load_trades(max_days=max(max_days, 365), limit=3000)
+            if str(row.get("order_id") or "") in owned_order_ids
+        ]
         payload["attribution"] = compute_attribution(
             all_trades, max_days=max_days, state=_load_agent_state()
         )
