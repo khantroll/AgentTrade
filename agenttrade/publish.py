@@ -88,6 +88,15 @@ def _log_signals_publish_summary(state: dict, cached: dict) -> None:
     )
 
 
+def filter_agenttrade_recent_fills(fills: list, owned_order_ids: set[str]) -> list:
+    """Return only broker fills attributable to AgentTrade-submitted orders."""
+    owned = {str(oid) for oid in (owned_order_ids or set()) if oid}
+    return [
+        fill for fill in (fills or [])
+        if str(fill.get("order_id") or fill.get("alpaca_order_id") or "") in owned
+    ]
+
+
 def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: Optional[dict] = None) -> dict:
     """
     Merge SQLite ledger + live Alpaca + projection-cache compatibility data.
@@ -142,10 +151,9 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
     except Exception:
         owned_order_ids = set()
     state["account_recent_fills"] = broker_recent_fills
-    state["recent_fills"] = [
-        fill for fill in broker_recent_fills
-        if str(fill.get("order_id") or fill.get("alpaca_order_id") or "") in owned_order_ids
-    ]
+    state["recent_fills"] = filter_agenttrade_recent_fills(
+        broker_recent_fills, owned_order_ids
+    )
 
     state["ledger_source"] = "sqlite"
     state["broker_source"] = "alpaca"
