@@ -33,6 +33,7 @@
   <div class="metric"><div class="label">Est. Cost Today</div><div class="value" id="cost-today">—</div><div class="sub" id="calls-sub"></div></div>
   <div class="metric"><div class="label">Trades Today</div><div class="value" id="trades-today">—</div><div class="sub" id="trades-cap">—</div></div>
 </div>
+<div id="cash-gate-note" class="mini" style="display:none;padding:8px 16px;background:#1a1408;color:var(--yellow);border-bottom:1px solid var(--line)"></div>
 <div class="wrap"><main>
 <section class="section"><div class="section-title">Bucket Allocations <span id="last-upd" class="mini"></span></div><div class="grid bucket-grid" id="bucket-grid"></div></section>
 <section class="section"><div class="section-title">Token Usage &amp; Model</div><div class="card">
@@ -443,6 +444,18 @@ function renderOrders(s) {
   }).join('') || '<tr><td colspan="8" class="empty">No orders yet</td></tr>';
 }
 
+function cashGateText(g) {
+  if (!g || !g.blocked) return '';
+  const usable = money(g.usable_cash);
+  const floor = money(g.min_cash_reserve);
+  const cashAmt = money(g.cash);
+  const reserve = money(g.reserve_dollars);
+  const pctReserve = Math.round(Number(g.reserve_pct || 0) * 100);
+  const buys = g.buys_blocked != null ? g.buys_blocked + ' buys blocked. ' : '';
+  return buys + 'Buys blocked by cash reserve: usable ' + usable + ' below MIN_CASH_RESERVE ' + floor
+    + ' (cash ' + cashAmt + ', ' + pctReserve + '% reserve ' + reserve + ').';
+}
+
 function renderCandidates(s) {
   const picks = Array.isArray(s.trade_candidates) ? s.trade_candidates : (Array.isArray(s.candidates) ? s.candidates : []);
   const blocked = Array.isArray(s.blocked_ideas) ? s.blocked_ideas : [];
@@ -464,7 +477,11 @@ function renderCandidates(s) {
     const sym = c.ticker || c.symbol || '?';
     const bucket = c.bucket || bucketForSymbol(sym, s) || '—';
     const conf = c.confidence != null ? (Number(c.confidence) * (Number(c.confidence) <= 1 ? 100 : 1)).toFixed(0) + '%' : '—';
-    const reason = c.reason || c.rationale || c.why || c.blocked_reason || '';
+    const buyBlocked = String(c.action || c.decision || '').toUpperCase() === 'BUY'
+      && ((s.cash_gate && s.cash_gate.blocked) || String(c.blocked_reason || '').indexOf('below_min_cash_reserve') === 0);
+    const reason = buyBlocked
+      ? (cashGateText(s.cash_gate || c.cash_gate) || c.blocked_reason || '')
+      : (c.reason || c.rationale || c.why || c.blocked_reason || '');
     const pillCls = c.action === 'SKIP' || c.blocked_reason ? 'red' : 'green';
     return '<tr><td>' + yahoo(sym) + '</td><td><span class="pill purple">' + esc(bucket) + '</span></td><td>' + esc(c.source || c.model || c.llm_model || '—') + '</td>' +
       '<td class="num"><span class="pill ' + pillCls + '">' + conf + '</span></td><td>' + esc(c.payoff_time || c.outcome || '—') + '</td>' +
@@ -617,7 +634,14 @@ function renderAll(s, silent) {
   btn.className = 'btn ' + (live ? 'live' : 'warn');
   document.getElementById('portfolio-value').textContent = money(pv);
   document.getElementById('cash').textContent = money(cash);
-  document.getElementById('cash-sub').textContent = pv ? pct(cash / pv) + ' of portfolio' : '';
+  const gateText = cashGateText(s.cash_gate);
+  const gateEl = document.getElementById('cash-gate-note');
+  if (gateEl) {
+    gateEl.style.display = gateText ? 'block' : 'none';
+    gateEl.textContent = gateText;
+  }
+  const cashPct = pv ? pct(cash / pv) + ' of portfolio' : '';
+  document.getElementById('cash-sub').textContent = gateText ? (cashPct ? cashPct + ' · buys blocked by cash reserve' : 'buys blocked by cash reserve') : cashPct;
   document.getElementById('positions-count').textContent = ps.length;
   document.getElementById('positions-sub').textContent = ps.length + ' active hold' + (ps.length === 1 ? '' : 's');
   const tradeLimit = healthTradeLimit != null ? healthTradeLimit.limit : configuredDailyCap(s);
@@ -629,7 +653,8 @@ function renderAll(s, silent) {
   const total = n(tok.total_tokens);
   const tokenPct = budget ? Math.min(100, (total / budget) * 100) : 0;
   renderModeIndicators(tokenPct);
-  document.getElementById('last-upd').textContent = s.last_run ? 'Last run: ' + new Date(s.last_run).toLocaleString() : '';
+  const deploySha = s.deploy_sha ? ' · deploy ' + s.deploy_sha : '';
+  document.getElementById('last-upd').textContent = (s.last_run ? 'Last run: ' + new Date(s.last_run).toLocaleString() : '') + deploySha;
   document.getElementById('cash-util').textContent = pv ? pct(1 - (cash / pv)) : '—';
   document.getElementById('risk-pos').textContent = ps.length + '/15';
   renderBuckets(s);

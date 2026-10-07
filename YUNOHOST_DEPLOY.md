@@ -202,6 +202,17 @@ sudo journalctl -u trading-agent-config -f
 
 ---
 
+## Deploy SHA
+
+`DEPLOY_SHA.txt` is the only commit a reader should trust. `DEPLOY_SHA` (no extension) is a mirror of that same text. They used to be written separately, so a deploy could update the `.txt` file and leave the extensionless file on the previous commit.
+
+`update_deploy.sh` and `install.sh` call `write_deploy_sha.sh`, which writes both files from one value:
+
+1. `DEPLOY_SHA` in the environment, if you pass one (`sudo DEPLOY_SHA=60a1dc10 bash update_deploy.sh -y`)
+2. otherwise `git rev-parse --short=8 HEAD` of the checkout you are deploying
+
+`run_cycle.sh` does not move that stamp when git HEAD changes. If the two files disagree, it rewrites both from `DEPLOY_SHA.txt` and copies that one value into the web directory as both names. Do not hand-edit only one file. If the app directory is not a git checkout, set `DEPLOY_SHA` for the deploy command, or run `bash write_deploy_sha.sh /opt/trading-agent <sha>`.
+
 ## Updating files after code changes
 
 ```bash

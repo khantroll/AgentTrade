@@ -174,13 +174,96 @@ PROVIDER_KEYS = {
 # Runtime cooldowns keep one bad provider/key/rate-limit from crashing a whole cycle.
 _PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
 
+# Saved before cooldown_class existed. An unspecified 429 and a few-second TPM
+# limit both used this label and a 7200s bench. A fresh bench from the current
+# policy stores cooldown_class and is not shortened here.
+_LEGACY_RATE_LIMIT_REASONS = frozenset({
+    "rate-limit (429)",
+    "rate/capacity/token-limit error",
+})
+
+
+def _cooldown_class_for_reason(reason: str) -> str:
+    low = (reason or "").strip().lower()
+    if low.startswith("short "):
+        return "short_rate_limit"
+    if low.startswith("quota"):
+        return "quota"
+    if low.startswith("billing"):
+        return "billing"
+    if low.startswith("auth"):
+        return "auth"
+    if "outage" in low:
+        return "outage"
+    if low.startswith("rate-limit"):
+        return "rate_limit"
+    if "transient" in low:
+        return "transient"
+    return "other"
+
+
+def _legacy_unclassified_rate_limit(rec: dict) -> bool:
+    """True for a pre-policy cooldown that a deploy should be allowed to shorten."""
+    if str(rec.get("cooldown_class") or "").strip():
+        return False
+    reason = str(rec.get("last_error") or "").strip()
+    return reason in _LEGACY_RATE_LIMIT_REASONS
+
+
+def _clamp_legacy_cooldowns(data: dict) -> bool:
+    """Cap an unclassified long rate-limit bench at the current short maximum.
+
+    Quota, billing, auth, and outage records keep their timestamps. A cooldown
+    written by the current policy has ``cooldown_class`` and is left alone, so
+    an unspecified 429 still lasts ``LLM_RATE_LIMIT_COOLDOWN_MINUTES``.
+    """
+    now = time.time()
+    cap = short_rate_limit_cap_seconds()
+    changed = False
+    for key, rec in list(data.items()):
+        if not isinstance(rec, dict) or str(key).startswith("_"):
+            continue
+        if not _legacy_unclassified_rate_limit(rec):
+            continue
+        try:
+            until = float(rec.get("cooldown_until") or 0)
+        except (TypeError, ValueError):
+            continue
+        if until <= now:
+            rec["cooldown_class"] = "legacy_rate_limit_clamped"
+            changed = True
+            continue
+        new_until = min(until, now + cap)
+        if new_until < until - 0.5:
+            log.warning(
+                "[LLM] Clamped stale %s cooldown from %.0fs remaining to %ss. "
+                "Saved reason %r had no cooldown class, so it predates the current policy.",
+                key,
+                until - now,
+                cap,
+                rec.get("last_error"),
+            )
+            rec["cooldown_until"] = new_until
+        mem = float(_PROVIDER_COOLDOWN_UNTIL.get(key, 0) or 0)
+        if mem <= 0 or mem > new_until:
+            _PROVIDER_COOLDOWN_UNTIL[key] = new_until
+        rec["cooldown_class"] = "legacy_rate_limit_clamped"
+        rec["cooldown_seconds"] = cap
+        changed = True
+    return changed
+
+
 def _load_health() -> dict:
     try:
         with open(LLM_HEALTH_FILE) as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
     except Exception:
         return {}
+    if _clamp_legacy_cooldowns(data):
+        _save_health(data)
+    return data
 
 def _save_health(data: dict):
     try:
@@ -252,7 +335,6 @@ def _provider_configured(provider: str) -> bool:
 
 
 def _provider_cooldown_remaining(provider: str) -> float:
-    now = time.time()
     try:
         mem_cd = float(_PROVIDER_COOLDOWN_UNTIL.get(provider, 0) or 0)
     except (TypeError, ValueError):
@@ -261,7 +343,10 @@ def _provider_cooldown_remaining(provider: str) -> float:
         disk_cd = float(_health(provider).get("cooldown_until", 0) or 0)
     except (TypeError, ValueError):
         disk_cd = 0.0
-    return max(0.0, max(mem_cd, disk_cd) - now)
+    # Sample the clock after the disk read. A clamp that runs during that read
+    # uses a slightly later timestamp, and subtracting an earlier clock made
+    # the remaining time look longer than the cap.
+    return max(0.0, max(mem_cd, disk_cd) - time.time())
 
 
 def _provider_ready(provider: str) -> bool:
@@ -324,6 +409,8 @@ def _cooldown_provider(provider: str, seconds: int, reason: str = ""):
     rec["fail"] = int(rec.get("fail", 0) or 0) + 1
     rec["cooldown_until"] = until
     rec["last_error"] = reason
+    rec["cooldown_class"] = _cooldown_class_for_reason(reason)
+    rec["cooldown_seconds"] = int(seconds)
     _save_health(data)
     log.warning(f"[LLM] Cooling down {provider} for {seconds}s. {reason}")
 
@@ -1586,11 +1673,61 @@ def _message_text(data: dict) -> str:
     return reasoning or text
 
 
-def _adjust_chat_payload(provider: str, model: str, payload: dict) -> dict:
-    """Give Groq gpt-oss enough completion budget to finish a JSON decision.
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
-    ``max_tokens`` of ~120 is spent on the reasoning trace, so the decision
-    object never arrives. ``reasoning_format`` is not sent: gpt-oss rejects it.
+
+def _thinking_model_markers() -> tuple:
+    """Model-id fragments that reason unless the request turns thinking off.
+
+    NVIDIA's Nemotron 3 Super documents this as on by default. The match is the
+    model id, so the same request works on any OpenAI-compatible host that
+    serves that id. ``LLM_THINKING_MODELS`` adds more fragments without naming
+    a vendor in code.
+    """
+    markers = ["nemotron"]
+    extra = os.getenv("LLM_THINKING_MODELS", "")
+    for part in extra.split(","):
+        part = part.strip().lower()
+        if part and part not in markers:
+            markers.append(part)
+    return tuple(markers)
+
+
+def _model_reasons_by_default(model: str) -> bool:
+    name = (model or "").lower()
+    return any(marker in name for marker in _thinking_model_markers())
+
+
+def reasoning_json_max_tokens() -> int:
+    """Completion budget when the model may spend tokens on a reasoning trace.
+
+    Research calls otherwise ask for ~180 tokens. Nemotron 3 Super's default
+    thinking consumes that before any JSON object is emitted. The cap is a
+    ceiling; a short JSON answer still stops early.
+    """
+    raw = os.getenv("LLM_REASONING_JSON_MAX_TOKENS", "1024")
+    try:
+        tokens = int(float(raw))
+    except (TypeError, ValueError):
+        tokens = 1024
+    if tokens < 256:
+        tokens = 1024
+    return tokens
+
+
+def _adjust_chat_payload(provider: str, model: str, payload: dict) -> dict:
+    """Shape an OpenAI-compatible chat body for JSON that has to finish.
+
+    Groq gpt-oss spends a small ``max_tokens`` on its reasoning trace.
+    ``reasoning_format`` is not sent: gpt-oss rejects it.
+
+    Nemotron 3 Super (and any id matched by ``_thinking_model_markers``) reasons
+    unless ``chat_template_kwargs.enable_thinking`` is false. NVIDIA's NIM docs
+    for ``nvidia/nemotron-3-super-120b-a12b`` say thinking is on by default and
+    that JSON mode should disable it so ``max_tokens`` is available for the
+    object. ``LLM_ENABLE_THINKING=1`` leaves thinking on, but the token ceiling
+    still rises so the object can follow the trace. Other models are unchanged.
     """
     out = dict(payload)
     if provider == "groq" and "gpt-oss" in (model or "").lower():
@@ -1599,6 +1736,13 @@ def _adjust_chat_payload(provider: str, model: str, payload: dict) -> dict:
         out["max_completion_tokens"] = budget
         out["reasoning_effort"] = "low"
         out["include_reasoning"] = True
+    if _model_reasons_by_default(model):
+        budget = max(int(out.get("max_tokens") or 0), reasoning_json_max_tokens())
+        out["max_tokens"] = budget
+        if not _env_flag("LLM_ENABLE_THINKING", "0"):
+            kwargs = dict(out.get("chat_template_kwargs") or {})
+            kwargs["enable_thinking"] = False
+            out["chat_template_kwargs"] = kwargs
     return out
 
 
@@ -1620,6 +1764,19 @@ def _recovered_llm_text(draft: str) -> bool:
         return False
     parsed = _parse_json(draft)
     return _research_payload_is_valid(parsed) or _analysis_payload_is_valid(parsed)
+
+
+def _thinking_kwargs_rejected(body: str) -> bool:
+    """True when the host refused the optional thinking control."""
+    low = (body or "").lower()
+    return "chat_template_kwargs" in low or "enable_thinking" in low
+
+
+def _payload_without_thinking_kwargs(payload: dict) -> dict:
+    """Drop the thinking control so a host that rejects it can still answer."""
+    retry = dict(payload)
+    retry.pop("chat_template_kwargs", None)
+    return retry
 
 
 def _payload_without_json_mode(payload: dict) -> dict:
@@ -1663,6 +1820,19 @@ def _call_chat_endpoint(provider: str, model: str, prompt: str, max_tokens: int,
         return _message_text(data if isinstance(data, dict) else {})
 
     r = _post_chat(url, api_key, payload)
+    # Some OpenAI-compatible hosts reject chat_template_kwargs. One retry without
+    # it keeps the call vendor-agnostic; the raised max_tokens still applies.
+    if (
+        r.status_code == 400
+        and payload.get("chat_template_kwargs")
+        and _thinking_kwargs_rejected(getattr(r, "text", "") or "")
+    ):
+        log.info(
+            "[LLM] %s rejected chat_template_kwargs; retrying once without enable_thinking.",
+            provider,
+        )
+        payload = _payload_without_thinking_kwargs(payload)
+        r = _post_chat(url, api_key, payload)
     # A 429 is a backoff, not a prompt-format problem. Do not immediately POST again.
     if r.status_code == 429:
         _reject(r)

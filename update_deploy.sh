@@ -139,7 +139,7 @@ UPDATE_WEB=(
     dashboard.html
 )
 UPDATE_SCRIPTS=(
-    update_deploy.sh verify_ledger_deploy.sh
+    update_deploy.sh verify_ledger_deploy.sh write_deploy_sha.sh
 )
 ENV_KEYS=(
     AGENTTRADE_DB_PATH
@@ -291,6 +291,19 @@ if [[ "$LOCAL_ONLY" -eq 0 && -d "$WEB_DIR" && -f "$SRC/dashboard.html" ]]; then
 fi
 
 success "Files deployed"
+
+# One commit, both filenames. Do not hand-edit only one of them.
+if [[ -f "$APP_DIR/write_deploy_sha.sh" ]]; then
+    if bash "$APP_DIR/write_deploy_sha.sh" "$APP_DIR" "${DEPLOY_SHA:-}" "$SRC"; then
+        success "DEPLOY_SHA.txt and DEPLOY_SHA both set to $(awk 'NF { print $1; exit }' "$APP_DIR/DEPLOY_SHA.txt")"
+    else
+        warn "Could not write DEPLOY_SHA.txt and DEPLOY_SHA together. Re-run: bash write_deploy_sha.sh $APP_DIR <sha>"
+    fi
+fi
+if [[ "$LOCAL_ONLY" -eq 0 && -d "$WEB_DIR" && -f "$APP_DIR/DEPLOY_SHA.txt" ]]; then
+    cp "$APP_DIR/DEPLOY_SHA.txt" "$WEB_DIR/DEPLOY_SHA.txt"
+    cp "$APP_DIR/DEPLOY_SHA.txt" "$WEB_DIR/DEPLOY_SHA"
+fi
 
 # Verify critical modules import from deployed app dir
 section "Import verification"

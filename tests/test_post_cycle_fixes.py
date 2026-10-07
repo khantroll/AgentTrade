@@ -440,3 +440,245 @@ def test_foreign_hype_buy_is_not_agenttrade_reserved_cash(monkeypatch, caplog):
         )
     assert still_blocked == []
     assert "below MIN_CASH_RESERVE" in caplog.text
+
+
+NEMOTRON_PROSE = "We need to output JSON with selected picks and a confidence for each ticker."
+NEMOTRON_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+
+
+def test_prose_before_json_is_parsed_and_prose_only_is_not():
+    import llm_router
+
+    embedded = NEMOTRON_PROSE + "\n" + json.dumps({
+        "selected": [{"ticker": "AAPL", "reason": "momentum", "confidence": 0.72}],
+    })
+    parsed = llm_router._parse_json(embedded)
+    assert parsed["selected"][0]["ticker"] == "AAPL"
+    assert llm_router._parse_json(NEMOTRON_PROSE) is None
+
+
+def test_nemotron_request_disables_thinking_on_any_host(monkeypatch):
+    import llm_router
+
+    monkeypatch.delenv("LLM_ENABLE_THINKING", raising=False)
+    monkeypatch.delenv("LLM_REASONING_JSON_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("LLM_THINKING_MODELS", raising=False)
+    base = {"max_tokens": 180, "messages": [{"role": "user", "content": "pick"}]}
+    nvidia = llm_router._adjust_chat_payload("nvidia", NEMOTRON_MODEL, dict(base))
+    routed = llm_router._adjust_chat_payload("openrouter", NEMOTRON_MODEL, dict(base))
+    groq = llm_router._adjust_chat_payload("groq", "qwen/qwen3.8-27b", dict(base, max_tokens=140))
+    assert nvidia["chat_template_kwargs"] == {"enable_thinking": False}
+    assert nvidia["max_tokens"] >= 1024
+    assert "max_completion_tokens" not in nvidia
+    assert routed["chat_template_kwargs"]["enable_thinking"] is False
+    assert "chat_template_kwargs" not in groq
+    assert groq["max_tokens"] == 140
+
+    monkeypatch.setenv("LLM_ENABLE_THINKING", "1")
+    thinking = llm_router._adjust_chat_payload("nvidia", NEMOTRON_MODEL, dict(base))
+    assert "chat_template_kwargs" not in thinking
+    assert thinking["max_tokens"] >= 1024
+
+
+def test_host_that_rejects_thinking_kwargs_is_retried_without_them(monkeypatch):
+    import llm_router
+
+    monkeypatch.delenv("LLM_ENABLE_THINKING", raising=False)
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append(json)
+        if len(calls) == 1:
+            return _Resp(400, {"error": {"message": "unexpected field chat_template_kwargs.enable_thinking"}})
+        body = (
+            '{"choices":[{"message":{"content":'
+            '"{\\"selected\\":[{\\"ticker\\":\\"MSFT\\",\\"reason\\":\\"ready\\",\\"confidence\\":0.4}]}"'
+            '}}]}'
+        )
+        return _Resp(200, body, usage={"prompt_tokens": 4, "completion_tokens": 8})
+
+    monkeypatch.setattr(llm_router.requests, "post", fake_post)
+    monkeypatch.setattr(llm_router, "_record_usage", lambda *a, **k: None)
+    text = llm_router._call_chat_endpoint(
+        "nvidia", NEMOTRON_MODEL, "pick", 180, "research",
+        "https://example.invalid/v1/chat/completions", "test-key",
+    )
+    assert len(calls) == 2
+    assert calls[0]["chat_template_kwargs"]["enable_thinking"] is False
+    assert "chat_template_kwargs" not in calls[1]
+    assert calls[1]["max_tokens"] >= 1024
+    assert llm_router._parse_json(text)["selected"][0]["ticker"] == "MSFT"
+
+
+def _research_choices(phase, prompt):
+    return [
+        ("nvidia_llama", "nvidia", NEMOTRON_MODEL),
+        ("groq_qwen", "groq", "qwen/qwen3.8-27b"),
+    ]
+
+
+def test_unusable_nemotron_research_fails_over_to_the_next_ready_provider(isolated_llm, monkeypatch):
+    llm = isolated_llm
+    cooled = []
+    monkeypatch.setattr(llm, "_tiered_fanout", lambda phase: 1)
+    monkeypatch.setattr(llm, "_provider_ready", lambda provider: True)
+    monkeypatch.setattr(llm, "_model_is_suppressed", lambda *a, **k: False)
+    monkeypatch.setattr(llm, "_mark_provider_success", lambda provider: None)
+    monkeypatch.setattr(llm, "_classify_cooldown", lambda *a, **k: cooled.append(a))
+    monkeypatch.setattr(llm, "_tiered_choices", _research_choices)
+
+    def fake_call(provider, model, prompt, max_tokens=600, agent_tag="", mark_success=True):
+        if provider == "nvidia":
+            return NEMOTRON_PROSE
+        return json.dumps({
+            "selected": [{"ticker": "MSFT", "reason": "next provider", "confidence": 0.61}],
+        })
+
+    monkeypatch.setattr(llm, "_call_provider", fake_call)
+    result = llm._tiered_research("pick names", agent_tag="Growth_research")
+    assert result["research_status"] == "ok"
+    assert result["selected"][0]["ticker"] == "MSFT"
+    assert result["tiered_models_used"] == ["groq_qwen"]
+    assert cooled == []
+
+
+def test_prose_only_research_stays_invalid_parse_when_no_other_provider_is_ready(isolated_llm, monkeypatch):
+    llm = isolated_llm
+    monkeypatch.setattr(llm, "_tiered_fanout", lambda phase: 1)
+    monkeypatch.setattr(llm, "_provider_ready", lambda provider: provider == "nvidia")
+    monkeypatch.setattr(llm, "_model_is_suppressed", lambda *a, **k: False)
+    monkeypatch.setattr(llm, "_mark_provider_success", lambda provider: None)
+    monkeypatch.setattr(llm, "_classify_cooldown", lambda *a, **k: None)
+    monkeypatch.setattr(llm, "_tiered_choices", lambda phase, prompt: [
+        ("nvidia_llama", "nvidia", NEMOTRON_MODEL),
+    ])
+
+    def fake_call(provider, model, prompt, max_tokens=600, agent_tag="", mark_success=True):
+        return NEMOTRON_PROSE
+
+    monkeypatch.setattr(llm, "_call_provider", fake_call)
+    result = llm._tiered_research("pick names", agent_tag="Growth_research")
+    assert result["research_status"] == "failed"
+    assert result["research_reason"] == "invalid_parse"
+    assert result["selected"] == []
+
+
+def test_legacy_7200s_rate_limit_is_clamped_on_load(isolated_llm, monkeypatch):
+    llm = isolated_llm
+    monkeypatch.setenv("LLM_SHORT_RATE_LIMIT_CAP_SECONDS", "900")
+    now = time.time()
+    health = {
+        "groq": {
+            "success": 1, "fail": 2, "cooldown_until": now + 7200,
+            "last_error": "rate-limit (429)", "last_ok": "",
+        },
+        "mistral": {
+            "success": 1, "fail": 2, "cooldown_until": now + 7000,
+            "last_error": "rate-limit (429)", "last_ok": "",
+        },
+        "gemini": {
+            "success": 0, "fail": 1, "cooldown_until": now + 3600,
+            "last_error": "quota/billing 429", "last_ok": "",
+        },
+        "openai": {
+            "success": 0, "fail": 1, "cooldown_until": now + 6 * 3600,
+            "last_error": "billing/balance error", "last_ok": "",
+        },
+    }
+    with open(llm.LLM_HEALTH_FILE, "w", encoding="utf-8") as fh:
+        json.dump(health, fh)
+    llm._PROVIDER_COOLDOWN_UNTIL.clear()
+    assert 800 < llm._provider_cooldown_remaining("groq") <= 900.5
+    assert 800 < llm._provider_cooldown_remaining("mistral") <= 900.5
+    assert llm._provider_cooldown_remaining("gemini") > 3000
+    assert llm._provider_cooldown_remaining("openai") > 5 * 3600
+    saved = json.load(open(llm.LLM_HEALTH_FILE, encoding="utf-8"))
+    assert saved["groq"]["cooldown_class"] == "legacy_rate_limit_clamped"
+    assert saved["mistral"]["cooldown_class"] == "legacy_rate_limit_clamped"
+    assert "cooldown_class" not in saved["gemini"]
+    assert "cooldown_class" not in saved["openai"]
+
+
+def test_classified_long_rate_limit_is_not_clamped_on_load(isolated_llm, monkeypatch):
+    llm = isolated_llm
+    monkeypatch.setenv("LLM_SHORT_RATE_LIMIT_CAP_SECONDS", "900")
+    now = time.time()
+    health = {
+        "mistral": {
+            "success": 0, "fail": 1, "cooldown_until": now + 7200,
+            "last_error": "rate-limit (429)", "cooldown_class": "rate_limit",
+            "cooldown_seconds": 7200,
+        }
+    }
+    with open(llm.LLM_HEALTH_FILE, "w", encoding="utf-8") as fh:
+        json.dump(health, fh)
+    llm._PROVIDER_COOLDOWN_UNTIL.clear()
+    assert llm._provider_cooldown_remaining("mistral") > 110 * 60
+
+
+def test_live_book_cash_reserve_block_shows_the_numbers(monkeypatch, caplog):
+    """Oct 7 14:00 CT book: cash $12,451, equity ~$105.9k, usable $1,860, floor $5,000."""
+    import logging
+
+    import agent_config as cfg
+    from agents.risk import cash_gate_summary, risk_agent
+
+    equity = 105910.0
+    usable = CASH - equity * 0.10
+    assert usable == pytest.approx(1860.0)
+    monkeypatch.setattr(cfg, "RESERVE_CASH_PCT", 0.10)
+    monkeypatch.setattr(cfg, "MIN_CASH_RESERVE", MIN_RESERVE)
+    monkeypatch.setattr(cfg, "ALLOW_NEGATIVE_CASH", False)
+    monkeypatch.setattr(cfg, "ALLOW_MARGIN", False)
+    monkeypatch.setattr(cfg, "BUYING_ENABLED", True)
+    monkeypatch.setattr("agents.risk.ledger.trading_paused", lambda: False)
+    book = _books(equity, [], agent_open=0, foreign_open=0)
+    decisions = [_buy("AAA"), _buy("BBB"), {"ticker": "CCC", "action": "SKIP", "current_price": 10}]
+    bucket = Bucket(name="Growth", allocation_pct=0.45, mode="growth")
+    with caplog.at_level(logging.WARNING):
+        approved = risk_agent(decisions, book["account"], [], bucket, account_snapshot=book)
+    assert approved == []
+    assert decisions[0]["blocked_reason"].startswith("below_min_cash_reserve")
+    assert "1860.00" in decisions[0]["blocked_reason"]
+    assert "5000.00" in decisions[0]["blocked_reason"]
+    assert decisions[0]["cash_gate"]["usable_cash"] == pytest.approx(1860.0)
+    assert decisions[0]["cash_gate"]["cash"] == pytest.approx(CASH)
+    assert decisions[0]["cash_gate"]["min_cash_reserve"] == pytest.approx(MIN_RESERVE)
+    assert decisions[0]["cash_gate"]["reserve_dollars"] == pytest.approx(10591.0)
+    assert "blocked_reason" not in decisions[2]
+    summary = cash_gate_summary(decisions)
+    assert summary["buys_blocked"] == 2
+    assert summary["usable_cash"] == pytest.approx(1860.0)
+    assert "Buys blocked by cash reserve" in caplog.text
+    assert "1860.00" in caplog.text
+
+
+def test_deploy_sha_files_are_rewritten_together(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    from deploy_sha import reconcile_deploy_sha, write_both
+
+    script = Path(__file__).resolve().parents[1] / "write_deploy_sha.sh"
+    subprocess.check_call(["bash", str(script), str(tmp_path), "60a1dc10"])
+    assert (tmp_path / "DEPLOY_SHA.txt").read_text(encoding="utf-8").strip() == "60a1dc10"
+    assert (tmp_path / "DEPLOY_SHA").read_text(encoding="utf-8").strip() == "60a1dc10"
+
+    (tmp_path / "DEPLOY_SHA").write_text("4cc04198\n", encoding="utf-8")
+    subprocess.check_call([
+        "bash", "-c",
+        'source "$1" && reconcile_deploy_sha "$2"',
+        "bash", str(script), str(tmp_path),
+    ])
+    assert (tmp_path / "DEPLOY_SHA.txt").read_text(encoding="utf-8").strip() == "60a1dc10"
+    assert (tmp_path / "DEPLOY_SHA").read_text(encoding="utf-8").strip() == "60a1dc10"
+
+    other = tmp_path / "py"
+    other.mkdir()
+    (other / "DEPLOY_SHA.txt").write_text("60a1dc10\n", encoding="utf-8")
+    (other / "DEPLOY_SHA").write_text("4cc04198\n", encoding="utf-8")
+    assert reconcile_deploy_sha(other) == "60a1dc10"
+    assert (other / "DEPLOY_SHA").read_text(encoding="utf-8").strip() == "60a1dc10"
+    assert write_both(other, "abcdef0") == "abcdef0"
+    assert (other / "DEPLOY_SHA.txt").read_text(encoding="utf-8").strip() == "abcdef0"
+    assert (other / "DEPLOY_SHA").read_text(encoding="utf-8").strip() == "abcdef0"
