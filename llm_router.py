@@ -11,6 +11,7 @@ Supported single-provider modes:
   deepseek_chat | deepseek_reasoner   ("deepspeak_*" aliases also accepted)
   groq_llama | groq_qwen
   nvidia_llama | nvidia_qwen | nvidia_deepseek
+  openrouter_free
 
 Supported strategy modes:
   tiered   — cheap model for research/screening; stronger model for analysis
@@ -19,7 +20,7 @@ Supported strategy modes:
 
 Environment keys:
   ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, MISTRAL_API_KEY,
-  DEEPSEEK_API_KEY, GROQ_API_KEY, NVIDIA_API_KEY
+  DEEPSEEK_API_KEY, GROQ_API_KEY, NVIDIA_API_KEY, OPENROUTER_API_KEY
 """
 
 import os
@@ -69,6 +70,10 @@ DEEPSEEK_API_KEY    = os.getenv("DEEPSEEK_API_KEY", "") or os.getenv("DEEPSPEAK_
 GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
 NVIDIA_API_KEY      = os.getenv("NVIDIA_API_KEY", "") or os.getenv("NIM_API_KEY", "")
 NVIDIA_BASE_URL     = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+# Free-model router. Filters for structured output and stays $0. Override per host.
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 DAILY_TOKEN_BUDGET  = int(os.getenv("DAILY_TOKEN_BUDGET", "200000"))
 TOKEN_USAGE_FILE    = "token_usage.json"
 LLM_HEALTH_FILE     = "llm_health.json"
@@ -92,6 +97,48 @@ NVIDIA_LLAMA  = os.getenv("NVIDIA_LLAMA_MODEL",  "meta/llama-3.1-70b-instruct")
 NVIDIA_QWEN   = os.getenv("NVIDIA_QWEN_MODEL",   "qwen/qwen3-235b-a22b")
 NVIDIA_DEEPSEEK = os.getenv("NVIDIA_DEEPSEEK_MODEL", "deepseek-ai/deepseek-r1")
 
+
+def _is_placeholder_secret(value: object) -> bool:
+    """True for blank values and config.example placeholders such as ``<SET_...>``.
+
+    A placeholder must not count as a configured failover key. Existing
+    providers keep their import-time ``PROVIDER_KEYS`` check.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return True
+    if s.startswith("<") and s.endswith(">"):
+        return True
+    upper = s.upper()
+    if upper.startswith(("YOUR_", "SET_", "CHANGEME", "<SET_")):
+        return True
+    if "REPLACE_ME" in upper or upper in {"TODO", "NONE", "NULL", "UNDEFINED"}:
+        return True
+    return False
+
+
+def _chat_completions_url(base: str) -> str:
+    """OpenAI-compatible chat URL. Accepts a base or a full ``/chat/completions`` URL."""
+    url = (base or "").strip().rstrip("/")
+    if not url:
+        raise RuntimeError("LLM base URL is empty")
+    if url.endswith("/chat/completions"):
+        return url
+    return f"{url}/chat/completions"
+
+
+def _openrouter_model() -> str:
+    return (os.getenv("OPENROUTER_MODEL", "") or OPENROUTER_MODEL or "openrouter/free").strip()
+
+
+def _openrouter_base_url() -> str:
+    return (os.getenv("OPENROUTER_BASE_URL", "") or OPENROUTER_BASE_URL or "https://openrouter.ai/api/v1").strip()
+
+
+def _nvidia_base_url() -> str:
+    return (os.getenv("NVIDIA_BASE_URL", "") or NVIDIA_BASE_URL or "https://integrate.api.nvidia.com/v1").strip()
+
+
 PROVIDER_KEYS = {
     "claude": bool(ANTHROPIC_API_KEY),
     "openai": bool(OPENAI_API_KEY),
@@ -100,6 +147,7 @@ PROVIDER_KEYS = {
     "deepseek": bool(DEEPSEEK_API_KEY),
     "groq": bool(GROQ_API_KEY),
     "nvidia": bool(NVIDIA_API_KEY),
+    "openrouter": bool(OPENROUTER_API_KEY) and not _is_placeholder_secret(OPENROUTER_API_KEY),
 }
 
 # Runtime cooldowns keep one bad provider/key/rate-limit from crashing a whole cycle.
@@ -125,19 +173,86 @@ def _health(provider: str) -> dict:
     rec = data.setdefault(provider, {"success": 0, "fail": 0, "cooldown_until": 0, "last_error": "", "last_ok": ""})
     return rec
 
-def _provider_ready(provider: str) -> bool:
-    if not PROVIDER_KEYS.get(provider, False):
-        return False
+def _module_provider_key(provider: str) -> str:
+    return {
+        "claude": ANTHROPIC_API_KEY,
+        "openai": OPENAI_API_KEY,
+        "gemini": GEMINI_API_KEY,
+        "mistral": MISTRAL_API_KEY,
+        "deepseek": DEEPSEEK_API_KEY,
+        "groq": GROQ_API_KEY,
+        "nvidia": NVIDIA_API_KEY,
+        "openrouter": OPENROUTER_API_KEY,
+    }.get(provider, "")
+
+
+_PROVIDER_KEY_ENV = {
+    "claude": ("ANTHROPIC_API_KEY",),
+    "openai": ("OPENAI_API_KEY",),
+    "gemini": ("GEMINI_API_KEY",),
+    "mistral": ("MISTRAL_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY", "DEEPSPEAK_API_KEY"),
+    "groq": ("GROQ_API_KEY",),
+    "nvidia": ("NVIDIA_API_KEY", "NIM_API_KEY"),
+    "openrouter": ("OPENROUTER_API_KEY",),
+}
+
+
+def _real_provider_key(provider: str) -> str:
+    """Non-placeholder key from the environment, else the import-time snapshot.
+
+    An explicit placeholder in the environment does not fall through to a
+    stale import value. Used to decide whether a cheap failover may join the
+    tier list. It does not turn a blank key into a configured provider.
+    """
+    names = _PROVIDER_KEY_ENV.get(provider, ())
+    saw_env = False
+    for name in names:
+        if name not in os.environ:
+            continue
+        saw_env = True
+        val = os.environ.get(name) or ""
+        if not _is_placeholder_secret(val):
+            return val.strip()
+    if saw_env:
+        return ""
+    val = _module_provider_key(provider)
+    if _is_placeholder_secret(val):
+        return ""
+    return str(val).strip()
+
+
+def _provider_configured(provider: str) -> bool:
+    if provider == "openrouter":
+        return bool(_real_provider_key("openrouter"))
+    if provider == "nvidia" and _real_provider_key("nvidia"):
+        return True
+    return bool(PROVIDER_KEYS.get(provider, False))
+
+
+def _provider_cooldown_remaining(provider: str) -> float:
     now = time.time()
-    mem_cd = _PROVIDER_COOLDOWN_UNTIL.get(provider, 0)
-    disk_cd = float(_health(provider).get("cooldown_until", 0) or 0)
-    return now >= max(mem_cd, disk_cd)
+    try:
+        mem_cd = float(_PROVIDER_COOLDOWN_UNTIL.get(provider, 0) or 0)
+    except (TypeError, ValueError):
+        mem_cd = 0.0
+    try:
+        disk_cd = float(_health(provider).get("cooldown_until", 0) or 0)
+    except (TypeError, ValueError):
+        disk_cd = 0.0
+    return max(0.0, max(mem_cd, disk_cd) - now)
+
+
+def _provider_ready(provider: str) -> bool:
+    if not _provider_configured(provider):
+        return False
+    return _provider_cooldown_remaining(provider) <= 0
 
 def _score_provider(provider: str, phase: str, input_tokens: int = 0) -> float:
     # Higher is better. Auto-adapts using recent success/fail counts and prompt size.
     base = {
-        "research": {"groq": 92, "nvidia": 90, "gemini": 88, "mistral": 72, "deepseek": 70, "openai": 65, "claude": 60},
-        "analysis": {"gemini": 92, "nvidia": 88, "groq": 84, "mistral": 74, "deepseek": 72, "openai": 68, "claude": 62},
+        "research": {"groq": 92, "nvidia": 90, "gemini": 88, "mistral": 72, "deepseek": 70, "openai": 65, "openrouter": 64, "claude": 60},
+        "analysis": {"gemini": 92, "nvidia": 88, "groq": 84, "mistral": 74, "deepseek": 72, "openai": 68, "openrouter": 63, "claude": 62},
     }.get(phase, {}).get(provider, 50)
     rec = _health(provider)
     success = int(rec.get("success", 0) or 0)
@@ -148,6 +263,7 @@ def _score_provider(provider: str, phase: str, input_tokens: int = 0) -> float:
     if provider == "groq" and input_tokens > 4500: size_penalty = 30
     if provider == "mistral" and input_tokens > 6000: size_penalty = 18
     if provider == "nvidia" and input_tokens > 8000: size_penalty = 12
+    if provider == "openrouter" and input_tokens > 8000: size_penalty = 12
     if provider == "gemini" and input_tokens > 10000: size_penalty = 8
     return base + reliability - size_penalty
 
@@ -296,13 +412,21 @@ def _is_model_not_found_error(err: Exception) -> bool:
 
 
 def _is_rate_limited_error(err: Exception) -> bool:
+    """True for HTTP 429 / explicit rate-limit responses.
+
+    A bare ``rate`` substring also matches ordinary words (``separate``,
+    ``moderate``, ``accurate``) and used to put the whole provider on the
+    120-minute 429 cooldown. That removed a still-usable provider from the
+    next cycle's pool.
+    """
     msg = str(err).lower()
+    if "429" in msg or "too many requests" in msg:
+        return True
     return (
-        "429" in msg
-        or "too many requests" in msg
-        or "rate limit" in msg
+        "rate limit" in msg
         or "rate_limit" in msg
-        or "rate" in msg
+        or "ratelimit" in msg
+        or "retry-after" in msg
     )
 
 
@@ -334,8 +458,8 @@ def _compact_prompt(prompt: str, provider: str, phase: str) -> str:
     # Keep prompts small enough for free/low-tier TPM limits. Preserve beginning instructions and ending JSON schema.
     phase = phase or "research"
     caps = {
-        "research": {"groq": 5200, "mistral": 6500, "nvidia": 8000, "gemini": 9000, "deepseek": 6500, "openai": 9000, "claude": 9000},
-        "analysis": {"groq": 7000, "mistral": 8500, "nvidia": 10000, "gemini": 12000, "deepseek": 8500, "openai": 12000, "claude": 12000},
+        "research": {"groq": 5200, "mistral": 6500, "nvidia": 8000, "openrouter": 8000, "gemini": 9000, "deepseek": 6500, "openai": 9000, "claude": 9000},
+        "analysis": {"groq": 7000, "mistral": 8500, "nvidia": 10000, "openrouter": 10000, "gemini": 12000, "deepseek": 8500, "openai": 12000, "claude": 12000},
     }
     cap = caps.get(phase, caps["research"]).get(provider, 7000)
     if len(prompt) <= cap:
@@ -353,14 +477,18 @@ def _json_system_prefix(phase: str) -> str:
 def _max_tokens_for(provider: str, phase: str) -> int:
     # Small responses reduce cost and reduce free-tier rate-limit failures.
     if phase == "research":
-        return {"groq": 140, "mistral": 160, "nvidia": 180, "gemini": 220, "deepseek": 180, "openai": 220, "claude": 220}.get(provider, 180)
-    return {"groq": 120, "mistral": 140, "nvidia": 160, "gemini": 180, "deepseek": 160, "openai": 180, "claude": 180}.get(provider, 160)
+        return {"groq": 140, "mistral": 160, "nvidia": 180, "openrouter": 180, "gemini": 220, "deepseek": 180, "openai": 220, "claude": 220}.get(provider, 180)
+    return {"groq": 120, "mistral": 140, "nvidia": 160, "openrouter": 160, "gemini": 180, "deepseek": 160, "openai": 180, "claude": 180}.get(provider, 160)
 
 # Approximate blended cost per 1k tokens. Update as your actual usage dictates.
 def _key_available(provider: str) -> bool:
-    return bool({"anthropic":ANTHROPIC_API_KEY,"openai":OPENAI_API_KEY,
-                 "gemini":GEMINI_API_KEY,"groq":GROQ_API_KEY,"nvidia":NVIDIA_API_KEY,
-                 "mistral":MISTRAL_API_KEY,"deepseek":DEEPSEEK_API_KEY}.get(provider,""))
+    if provider == "anthropic":
+        provider = "claude"
+    if provider == "openrouter":
+        return bool(_real_provider_key("openrouter"))
+    return bool({"claude": ANTHROPIC_API_KEY, "openai": OPENAI_API_KEY,
+                 "gemini": GEMINI_API_KEY, "groq": GROQ_API_KEY, "nvidia": NVIDIA_API_KEY,
+                 "mistral": MISTRAL_API_KEY, "deepseek": DEEPSEEK_API_KEY}.get(provider, ""))
 
 COST_PER_1K = {
     CLAUDE_HAIKU:  0.00120,
@@ -379,6 +507,8 @@ COST_PER_1K = {
     NVIDIA_LLAMA:  0.00060,
     NVIDIA_QWEN:   0.00060,
     NVIDIA_DEEPSEEK: 0.00060,
+    "openrouter/free": 0.0,
+    OPENROUTER_MODEL: 0.0,
 }
 
 _anthropic_client = None
@@ -483,10 +613,17 @@ MODEL_ALIASES = {
     "nim_llama": ("nvidia", NVIDIA_LLAMA),
     "nim_qwen": ("nvidia", NVIDIA_QWEN),
     "nim_deepseek": ("nvidia", NVIDIA_DEEPSEEK),
+    "openrouter_free": ("openrouter", OPENROUTER_MODEL),
+    "openrouter": ("openrouter", OPENROUTER_MODEL),
 }
 
-DEFAULT_TIERED_RESEARCH = "groq_qwen,nvidia_llama,gemini_flash,mistral_small,deepseek_chat,gpt4o_mini,claude_haiku"
-DEFAULT_TIERED_ANALYSIS = "gemini_flash,nvidia_llama,groq_llama,mistral_small,deepseek_chat,gpt4o_mini,claude_haiku"
+# Cheap/free OpenAI-compatible backups. Appended after the explicit tier list
+# when that provider has a real key and is not already listed. They do not
+# replace Groq/Gemini/Mistral; fanout still stops once enough parses succeed.
+FAILOVER_ALIASES = ("openrouter_free", "nvidia_llama")
+
+DEFAULT_TIERED_RESEARCH = "groq_qwen,nvidia_llama,gemini_flash,mistral_small,openrouter_free,deepseek_chat,gpt4o_mini,claude_haiku"
+DEFAULT_TIERED_ANALYSIS = "gemini_flash,nvidia_llama,groq_llama,mistral_small,openrouter_free,deepseek_chat,gpt4o_mini,claude_haiku"
 
 
 def _tiered_aliases(phase: str) -> list[str]:
@@ -496,6 +633,60 @@ def _tiered_aliases(phase: str) -> list[str]:
     aliases = [x.strip().lower() for x in raw.split(",") if x.strip()]
     # Keep only known aliases, preserving user order.
     return [a for a in aliases if a in MODEL_ALIASES]
+
+
+def _auto_failover_enabled() -> bool:
+    return os.getenv("LLM_TIERED_AUTO_FAILOVER", "1").lower() not in ("0", "false", "no")
+
+
+def _resolve_alias(alias: str) -> tuple[str, str]:
+    provider, model = MODEL_ALIASES[alias]
+    if provider == "openrouter":
+        model = _openrouter_model()
+    return provider, model
+
+
+def _failover_aliases(explicit: list[str]) -> list[str]:
+    """Last-resort aliases whose keys are set and which the explicit list omitted.
+
+    A cooldown on Groq, Mistral, or Gemini does not remove these. A placeholder
+    key such as ``<SET_NVIDIA_API_KEY>`` does not enable NVIDIA by itself.
+    ``LLM_TIERED_AUTO_FAILOVER=0`` keeps the explicit list exclusive.
+    """
+    if not _auto_failover_enabled():
+        return []
+    present = set()
+    for alias in explicit:
+        if alias in MODEL_ALIASES:
+            present.add(MODEL_ALIASES[alias][0])
+    extras = []
+    for alias in FAILOVER_ALIASES:
+        provider, _model = MODEL_ALIASES[alias]
+        if provider in present:
+            continue
+        if not _real_provider_key(provider):
+            continue
+        extras.append(alias)
+    return extras
+
+
+def _consider_tier(bucket: list, alias: str) -> None:
+    provider, model = _resolve_alias(alias)
+    if not _provider_ready(provider):
+        # A cooling provider is skipped alone. Ready providers later in the
+        # list, including an appended failover, are still tried.
+        if _provider_configured(provider):
+            remaining = _provider_cooldown_remaining(provider)
+            if remaining > 0:
+                log.info(
+                    "[LLM] Skipping tier %s — %s is cooling for another %.0fs. Other ready providers stay in the pool.",
+                    alias, provider, remaining,
+                )
+        return
+    if _model_is_suppressed(provider, model):
+        _log_suppressed_skip(provider, model)
+        return
+    bucket.append((alias, provider, model))
 
 
 def _tiered_fanout(phase: str) -> int:
@@ -519,19 +710,24 @@ def _tiered_choices(phase: str, prompt: str) -> list[tuple[str, str, str]]:
 
     Research walks this full list until it has N valid parses. The fanout cap is
     applied by the caller, not by dropping later models before they are needed.
+    One provider's cooldown removes only that provider. Keyed OpenRouter / NIM
+    failovers stay at the end even when the explicit list omitted them, so a
+    cooling Groq does not empty the pool while another model is ready.
     """
-    candidates = []
-    for alias in _tiered_aliases(phase):
-        provider, model = MODEL_ALIASES[alias]
-        if not _provider_ready(provider):
-            continue
-        if _model_is_suppressed(provider, model):
-            _log_suppressed_skip(provider, model)
-            continue
-        candidates.append((alias, provider, model))
+    explicit = _tiered_aliases(phase)
+    primary = []
+    for alias in explicit:
+        _consider_tier(primary, alias)
     if LLM_AUTO_ADAPT:
-        candidates = sorted(candidates, key=lambda apm: _score_provider(apm[1], phase, _estimate_tokens(prompt)), reverse=True)
-    return candidates
+        primary = sorted(
+            primary,
+            key=lambda apm: _score_provider(apm[1], phase, _estimate_tokens(prompt)),
+            reverse=True,
+        )
+    failover = []
+    for alias in _failover_aliases(explicit):
+        _consider_tier(failover, alias)
+    return primary + failover
 
 
 def _is_proactive_tiered(mode: str) -> bool:
@@ -1001,31 +1197,37 @@ def _pick_model(phase: str, mode: str) -> tuple[str, str] | None:
         "nim_llama": ("nvidia", NVIDIA_LLAMA),
         "nim_qwen": ("nvidia", NVIDIA_QWEN),
         "nim_deepseek": ("nvidia", NVIDIA_DEEPSEEK),
+        "openrouter_free": ("openrouter", _openrouter_model()),
+        "openrouter": ("openrouter", _openrouter_model()),
     }
     if mode in mapping:
         p, m = mapping[mode]
-        if not PROVIDER_KEYS.get(p):
+        if not _provider_configured(p):
             raise RuntimeError(f"{p.upper()} API key not configured for LLM_MODE={mode}")
         return p, m
 
     if mode == "economy":
-        choices = _provider_sorted([("groq", GROQ_QWEN), ("nvidia", NVIDIA_LLAMA), ("gemini", GEMINI_FLASH), ("mistral", MISTRAL_SMALL),
+        choices = _provider_sorted([("groq", GROQ_QWEN), ("nvidia", NVIDIA_LLAMA), ("openrouter", _openrouter_model()),
+                                    ("gemini", GEMINI_FLASH), ("mistral", MISTRAL_SMALL),
                                     ("openai", GPT4O_MINI), ("deepseek", DEEPSEEK_CHAT), ("claude", CLAUDE_HAIKU)], phase)
         return choices[0] if choices else None
 
     if mode in ("tiered", "adaptive", "auto"):
         # Auto-adaptive mode: use authenticated providers, score by recent health, and avoid weak providers for huge prompts.
         if phase == "research":
-            choices = _provider_sorted([("groq", GROQ_QWEN), ("nvidia", NVIDIA_LLAMA), ("gemini", GEMINI_FLASH), ("mistral", MISTRAL_SMALL),
+            choices = _provider_sorted([("groq", GROQ_QWEN), ("nvidia", NVIDIA_LLAMA), ("openrouter", _openrouter_model()),
+                                        ("gemini", GEMINI_FLASH), ("mistral", MISTRAL_SMALL),
                                         ("deepseek", DEEPSEEK_CHAT), ("openai", GPT4O_MINI), ("claude", CLAUDE_HAIKU)], phase)
         else:
-            choices = _provider_sorted([("gemini", GEMINI_FLASH), ("nvidia", NVIDIA_LLAMA), ("groq", GROQ_LLAMA), ("mistral", MISTRAL_SMALL),
+            choices = _provider_sorted([("gemini", GEMINI_FLASH), ("nvidia", NVIDIA_LLAMA), ("groq", GROQ_LLAMA),
+                                        ("openrouter", _openrouter_model()), ("mistral", MISTRAL_SMALL),
                                         ("deepseek", DEEPSEEK_CHAT), ("openai", GPT4O_MINI), ("claude", CLAUDE_HAIKU)], phase)
         return choices[0] if choices else None
 
     # Unknown mode: safe fallback to first configured provider.
     choices = _available([("claude", CLAUDE_SONNET), ("openai", GPT4O_MINI), ("gemini", GEMINI_FLASH),
-                          ("nvidia", NVIDIA_LLAMA), ("mistral", MISTRAL_SMALL), ("deepseek", DEEPSEEK_CHAT), ("groq", GROQ_QWEN)])
+                          ("nvidia", NVIDIA_LLAMA), ("openrouter", _openrouter_model()),
+                          ("mistral", MISTRAL_SMALL), ("deepseek", DEEPSEEK_CHAT), ("groq", GROQ_QWEN)])
     return choices[0] if choices else None
 
 
@@ -1060,7 +1262,12 @@ def _call_provider(provider: str, model: str, prompt: str, max_tokens: int = 600
                                            "https://api.groq.com/openai/v1/chat/completions", GROQ_API_KEY))
     if provider == "nvidia":
         return _finish(_call_chat_endpoint("nvidia", model, prompt, max_tokens, agent_tag,
-                                           f"{NVIDIA_BASE_URL}/chat/completions", NVIDIA_API_KEY))
+                                           _chat_completions_url(_nvidia_base_url()),
+                                           _real_provider_key("nvidia") or NVIDIA_API_KEY))
+    if provider == "openrouter":
+        return _finish(_call_chat_endpoint("openrouter", model, prompt, max_tokens, agent_tag,
+                                           _chat_completions_url(_openrouter_base_url()),
+                                           _real_provider_key("openrouter")))
     raise RuntimeError(f"Unknown LLM provider: {provider}")
 
 
@@ -1301,10 +1508,12 @@ def _call_gemini(model: str, prompt: str, max_tokens: int = 600, agent_tag: str 
 def _fallback_models(phase: str, exclude_provider: str = "") -> list[tuple[str, str]]:
     """All configured models for the phase, excluding the provider that just failed."""
     if phase == "research":
-        pool = [("groq", GROQ_QWEN), ("nvidia", NVIDIA_LLAMA), ("mistral", MISTRAL_SMALL), ("gemini", GEMINI_FLASH),
+        pool = [("groq", GROQ_QWEN), ("nvidia", NVIDIA_LLAMA), ("openrouter", _openrouter_model()),
+                ("mistral", MISTRAL_SMALL), ("gemini", GEMINI_FLASH),
                 ("deepseek", DEEPSEEK_CHAT), ("openai", GPT4O_MINI), ("claude", CLAUDE_HAIKU)]
     else:
-        pool = [("deepseek", DEEPSEEK_REASONER), ("gemini", GEMINI_PRO), ("nvidia", NVIDIA_LLAMA), ("mistral", MISTRAL_LARGE),
+        pool = [("deepseek", DEEPSEEK_REASONER), ("gemini", GEMINI_PRO), ("nvidia", NVIDIA_LLAMA),
+                ("openrouter", _openrouter_model()), ("mistral", MISTRAL_LARGE),
                 ("groq", GROQ_LLAMA), ("openai", GPT4O), ("claude", CLAUDE_SONNET)]
     return [(p, m) for p, m in _provider_sorted(pool, phase) if p != exclude_provider]
 
@@ -1921,7 +2130,7 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
     print(f"\n🤖 LLM Router test — mode={LLM_MODE}\n")
-    for p in ["claude", "openai", "gemini", "mistral", "deepseek", "groq", "nvidia"]:
+    for p in ["claude", "openai", "gemini", "mistral", "deepseek", "groq", "nvidia", "openrouter"]:
         print(f"  {p:8} key: {'✓ set' if PROVIDER_KEYS[p] else '✗ not set'}")
     print(f"  Daily budget: {DAILY_TOKEN_BUDGET:,} tokens")
     print(f"  Budget used:  {budget_pct()*100:.1f}%\n")

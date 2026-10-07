@@ -252,6 +252,7 @@ def _llm_keys_check() -> dict:
         "deepseek": bool(os.getenv("DEEPSEEK_API_KEY") or cfg.get("DEEPSEEK_API_KEY")),
         "groq": bool(os.getenv("GROQ_API_KEY") or cfg.get("GROQ_API_KEY")),
         "nvidia": bool(os.getenv("NVIDIA_API_KEY") or cfg.get("NVIDIA_API_KEY") or os.getenv("NIM_API_KEY")),
+        "openrouter": bool(os.getenv("OPENROUTER_API_KEY") or cfg.get("OPENROUTER_API_KEY")),
     }
     configured = [k for k, v in providers.items() if v]
     if not configured:

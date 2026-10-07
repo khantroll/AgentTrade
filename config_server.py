@@ -72,6 +72,7 @@ APP_ROOT = _resolve_app_root()
 SENSITIVE_KEYS = {
     "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY", "MISTRAL_API_KEY",
     "DEEPSEEK_API_KEY", "DEEPSPEAK_API_KEY", "GROQ_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY",
+    "OPENROUTER_API_KEY",
     "ALPACA_API_KEY", "ALPACA_SECRET_KEY",
     "REDDIT_CLIENT_SECRET", "QUIVER_API_KEY", "NEWS_API_KEY",
 }
@@ -91,6 +92,9 @@ DEFAULT_CONFIG = {
     "NVIDIA_API_KEY":       "",
     "NIM_API_KEY":          "",
     "NVIDIA_BASE_URL":      "https://integrate.api.nvidia.com/v1",
+    "OPENROUTER_API_KEY":   "",
+    "OPENROUTER_BASE_URL":  "https://openrouter.ai/api/v1",
+    "OPENROUTER_MODEL":     "openrouter/free",
     "NVIDIA_LLAMA_MODEL":   "meta/llama-3.1-70b-instruct",
     "NVIDIA_QWEN_MODEL":    "qwen/qwen3-235b-a22b",
     "NVIDIA_DEEPSEEK_MODEL": "deepseek-ai/deepseek-r1",
@@ -360,10 +364,24 @@ def test_groq(api_key: str) -> dict:
     return _test_chat_endpoint("groq", api_key, "https://api.groq.com/openai/v1/chat/completions", model)
 
 
+def _chat_completions_url(base: str) -> str:
+    """Join an OpenAI-compatible base with /chat/completions, without doubling it."""
+    url = (base or "").strip().rstrip("/")
+    if url.endswith("/chat/completions"):
+        return url
+    return f"{url}/chat/completions"
+
+
 def test_nvidia(api_key: str) -> dict:
-    base = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
+    base = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
     model = os.getenv("NVIDIA_LLAMA_MODEL", "meta/llama-3.1-70b-instruct")
-    return _test_chat_endpoint("nvidia", api_key, f"{base}/chat/completions", model)
+    return _test_chat_endpoint("nvidia", api_key, _chat_completions_url(base), model)
+
+
+def test_openrouter(api_key: str) -> dict:
+    base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+    return _test_chat_endpoint("openrouter", api_key, _chat_completions_url(base), model)
 
 
 def test_alpaca(api_key: str, secret_key: str, paper: bool = True) -> dict:
@@ -560,6 +578,11 @@ def create_app():
     def route_test_nvidia():
         d = request.get_json(force=True)
         return jsonify(test_nvidia(_request_value_or_saved(d, "api_key", "NVIDIA_API_KEY")))
+
+    @app.route("/test/openrouter", methods=["POST"])
+    def route_test_openrouter():
+        d = request.get_json(force=True)
+        return jsonify(test_openrouter(_request_value_or_saved(d, "api_key", "OPENROUTER_API_KEY")))
 
     @app.route("/test/alpaca", methods=["POST"])
     def route_test_alpaca():
