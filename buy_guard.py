@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Tuple
 
 import agent_config as cfg
-from account_sync import refresh_alpaca_snapshot
+from account_sync import refresh_alpaca_snapshot, reserved_open_buy_notional
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ def check_buy_allowed(
     acct = snap.get("account") or snap
     cash = _float(acct.get("cash", snap.get("cash")))
     buying_power = _float(acct.get("buying_power", snap.get("buying_power")))
-    open_buy_notional = _float(snap.get("open_buy_notional"))
+    open_buy_notional = reserved_open_buy_notional(snap)
     notional = _float(order_notional)
 
     projected_cash = cash - open_buy_notional - notional
@@ -68,6 +68,7 @@ def check_buy_allowed(
         "buying_power": round(buying_power, 2),
         "order_notional": round(notional, 2),
         "open_buy_notional": round(open_buy_notional, 2),
+        "foreign_open_buy_notional": round(_float(snap.get("foreign_open_buy_notional")), 2),
         "projected_cash": round(projected_cash, 2),
         "min_cash_reserve": cfg.MIN_CASH_RESERVE,
     }

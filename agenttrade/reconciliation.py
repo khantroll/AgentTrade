@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import agent_config as cfg
-from account_sync import refresh_alpaca_snapshot
+from account_sync import refresh_alpaca_snapshot, reserved_open_buy_notional
 from agenttrade import db as ledger
 
 log = logging.getLogger(__name__)
@@ -347,7 +347,7 @@ def run_reconciliation_gate(
             differences, snapshot,
         )
 
-    open_buy_notional = _float(snapshot.get("open_buy_notional"), 0) or 0
+    open_buy_notional = reserved_open_buy_notional(snapshot)
     if cash < -MARGIN_TOLERANCE and open_buy_notional > 0:
         differences["open_buy_notional"] = open_buy_notional
         return _fail(

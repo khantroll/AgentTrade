@@ -27,6 +27,7 @@ guard. Protective sells are not decided here.
 import logging
 
 import agent_config as cfg
+from account_sync import reserved_open_buy_notional
 from agenttrade import db as ledger
 from agenttrade.risk import CycleRiskState, quote_buy_notional, _is_cash_block
 from buckets import Bucket
@@ -123,16 +124,21 @@ def risk_agent(
     live_acct = (account_snapshot or {}).get("account") or account_snapshot or account
     portfolio_value = float(live_acct.get("portfolio_value") or live_acct.get("equity") or account.get("portfolio_value", 10000))
     raw_cash = float(live_acct.get("cash", account.get("cash", 0)))
-    open_buy = float((account_snapshot or {}).get("open_buy_notional", 0))
+    open_buy = reserved_open_buy_notional(account_snapshot)
+    foreign_open_buy = float((account_snapshot or {}).get("foreign_open_buy_notional") or 0)
     if raw_cash <= 0 and not cfg.ALLOW_MARGIN and not cfg.ALLOW_NEGATIVE_CASH:
         log.warning("[%s/Risk] Live cash $%.2f — blocking buys.", bucket.name, raw_cash)
         return []
 
-    cash = max(raw_cash - open_buy - portfolio_value * cfg.RESERVE_CASH_PCT, 0)
+    reserve_dollars = portfolio_value * cfg.RESERVE_CASH_PCT
+    cash = max(raw_cash - open_buy - reserve_dollars, 0)
     if cash < cfg.MIN_CASH_RESERVE and not cfg.ALLOW_NEGATIVE_CASH:
         log.warning(
-            "[%s/Risk] Usable cash $%.2f below MIN_CASH_RESERVE $%.2f — blocking buys.",
+            "[%s/Risk] Usable cash $%.2f below MIN_CASH_RESERVE $%.2f "
+            "(cash $%.2f, AgentTrade open buys $%.2f, %.0f%% reserve $%.2f, "
+            "foreign open buys $%.2f left on the shared account).",
             bucket.name, cash, cfg.MIN_CASH_RESERVE,
+            raw_cash, open_buy, cfg.RESERVE_CASH_PCT * 100, reserve_dollars, foreign_open_buy,
         )
         return []
     if cash < 10 and not cfg.ALLOW_NEGATIVE_CASH:
