@@ -213,17 +213,29 @@ sudo journalctl -u trading-agent-config -f
 
 `run_cycle.sh` does not move that stamp when git HEAD changes. If the two files disagree, it rewrites both from `DEPLOY_SHA.txt` and copies that one value into the web directory as both names. Do not hand-edit only one file. If the app directory is not a git checkout, set `DEPLOY_SHA` for the deploy command, or run `bash write_deploy_sha.sh /opt/trading-agent <sha>`.
 
-## Updating files after code changes
+## Updating a live host
+
+From the source tree (the directory that contains `update_deploy.sh`):
 
 ```bash
-sudo cp agent.py screener.py buckets.py llm_router.py \
-        config_server.py /opt/trading-agent/
-
-sudo cp dashboard.html /var/www/my_webapp/www/index.html
-sudo cp settings.html  /var/www/my_webapp/www/settings.html
-
-sudo systemctl restart trading-agent-config
+sudo bash update_deploy.sh -y
 ```
+
+That deploys into `/opt/trading-agent` by default. It does not import `agent_state.json` into SQLite, and it does not overwrite `.env`, `agenttrade.sqlite3`, `llm_health.json`, `agent_state.json`, `token_usage.json`, `config.json`, `bucket_tags.json`, `trade_log.jsonl`, `performance_history.jsonl`, or log files. Those are runtime state. They are gitignored and are not part of the copy list.
+
+Running that same command from `/opt/trading-agent` itself is in-place: the script sees that the source and destination are the same files and skips the copy instead of aborting. `/opt/trading-agent` does not need to be a git checkout.
+
+To deploy a separate checkout onto the live app:
+
+```bash
+sudo bash /path/to/source/update_deploy.sh -y --app-dir /opt/trading-agent
+```
+
+`--migrate` is a first-time JSON import only. On a ledger that already has system flags or cycle history it leaves `STARTING_EQUITY`, `HIGH_WATER_EQUITY`, `TRADING_HALTED`, and existing cycles unchanged. Do not pass it for a normal update. Do not rsync the git tree over `/opt/trading-agent` with `--delete`.
+
+`update_deploy.sh -y --dry-run` prints this plan and writes nothing.
+
+The dashboard is one HTML file. There is no `js/` bundle to deploy, and the post-deploy check looks for the Pre-Cycle Health section that the page actually contains.
 
 ---
 

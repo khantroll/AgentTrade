@@ -39,6 +39,58 @@ def _migration_plan(state: dict) -> dict:
     }
 
 
+def _ledger_is_live() -> bool:
+    """True when the SQLite file already holds flags or cycle history.
+
+    A deploy must not treat that file as an empty JSON import. Opening the
+    file read-only avoids creating a database just to look.
+    """
+    path = ledger.get_db_path()
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return False
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return True
+    try:
+        names = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "system_flags" in names:
+            count = conn.execute("SELECT COUNT(*) FROM system_flags").fetchone()
+            if count and count[0]:
+                return True
+        if "cycle_runs" in names:
+            count = conn.execute("SELECT COUNT(*) FROM cycle_runs").fetchone()
+            if count and count[0]:
+                return True
+        return False
+    except sqlite3.Error:
+        return True
+    finally:
+        conn.close()
+
+
+def _preserved_summary(dry_run: bool) -> dict:
+    message = (
+        "Existing SQLite ledger left unchanged. "
+        "Equity baselines, the halt flag, and history were not reset."
+    )
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "skipped": True,
+        "backup_path": None,
+        "db_path": ledger.get_db_path(),
+        "state_path": cfg.STATE_FILE,
+        "imported": {},
+        "preserved": ["STARTING_EQUITY", "HIGH_WATER_EQUITY", "TRADING_HALTED", "cycle history"],
+        "message": message,
+    }
+
+
 def migrate_state(dry_run: bool = False) -> dict:
     """
     Back up agent_state.json, init SQLite, import useful history.
@@ -46,11 +98,21 @@ def migrate_state(dry_run: bool = False) -> dict:
 
     With dry_run=True, parse and report the migration plan without writing
     backups, SQLite rows, or system flags.
+
+    An existing ledger (any system flag or cycle) is left untouched. This
+    import is only for a first-time database. It must not overwrite
+    STARTING_EQUITY, HIGH_WATER_EQUITY, TRADING_HALTED, or prior cycles.
     """
+    if _ledger_is_live():
+        summary = _preserved_summary(dry_run)
+        log.info("[Migrate] %s", summary["message"])
+        return summary
+
     state_path = cfg.STATE_FILE
     summary = {
         "ok": False,
         "dry_run": dry_run,
+        "skipped": False,
         "backup_path": None,
         "db_path": ledger.get_db_path(),
         "state_path": state_path,
