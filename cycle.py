@@ -607,6 +607,25 @@ def run_trading_cycle() -> None:
                 _ledger.insert_funnel_events(_CYCLE_RUN_ID, "ORDER", orders, bucket=bucket.name)
 
         research_status = summarize_research_status(bucket_research)
+        from agents.risk import cash_gate_summary
+        from deploy_sha import reconcile_deploy_sha
+
+        cash_gate = cash_gate_summary(all_blocked)
+        if cash_gate:
+            log.warning(
+                "[Cycle] Buys blocked by cash reserve: usable $%.2f below MIN_CASH_RESERVE $%.2f "
+                "(cash $%.2f, %.0f%% reserve $%.2f, AgentTrade open buys $%.2f, "
+                "foreign open buys $%.2f). %d buys blocked, 0 of those orders placed.",
+                cash_gate.get("usable_cash") or 0,
+                cash_gate.get("min_cash_reserve") or 0,
+                cash_gate.get("cash") or 0,
+                float(cash_gate.get("reserve_pct") or 0) * 100,
+                cash_gate.get("reserve_dollars") or 0,
+                cash_gate.get("agenttrade_open_buys") or 0,
+                cash_gate.get("foreign_open_buys") or 0,
+                int(cash_gate.get("buys_blocked") or 0),
+            )
+
         log.info(
             "[Cycle] Funnel summary: candidates=%d decisions=%d blocked=%d research=%s entry_source=%s buckets_screener=%s",
             len(all_candidates),
@@ -657,6 +676,8 @@ def run_trading_cycle() -> None:
             "research_status": research_status,
             "decisions": all_decisions,
             "blocked_ideas": all_blocked,
+            "cash_gate": cash_gate,
+            "deploy_sha": reconcile_deploy_sha(),
             "last_orders": all_orders,  # includes position_review sells + hard_rebalance + buys
             "recent_fills": get_recent_fills(30),
             "daily_trades": cfg.daily_trades,
@@ -683,7 +704,7 @@ def run_trading_cycle() -> None:
         state = merge_snapshot_into_state(state, snapshot, source="cycle")
         if _CYCLE_RUN_ID:
             from agenttrade import db as _ledger
-            for _key in ("universes", "screener_sources", "token_usage", "rebalance", "hard_rebalance", "buy_lock", "llm_mode", "last_run", "research_status"):
+            for _key in ("universes", "screener_sources", "token_usage", "rebalance", "hard_rebalance", "buy_lock", "llm_mode", "last_run", "research_status", "cash_gate", "deploy_sha"):
                 _ledger.upsert_cycle_artifact(_CYCLE_RUN_ID, _key, state.get(_key))
         from agenttrade.publish import build_dashboard_state, publish_dashboard_state
         state = build_dashboard_state(cached_funnel=state, live_snapshot=snapshot)

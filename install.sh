@@ -88,11 +88,17 @@ for f in agent.py agent_config.py alpaca_client.py market_data.py cycle.py \
 done
 mkdir -p "$APP_DIR/agents"
 cp "$SRC/agents/"*.py "$APP_DIR/agents/" && info "  ✓ agents/*.py"
-for f in run_cycle.sh monitor.sh midnight_reset.sh verify_backtest_deploy.sh; do
+for f in run_cycle.sh monitor.sh midnight_reset.sh verify_backtest_deploy.sh write_deploy_sha.sh; do
     cp "$SRC/$f" "$APP_DIR/$f"
     chmod +x "$APP_DIR/$f"
     info "  ✓ $f (executable)"
 done
+
+if [ -f "$APP_DIR/write_deploy_sha.sh" ]; then
+    bash "$APP_DIR/write_deploy_sha.sh" "$APP_DIR" "${DEPLOY_SHA:-}" "$SRC" \
+        && success "DEPLOY_SHA.txt and DEPLOY_SHA recorded together" \
+        || warn "Could not record deploy sha — run: bash $APP_DIR/write_deploy_sha.sh $APP_DIR <sha>"
+fi
 
 # Patch run_cycle.sh with correct web dir
 sed -i "s|/var/www/my_webapp/www|$WEB_DIR|g"   "$APP_DIR/run_cycle.sh"

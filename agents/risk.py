@@ -46,6 +46,49 @@ def _stamp_buys(decisions: list, reason: str) -> None:
             d["blocked_reason"] = reason
 
 
+def _cash_gate_detail(
+    usable: float,
+    raw_cash: float,
+    open_buy: float,
+    reserve_pct: float,
+    reserve_dollars: float,
+    foreign_open_buy: float,
+    min_cash_reserve: float,
+) -> dict:
+    return {
+        "blocked": True,
+        "reason": "below_min_cash_reserve",
+        "usable_cash": round(usable, 2),
+        "min_cash_reserve": round(float(min_cash_reserve), 2),
+        "cash": round(raw_cash, 2),
+        "agenttrade_open_buys": round(open_buy, 2),
+        "reserve_pct": float(reserve_pct),
+        "reserve_dollars": round(reserve_dollars, 2),
+        "foreign_open_buys": round(foreign_open_buy, 2),
+    }
+
+
+def cash_gate_summary(decisions: list) -> dict:
+    """One cash-reserve block for the cycle log and dashboard, or empty."""
+    detail = None
+    buys = 0
+    for d in decisions or []:
+        gate = d.get("cash_gate") if isinstance(d, dict) else None
+        reason = str((d or {}).get("blocked_reason") or "")
+        if not (isinstance(gate, dict) and gate.get("blocked")) and not reason.startswith("below_min_cash_reserve"):
+            continue
+        action = str(d.get("action") or d.get("decision") or "").upper()
+        if action == "BUY":
+            buys += 1
+        if detail is None and isinstance(gate, dict):
+            detail = dict(gate)
+    if detail is None:
+        return {}
+    detail["blocked"] = True
+    detail["buys_blocked"] = buys
+    return detail
+
+
 def _unrealized_pl(position: dict) -> float:
     if not position:
         return 0.0
@@ -133,13 +176,26 @@ def risk_agent(
     reserve_dollars = portfolio_value * cfg.RESERVE_CASH_PCT
     cash = max(raw_cash - open_buy - reserve_dollars, 0)
     if cash < cfg.MIN_CASH_RESERVE and not cfg.ALLOW_NEGATIVE_CASH:
+        gate = _cash_gate_detail(
+            cash, raw_cash, open_buy, cfg.RESERVE_CASH_PCT, reserve_dollars,
+            foreign_open_buy, cfg.MIN_CASH_RESERVE,
+        )
         log.warning(
-            "[%s/Risk] Usable cash $%.2f below MIN_CASH_RESERVE $%.2f "
+            "[%s/Risk] Buys blocked by cash reserve: usable $%.2f below MIN_CASH_RESERVE $%.2f "
             "(cash $%.2f, AgentTrade open buys $%.2f, %.0f%% reserve $%.2f, "
             "foreign open buys $%.2f left on the shared account).",
             bucket.name, cash, cfg.MIN_CASH_RESERVE,
             raw_cash, open_buy, cfg.RESERVE_CASH_PCT * 100, reserve_dollars, foreign_open_buy,
         )
+        for d in decisions or []:
+            action = str(d.get("action") or d.get("decision") or "SKIP").upper()
+            if action == "BUY":
+                d["blocked_reason"] = (
+                    "below_min_cash_reserve: usable $%.2f below MIN_CASH_RESERVE $%.2f "
+                    "(cash $%.2f, %.0f%% reserve $%.2f)"
+                    % (cash, cfg.MIN_CASH_RESERVE, raw_cash, cfg.RESERVE_CASH_PCT * 100, reserve_dollars)
+                )
+                d["cash_gate"] = dict(gate)
         return []
     if cash < 10 and not cfg.ALLOW_NEGATIVE_CASH:
         log.warning("[%s/Risk] Usable cash $%.2f — skipping.", bucket.name, cash)

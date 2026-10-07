@@ -45,6 +45,18 @@ fi
 
 echo "── $(date '+%Y-%m-%d %H:%M:%S %Z') run_cycle.sh starting ──"
 
+# DEPLOY_SHA.txt is canonical. The extensionless DEPLOY_SHA is the same bytes.
+# This reconciles a disagreement left by an older deploy. It does not advance
+# the stamp to a newer git HEAD; update_deploy.sh / write_deploy_sha.sh do that.
+if [ -f "$APP_DIR/write_deploy_sha.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$APP_DIR/write_deploy_sha.sh"
+    reconcile_deploy_sha "$APP_DIR" || true
+    if [ -n "${DEPLOY_SHA_VALUE:-}" ]; then
+        echo "deploy sha ${DEPLOY_SHA_VALUE} (DEPLOY_SHA.txt and DEPLOY_SHA match)"
+    fi
+fi
+
 # ── Log rotation ──────────────────────────────────────────────────────────────
 if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt "$MAX_LOG_BYTES" ]; then
     mv "$LOG" "${LOG}.1"
@@ -78,6 +90,13 @@ fi
 if [ -f "$APP_DIR/agent_state.json" ]; then
     cp "$APP_DIR/agent_state.json" "$WEB_DIR/agent_state.json"
     echo "✓ agent_state.json published to web directory"
+fi
+# Publish the one recorded commit as both names. Never copy the two files
+# independently; a stale extensionless file must not outlive DEPLOY_SHA.txt.
+if [ -f "$APP_DIR/DEPLOY_SHA.txt" ]; then
+    cp "$APP_DIR/DEPLOY_SHA.txt" "$WEB_DIR/DEPLOY_SHA.txt"
+    cp "$APP_DIR/DEPLOY_SHA.txt" "$WEB_DIR/DEPLOY_SHA"
+    echo "✓ deploy sha $(awk 'NF { print $1; exit }' "$APP_DIR/DEPLOY_SHA.txt") published to both SHA files"
 fi
 if [ -f "$APP_DIR/performance_history.json" ]; then
     cp "$APP_DIR/performance_history.json" "$WEB_DIR/performance_history.json"
