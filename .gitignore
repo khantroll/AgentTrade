@@ -10,5 +10,11 @@ __pycache__/
 venv/
 backups/
 *.log
+# Runtime state. Do not commit these or copy them onto a live host.
+trading_agent.log
+cron.log
+llm_health.json
+token_usage.json
+config.json
 DEPLOY_SHA
 DEPLOY_SHA.txt

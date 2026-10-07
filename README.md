@@ -181,6 +181,8 @@ LLM research is a narrator and a fallback, not the only way into a trade.
 
 `run_cycle.sh` and `monitor.sh` export `.env` with `set -a` before Python so import-time settings such as `CRYPTO_MAX_ALLOCATION` are visible. `run_cycle.sh` uses `flock -E 75` so a busy lock exits 0 and a failed cycle keeps its own exit code.
 
+A live update is `sudo bash update_deploy.sh -y` from the source tree (or from `/opt/trading-agent` once this copy is installed). That command does not migrate SQLite. `--migrate` is only a first-time import, and an existing ledger keeps its equity baselines, halt flag, and history. The script skips a copy when the source and destination are the same file. It never overwrites `.env`, the sqlite ledger, `llm_health.json`, `agent_state.json`, trade logs, or process logs.
+
 ## Milestone C risk guards
 
 Approvals in one cycle share a cash ledger and a global held set. Tier 2 still sizes the order. These checks only decide whether another buy may be opened.

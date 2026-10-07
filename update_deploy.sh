@@ -14,8 +14,14 @@
 # Or non-interactive with defaults:
 #   sudo bash update_deploy.sh -y
 #
-# In-place update (already running from APP_DIR):
+# In-place update (source and /opt/trading-agent are the same directory):
 #   cd /opt/trading-agent && sudo bash update_deploy.sh -y
+# Same-file copies are skipped. SQLite migration is NOT part of this command.
+# A first-time JSON import is opt-in: --migrate
+#
+# Deploy from a separate source tree onto the live app:
+#   sudo bash /path/to/source/update_deploy.sh -y --app-dir /opt/trading-agent
+#   sudo bash update_deploy.sh -y --source /path/to/source --app-dir /opt/trading-agent
 #
 # Local/dev only (no systemd, no web copy):
 #   bash update_deploy.sh --local-only
@@ -38,11 +44,14 @@ section() { echo -e "\n${BOLD}â”€â”€ $* â”€â”€${NC}"; }
 
 ASSUME_YES=0
 LOCAL_ONLY=0
-SKIP_MIGRATE=0
+RUN_MIGRATE=0
 SKIP_VERIFY=0
 SKIP_RESTART=0
 SKIP_TESTS=0
+SKIP_PIP=0
+DRY_RUN=0
 DRY_RUN_MIGRATE_ONLY=0
+SOURCE_DIR=""
 
 usage() {
     cat << 'EOF'
@@ -50,38 +59,54 @@ Usage: bash update_deploy.sh [OPTIONS]
 
 Options:
   -y, --yes           Accept defaults; skip most prompts
+  --dry-run           Print the plan and write nothing
   --local-only        Update files in APP_DIR only (no web/systemd; for dev)
+  --source PATH       Directory of files to deploy (default: this script's directory)
   --app-dir PATH      Target app directory (default: /opt/trading-agent)
   --web-dir PATH      Dashboard web root (default: /var/www/my_webapp__3/www)
   --service NAME      systemd service (default: trading-agent-config)
-  --skip-migrate      Do not run SQLite migration
+  --migrate           Opt in to a first-time JSON import. Existing ledgers are preserved.
+  --skip-migrate      Do not run SQLite migration (this is already the default)
   --skip-verify       Do not run verify_ledger after deploy
   --skip-restart      Do not restart config server
   --skip-tests        Do not run pytest (if tests/ present)
-  --migrate-dry-run   Run migration dry-run only (no deploy writes for migration)
+  --skip-pip          Do not create a venv or run pip
+  --migrate-dry-run   Print the migration plan only; do not import
   -h, --help          Show this help
 
-Interactive prompts appear for paths and migration unless -y is set.
+The plain command is: sudo bash update_deploy.sh -y
+It copies code onto the app dir, skips same-file copies, and does not import
+agent_state.json into an existing SQLite ledger. Runtime files (.env, sqlite,
+llm_health.json, agent_state.json, logs, trade logs) are never overwritten.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -y|--yes) ASSUME_YES=1 ;;
+        --dry-run) DRY_RUN=1 ;;
         --local-only) LOCAL_ONLY=1 ;;
+        --source) SOURCE_DIR="$2"; shift ;;
         --app-dir) DEFAULT_APP="$2"; shift ;;
         --web-dir) DEFAULT_WEB="$2"; shift ;;
         --service) DEFAULT_SERVICE="$2"; shift ;;
-        --skip-migrate) SKIP_MIGRATE=1 ;;
+        --migrate) RUN_MIGRATE=1; DRY_RUN_MIGRATE_ONLY=0 ;;
+        --skip-migrate) RUN_MIGRATE=0; DRY_RUN_MIGRATE_ONLY=0 ;;
         --skip-verify) SKIP_VERIFY=1 ;;
         --skip-restart) SKIP_RESTART=1 ;;
         --skip-tests) SKIP_TESTS=1 ;;
-        --migrate-dry-run) DRY_RUN_MIGRATE_ONLY=1 ;;
+        --skip-pip) SKIP_PIP=1 ;;
+        --migrate-dry-run) DRY_RUN_MIGRATE_ONLY=1; RUN_MIGRATE=0 ;;
         -h|--help) usage; exit 0 ;;
         *) error "Unknown option: $1 (use -h for help)" ;;
     esac
     shift
 done
+
+if [[ -n "$SOURCE_DIR" ]]; then
+    [[ -d "$SOURCE_DIR" ]] || error "Source dir not found: $SOURCE_DIR"
+    SRC="$(cd "$SOURCE_DIR" && pwd)"
+fi
 
 prompt() {
     local var_name="$1"
@@ -186,7 +211,28 @@ for f in "${UPDATE_PY[@]}" "${UPDATE_AGENTS[@]}" "${UPDATE_AGENTTRADE[@]}"; do
         MISSING=$((MISSING + 1))
     fi
 done
-[[ "$MISSING" -gt 0 ]] && error "$MISSING required file(s) missing from $SRC â€” sync repo first"
+[[ "$MISSING" -gt 0 ]] && error "$MISSING required file(s) missing from $SRC — sync repo first"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    section "Dry run"
+    info "Source: $SRC"
+    info "App:    $APP_DIR"
+    if [[ "$IN_PLACE" -eq 1 ]]; then
+        info "In-place: source and app dir are the same; file copies will be skipped"
+    else
+        info "Would copy code files from the source tree into the app dir"
+    fi
+    info "Runtime files are never overwritten: .env, agenttrade.sqlite3, llm_health.json, agent_state.json, token_usage.json, config.json, bucket_tags.json, trade_log.jsonl, performance_history.jsonl, *.log"
+    if [[ "$RUN_MIGRATE" -eq 1 ]]; then
+        info "Would run a first-time SQLite import. An existing ledger is preserved."
+    elif [[ "$DRY_RUN_MIGRATE_ONLY" -eq 1 ]]; then
+        info "Would print the migration plan only"
+    else
+        info "SQLite migration: not run. Pass --migrate only for a first-time JSON import."
+    fi
+    info "No files were written."
+    exit 0
+fi
 
 if [[ ! -d "$APP_DIR" ]]; then
     if confirm "App dir $APP_DIR does not exist. Create it?" "y"; then
@@ -212,7 +258,9 @@ if [[ "$EUID" -ne 0 && "$LOCAL_ONLY" -eq 0 ]]; then
     fi
 fi
 
-if [[ ! -d "$VENV" ]]; then
+if [[ "$SKIP_PIP" -eq 1 ]]; then
+    info "Skipped venv/pip (--skip-pip)"
+elif [[ ! -d "$VENV" ]]; then
     warn "Virtualenv not found at $VENV"
     if confirm "Create venv and install requirements?" "y"; then
         python3 -m venv "$VENV"
@@ -255,12 +303,45 @@ success "Backup saved to $BACKUP_DIR"
 section "Deploying files"
 mkdir -p "$APP_DIR/agents" "$APP_DIR/agenttrade"
 
+# Live host state. A source tree must never replace these, even in-place.
+is_runtime_rel() {
+    local base
+    base="$(basename "$1")"
+    case "$base" in
+        .env|agent_state.json|llm_health.json|token_usage.json|config.json|bucket_tags.json|trade_log.jsonl|performance_history.jsonl|trading_agent.log|cron.log)
+            return 0
+            ;;
+        *.log|*.jsonl|*.sqlite3|*.sqlite3-*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 copy_file() {
     local rel="$1"
+    local src="$SRC/$rel"
     local dest="$APP_DIR/$rel"
+    if is_runtime_rel "$rel"; then
+        info "  · $rel left untouched (runtime state)"
+        return 0
+    fi
+    if [[ ! -f "$src" ]]; then
+        warn "  missing in source: $rel"
+        return 0
+    fi
+    if [[ -e "$dest" ]]; then
+        local src_real dest_real
+        src_real="$(readlink -f "$src")"
+        dest_real="$(readlink -f "$dest")"
+        if [[ "$src_real" == "$dest_real" ]]; then
+            info "  · $rel unchanged (source and destination are the same file)"
+            return 0
+        fi
+    fi
     mkdir -p "$(dirname "$dest")"
-    cp "$SRC/$rel" "$dest"
-    info "  âœ“ $rel"
+    cp "$src" "$dest"
+    info "  ✓ $rel"
 }
 
 for f in "${UPDATE_PY[@]}"; do copy_file "$f"; done
@@ -271,8 +352,7 @@ for f in "${UPDATE_SCRIPTS[@]}"; do
 done
 
 if [[ -f "$SRC/requirements.txt" ]]; then
-    cp "$SRC/requirements.txt" "$APP_DIR/requirements.txt"
-    info "  âœ“ requirements.txt"
+    copy_file "requirements.txt"
 fi
 
 if [[ "$LOCAL_ONLY" -eq 0 && -d "$WEB_DIR" && -f "$SRC/dashboard.html" ]]; then
@@ -284,9 +364,7 @@ if [[ "$LOCAL_ONLY" -eq 0 && -d "$WEB_DIR" && -f "$SRC/dashboard.html" ]]; then
         mkdir -p "$WEB_DIR/js"
         cp "$SRC/js"/at-*.js "$WEB_DIR/js/"
         chmod 644 "$WEB_DIR/js"/at-*.js 2>/dev/null || true
-        success "js/at-*.js â†’ $WEB_DIR/js/"
-    else
-        warn "js/ directory not found in $SRC â€” dashboard JS modules will be missing"
+        success "js/at-*.js → $WEB_DIR/js/"
     fi
 fi
 
@@ -359,7 +437,9 @@ fi
 
 # â”€â”€ Dependencies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 section "Python dependencies"
-if [[ -f "$APP_DIR/requirements.txt" ]]; then
+if [[ "$SKIP_PIP" -eq 1 ]]; then
+    info "Skipped pip install (--skip-pip)"
+elif [[ -f "$APP_DIR/requirements.txt" ]]; then
     if confirm "Run pip install -r requirements.txt?" "y"; then
         "$PIP" install -r "$APP_DIR/requirements.txt" -q
         success "Dependencies up to date"
@@ -395,8 +475,8 @@ section "SQLite migration"
 export TRADING_AGENT_DIR="$APP_DIR"
 cd "$APP_DIR"
 
-if [[ "$SKIP_MIGRATE" -eq 1 ]]; then
-    warn "Migration skipped (--skip-migrate)"
+if [[ "$RUN_MIGRATE" -eq 0 && "$DRY_RUN_MIGRATE_ONLY" -eq 0 ]]; then
+    info "SQLite migration not run. An existing ledger is left as-is. Opt in with --migrate for a first-time JSON import."
 else
     info "Migration dry-run:"
     "$PY" -m agenttrade.migrate_state --dry-run || warn "Dry-run reported issues"
@@ -404,7 +484,7 @@ else
 
     if [[ "$DRY_RUN_MIGRATE_ONLY" -eq 1 ]]; then
         info "Stopping after dry-run (--migrate-dry-run)"
-    elif confirm "Run migration for real? (backs up agent_state.json, creates/updates SQLite)" "y"; then
+    elif [[ "$RUN_MIGRATE" -eq 1 ]] && confirm "Run first-time migration? Existing ledgers are preserved." "n"; then
         if "$PY" -m agenttrade.migrate_state; then
             success "Migration completed"
         else
@@ -476,7 +556,7 @@ chk "Flask /ledger route"           "grep -q '/ledger' $APP_DIR/config_server.py
 
 if [[ "$LOCAL_ONLY" -eq 0 && -d "$WEB_DIR" ]]; then
     chk "dashboard index.html"      "[ -f $WEB_DIR/index.html ]"
-    chk "dashboard reconciliation UI" "grep -q reconciliation $WEB_DIR/index.html"
+    chk "dashboard HTML" "grep -q 'Pre-Cycle Health' $WEB_DIR/index.html"
 fi
 
 echo ""

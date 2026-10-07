@@ -150,9 +150,16 @@ success "Application rollback backup: $BACKUP_TAR"
 DB_HASH_BEFORE=""
 ENV_HASH_BEFORE=""
 TAGS_HASH_BEFORE=""
-[[ -f "$APP_DIR/agenttrade.sqlite3" ]] && DB_HASH_BEFORE="$(sha256sum "$APP_DIR/agenttrade.sqlite3" | awk '{print $1}')"
-[[ -f "$APP_DIR/.env" ]] && ENV_HASH_BEFORE="$(sha256sum "$APP_DIR/.env" | awk '{print $1}')"
-[[ -f "$APP_DIR/bucket_tags.json" ]] && TAGS_HASH_BEFORE="$(sha256sum "$APP_DIR/bucket_tags.json" | awk '{print $1}')"
+file_hash() {
+    [[ -f "$1" ]] && sha256sum "$1" | awk '{print $1}' || true
+}
+DB_HASH_BEFORE="$(file_hash "$APP_DIR/agenttrade.sqlite3")"
+ENV_HASH_BEFORE="$(file_hash "$APP_DIR/.env")"
+TAGS_HASH_BEFORE="$(file_hash "$APP_DIR/bucket_tags.json")"
+STATE_HASH_BEFORE="$(file_hash "$APP_DIR/agent_state.json")"
+HEALTH_HASH_BEFORE="$(file_hash "$APP_DIR/llm_health.json")"
+TRADE_HASH_BEFORE="$(file_hash "$APP_DIR/trade_log.jsonl")"
+LOG_HASH_BEFORE="$(file_hash "$APP_DIR/trading_agent.log")"
 
 # -----------------------------------------------------------------------------
 # Deploy application source
@@ -191,7 +198,7 @@ info "  ✓ ${#AGENTTRADE_FILES[@]} agenttrade/*.py files"
 install -m 0644 "$SRC/requirements.txt" "$APP_DIR/requirements.txt"
 
 # Runtime shell helpers: deploy if present. Do NOT change /etc/cron.d here.
-for f in run_cycle.sh monitor.sh midnight_reset.sh verify_backtest_deploy.sh verify_ledger_deploy.sh; do
+for f in run_cycle.sh monitor.sh midnight_reset.sh verify_backtest_deploy.sh verify_ledger_deploy.sh write_deploy_sha.sh update_deploy.sh; do
     if [[ -f "$SRC/$f" ]]; then
         install -m 0755 "$SRC/$f" "$APP_DIR/$f"
         info "  ✓ $f"
@@ -199,7 +206,7 @@ for f in run_cycle.sh monitor.sh midnight_reset.sh verify_backtest_deploy.sh ver
 done
 
 # Preserve production mutable state by design.
-for f in .env agenttrade.sqlite3 bucket_tags.json agent_state.json; do
+for f in .env agenttrade.sqlite3 bucket_tags.json agent_state.json llm_health.json token_usage.json config.json trade_log.jsonl performance_history.jsonl trading_agent.log cron.log; do
     if [[ -e "$SRC/$f" ]]; then
         info "  ↷ source $f intentionally NOT copied"
     fi
@@ -256,6 +263,21 @@ if [[ -n "$TAGS_HASH_BEFORE" ]]; then
         || error "Production bucket_tags.json changed during deployment. Restore from $BACKUP_TAR"
     success "bucket_tags.json unchanged"
 fi
+
+assert_unchanged() {
+    local label="$1"
+    local path="$2"
+    local before="$3"
+    [[ -n "$before" ]] || return 0
+    local after
+    after="$(file_hash "$path")"
+    [[ "$before" == "$after" ]] || error "Production $label changed during deployment. Restore from $BACKUP_TAR"
+    success "$label unchanged"
+}
+assert_unchanged "agent_state.json" "$APP_DIR/agent_state.json" "$STATE_HASH_BEFORE"
+assert_unchanged "llm_health.json" "$APP_DIR/llm_health.json" "$HEALTH_HASH_BEFORE"
+assert_unchanged "trade_log.jsonl" "$APP_DIR/trade_log.jsonl" "$TRADE_HASH_BEFORE"
+assert_unchanged "trading_agent.log" "$APP_DIR/trading_agent.log" "$LOG_HASH_BEFORE"
 
 # -----------------------------------------------------------------------------
 # Static/runtime validation BEFORE service restart
