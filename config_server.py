@@ -95,7 +95,7 @@ DEFAULT_CONFIG = {
     "OPENROUTER_API_KEY":   "",
     "OPENROUTER_BASE_URL":  "https://openrouter.ai/api/v1",
     "OPENROUTER_MODEL":     "openrouter/free",
-    "NVIDIA_LLAMA_MODEL":   "meta/llama-3.1-70b-instruct",
+    "NVIDIA_LLAMA_MODEL":   "nvidia/nemotron-3-super-120b-a12b",
     "NVIDIA_QWEN_MODEL":    "qwen/qwen3-235b-a22b",
     "NVIDIA_DEEPSEEK_MODEL": "deepseek-ai/deepseek-r1",
     "LLM_MODE":             "tiered",
@@ -103,6 +103,9 @@ DEFAULT_CONFIG = {
     "GROQ_QWEN_MODEL":      "qwen/qwen3.8-27b",
     "LLM_MODEL_NOT_FOUND_SUPPRESS_HOURS": "24",
     "LLM_RATE_LIMIT_COOLDOWN_MINUTES": "120",
+    "LLM_SHORT_RATE_LIMIT_CAP_SECONDS": "900",
+    "LLM_QUOTA_COOLDOWN_MINUTES": "60",
+    "LLM_BILLING_COOLDOWN_HOURS": "6",
     "GROWTH_ALLOCATION":    "0.45",
     "DIVIDEND_ALLOCATION":  "0.25",
     "SWING_ALLOCATION":     "0.20",
@@ -374,7 +377,11 @@ def _chat_completions_url(base: str) -> str:
 
 def test_nvidia(api_key: str) -> dict:
     base = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-    model = os.getenv("NVIDIA_LLAMA_MODEL", "meta/llama-3.1-70b-instruct")
+    try:
+        from llm_router import _resolved_nvidia_llama
+        model = _resolved_nvidia_llama()
+    except Exception:
+        model = os.getenv("NVIDIA_LLAMA_MODEL", "nvidia/nemotron-3-super-120b-a12b")
     return _test_chat_endpoint("nvidia", api_key, _chat_completions_url(base), model)
 
 

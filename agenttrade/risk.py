@@ -23,6 +23,12 @@ MAX_CONSECUTIVE_LOSSES = 5
 LLM_SIZING_KEYS = ("qty", "shares", "notional", "notional_usd", "position_size")
 
 
+def _reserved_open_buy(snapshot: Optional[dict]) -> float:
+    from account_sync import reserved_open_buy_notional
+
+    return reserved_open_buy_notional(snapshot)
+
+
 def _float(v, default=0.0) -> float:
     try:
         return float(v)
@@ -324,7 +330,7 @@ def prepare_buy_order(
     acct = account_snapshot.get("account") or account_snapshot
     equity = _float(acct.get("equity") or acct.get("portfolio_value"))
     cash = _float(acct.get("cash"))
-    open_buy = _float(account_snapshot.get("open_buy_notional"))
+    open_buy = _reserved_open_buy(account_snapshot)
     available_cash = max(cash - open_buy, 0) if not cfg.ALLOW_MARGIN else cash
 
     price = _float(decision.get("current_price") or decision.get("price"))
@@ -405,7 +411,7 @@ def evaluate_proposed_order(
     acct = account_snapshot.get("account") or account_snapshot
     equity = _float(acct.get("equity") or acct.get("portfolio_value"))
     cash = _float(acct.get("cash"))
-    open_buy = _float(account_snapshot.get("open_buy_notional"))
+    open_buy = _reserved_open_buy(account_snapshot)
     allow_margin = cfg.ALLOW_MARGIN
 
     price = _float(adj.get("current_price") or adj.get("price"))
@@ -489,7 +495,7 @@ class CycleRiskState:
             positions = list(positions)
 
         raw_cash = _float(acct.get("cash"))
-        open_buy = _float(snap.get("open_buy_notional"))
+        open_buy = _reserved_open_buy(snap)
         if cfg.ALLOW_MARGIN:
             buying_power = acct.get("buying_power")
             spendable = _float(buying_power, raw_cash) if buying_power not in (None, "") else raw_cash

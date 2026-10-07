@@ -55,6 +55,109 @@ def _order_notional(order: dict) -> float:
     return 0.0
 
 
+def _order_client_id(order: dict) -> str:
+    cid = str((order or {}).get("client_order_id") or "").strip()
+    if cid:
+        return cid
+    raw = (order or {}).get("raw_json")
+    if isinstance(raw, dict):
+        return str(raw.get("client_order_id") or "").strip()
+    if isinstance(raw, str) and raw.strip():
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+        if isinstance(loaded, dict):
+            return str(loaded.get("client_order_id") or "").strip()
+    return ""
+
+
+def _known_agenttrade_order_ids() -> set:
+    try:
+        from agenttrade import db as ledger
+        return {str(oid) for oid in ledger.agent_submitted_order_ids() if oid}
+    except Exception:
+        return set()
+
+
+def order_is_agenttrade(order: dict, owned_ids: Optional[set] = None) -> bool:
+    """True for a resting order AgentTrade submitted.
+
+    Ownership matches the daily-trade filter: ``agenttrade-`` client id,
+    a strategy name on the row, or a broker id recorded in the order ledger.
+    Another app's order on the shared Alpaca account is not ours.
+    """
+    if not isinstance(order, dict):
+        return False
+    from trading_day import client_order_id_is_ours
+
+    if client_order_id_is_ours(_order_client_id(order)):
+        return True
+    if str(order.get("strategy_name") or "").strip():
+        return True
+    oid = str(order.get("id") or order.get("alpaca_order_id") or "").strip()
+    owned = {str(item) for item in (owned_ids or set()) if item}
+    return bool(oid and oid in owned)
+
+
+def split_open_buy_notionals(open_orders, owned_ids: Optional[set] = None) -> tuple:
+    """Return (total, agenttrade, foreign) open-buy notional."""
+    agent = 0.0
+    foreign = 0.0
+    for order in open_orders or []:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("side", "")).lower() != "buy":
+            continue
+        notional = _order_notional(order)
+        if order_is_agenttrade(order, owned_ids):
+            agent += notional
+        else:
+            foreign += notional
+    total = agent + foreign
+    return round(total, 2), round(agent, 2), round(foreign, 2)
+
+
+def reserved_open_buy_notional(snapshot: Optional[dict]) -> float:
+    """Open-buy notional AgentTrade must keep reserved.
+
+    When the snapshot has classified orders, only AgentTrade's own buys count.
+    A snapshot that only has the combined ``open_buy_notional`` still reserves
+    that whole amount so older callers do not drop a real reservation.
+    """
+    if not isinstance(snapshot, dict):
+        return 0.0
+    if "agenttrade_open_buy_notional" in snapshot:
+        return _float(snapshot.get("agenttrade_open_buy_notional"))
+    return _float(snapshot.get("open_buy_notional"))
+
+
+def explain_equity_gap(equity: float, cash: float, positions_value: float, foreign_open_buy: float) -> dict:
+    """Separate a foreign open-buy hold from a real equity mismatch.
+
+    Alpaca ``cash`` is often already net of cash held for an open order, while
+    ``equity`` still includes that cash. The gap then equals the open-buy
+    notional. A foreign order on the shared account explains that gap and is
+    not an AgentTrade books error. A gap that remains after that explanation
+    still alarms.
+    """
+    raw_gap = round(float(equity) - (float(cash) + float(positions_value)), 2)
+    foreign = max(0.0, float(foreign_open_buy or 0))
+    explained = min(raw_gap, foreign) if raw_gap > 0 and foreign > 0 else 0.0
+    unexplained = round(raw_gap - explained, 2)
+    mismatch = abs(unexplained) > EQUITY_MISMATCH_THRESHOLD
+    return {
+        "equity_mismatch": mismatch,
+        "equity_mismatch_delta": unexplained,
+        "equity_mismatch_raw_delta": raw_gap,
+        "equity_gap_explained_by_foreign_open_buy": round(explained, 2),
+        "equity_mismatch_message": (
+            "Equity mismatch: dashboard state does not match Alpaca."
+            if mismatch else None
+        ),
+    }
+
+
 def _count_trades_today(fills: list, open_orders: list, now=None) -> int:
     """AgentTrade entries in the America/Chicago day.
 
@@ -86,12 +189,12 @@ def refresh_alpaca_snapshot() -> dict:
 
     open_positions_value = sum(_float(p.get("market_value")) for p in positions)
     computed_equity = cash + open_positions_value
-    mismatch_delta = round(equity - computed_equity, 2)
-    equity_mismatch = abs(mismatch_delta) > EQUITY_MISMATCH_THRESHOLD
-
-    open_buy_notional = sum(
-        _order_notional(o) for o in open_orders if str(o.get("side", "")).lower() == "buy"
+    open_buy_notional, agent_open_buy, foreign_open_buy = split_open_buy_notionals(
+        open_orders, _known_agenttrade_order_ids(),
     )
+    gap = explain_equity_gap(equity, cash, open_positions_value, foreign_open_buy)
+    equity_mismatch = gap["equity_mismatch"]
+    mismatch_delta = gap["equity_mismatch_delta"]
     open_sell_qty = sum(
         1 for o in open_orders if str(o.get("side", "")).lower() == "sell"
     )
@@ -118,11 +221,12 @@ def refresh_alpaca_snapshot() -> dict:
         "computed_equity": round(computed_equity, 2),
         "equity_mismatch": equity_mismatch,
         "equity_mismatch_delta": mismatch_delta,
-        "equity_mismatch_message": (
-            "Equity mismatch: dashboard state does not match Alpaca."
-            if equity_mismatch else None
-        ),
-        "open_buy_notional": round(open_buy_notional, 2),
+        "equity_mismatch_raw_delta": gap["equity_mismatch_raw_delta"],
+        "equity_gap_explained_by_foreign_open_buy": gap["equity_gap_explained_by_foreign_open_buy"],
+        "equity_mismatch_message": gap["equity_mismatch_message"],
+        "open_buy_notional": open_buy_notional,
+        "agenttrade_open_buy_notional": agent_open_buy,
+        "foreign_open_buy_notional": foreign_open_buy,
         "open_sell_orders": open_sell_qty,
         "positions": positions,
         "open_orders": open_orders,
@@ -146,8 +250,14 @@ def merge_snapshot_into_state(state: dict, snapshot: dict, *, source: str = "cyc
     state["computed_equity"] = snapshot.get("computed_equity")
     state["equity_mismatch"] = snapshot.get("equity_mismatch", False)
     state["equity_mismatch_delta"] = snapshot.get("equity_mismatch_delta")
+    state["equity_mismatch_raw_delta"] = snapshot.get("equity_mismatch_raw_delta")
+    state["equity_gap_explained_by_foreign_open_buy"] = snapshot.get(
+        "equity_gap_explained_by_foreign_open_buy"
+    )
     state["equity_mismatch_message"] = snapshot.get("equity_mismatch_message")
     state["open_buy_notional"] = snapshot.get("open_buy_notional")
+    state["agenttrade_open_buy_notional"] = snapshot.get("agenttrade_open_buy_notional")
+    state["foreign_open_buy_notional"] = snapshot.get("foreign_open_buy_notional")
     state["positions"] = snapshot.get("positions") or []
     state["open_orders"] = snapshot.get("open_orders") or []
     state["recent_fills"] = snapshot.get("recent_fills") or []

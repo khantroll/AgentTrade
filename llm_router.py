@@ -26,6 +26,7 @@ Environment keys:
 import os
 import json
 import logging
+import math
 import time
 import hashlib
 import re
@@ -93,7 +94,27 @@ DEEPSEEK_CHAT = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-chat")
 DEEPSEEK_REASONER = os.getenv("DEEPSEEK_REASONER_MODEL", "deepseek-reasoner")
 GROQ_LLAMA    = os.getenv("GROQ_LLAMA_MODEL",    "openai/gpt-oss-120b")
 GROQ_QWEN     = os.getenv("GROQ_QWEN_MODEL",     "qwen/qwen3.8-27b")  # JSON-object capable Groq default
-NVIDIA_LLAMA  = os.getenv("NVIDIA_LLAMA_MODEL",  "meta/llama-3.1-70b-instruct")
+# meta/llama-3.1-70b-instruct has been HTTP 410 on the hosted NIM API since
+# 2026-08-26. A saved config that still names it is rewritten to the default
+# below. Set NVIDIA_LLAMA_MODEL to a different current id to override.
+_RETIRED_NVIDIA_LLAMA_MODELS = {"meta/llama-3.1-70b-instruct"}
+_DEFAULT_NVIDIA_LLAMA = "nvidia/nemotron-3-super-120b-a12b"
+
+
+def _resolved_nvidia_llama() -> str:
+    raw = (os.getenv("NVIDIA_LLAMA_MODEL") or _DEFAULT_NVIDIA_LLAMA).strip()
+    if raw in _RETIRED_NVIDIA_LLAMA_MODELS:
+        log.warning(
+            "[LLM] NVIDIA_LLAMA_MODEL=%s is retired (HTTP 410 / EOL). "
+            "Using %s. Set NVIDIA_LLAMA_MODEL to a current model id to override.",
+            raw,
+            _DEFAULT_NVIDIA_LLAMA,
+        )
+        return _DEFAULT_NVIDIA_LLAMA
+    return raw or _DEFAULT_NVIDIA_LLAMA
+
+
+NVIDIA_LLAMA  = _resolved_nvidia_llama()
 NVIDIA_QWEN   = os.getenv("NVIDIA_QWEN_MODEL",   "qwen/qwen3-235b-a22b")
 NVIDIA_DEEPSEEK = os.getenv("NVIDIA_DEEPSEEK_MODEL", "deepseek-ai/deepseek-r1")
 
@@ -325,7 +346,11 @@ def model_not_found_suppress_seconds() -> int:
 
 
 def rate_limit_cooldown_seconds() -> int:
-    """How long a 429 backs off a provider before the next tier is worth retrying."""
+    """Long bench for an unspecified HTTP 429 (no short provider wait).
+
+    Mistral-style "rate limit exceeded" with no Retry-After uses this.
+    A Groq TPM hint of a few seconds does not. Default 120 minutes.
+    """
     raw = os.getenv("LLM_RATE_LIMIT_COOLDOWN_MINUTES", "120")
     try:
         minutes = float(raw)
@@ -334,6 +359,122 @@ def rate_limit_cooldown_seconds() -> int:
     if minutes < 1:
         minutes = 120.0
     return int(minutes * 60)
+
+
+def short_rate_limit_cap_seconds() -> int:
+    """Ceiling for a provider-suggested wait on a brief TPM / Retry-After.
+
+    Default 15 minutes. A "try again in 5s" hint stays near 5 seconds.
+    It is never promoted to ``LLM_RATE_LIMIT_COOLDOWN_MINUTES``.
+    """
+    raw = os.getenv("LLM_SHORT_RATE_LIMIT_CAP_SECONDS", "900")
+    try:
+        seconds = int(float(raw))
+    except (TypeError, ValueError):
+        seconds = 900
+    if seconds < 1:
+        seconds = 900
+    return seconds
+
+
+def quota_cooldown_seconds() -> int:
+    """Bench for an HTTP 429 that is really a quota or billing-plan limit.
+
+    Gemini's "check your plan and billing details" 429 is this case.
+    It is not a 24-hour outage and not a 5-second TPM pause. Default 60 minutes.
+    """
+    raw = os.getenv("LLM_QUOTA_COOLDOWN_MINUTES", "60")
+    try:
+        minutes = float(raw)
+    except (TypeError, ValueError):
+        minutes = 60.0
+    if minutes < 1:
+        minutes = 60.0
+    return int(minutes * 60)
+
+
+def billing_cooldown_seconds() -> int:
+    """Bench for a hard billing failure that is not an HTTP 429.
+
+    HTTP 402, insufficient balance, or a billing-disabled account. Long enough
+    that a cycle does not hammer the API, short of the old 24-hour blackout
+    so a later cycle the same day can try the provider again. Default 6 hours.
+    """
+    raw = os.getenv("LLM_BILLING_COOLDOWN_HOURS", "6")
+    try:
+        hours = float(raw)
+    except (TypeError, ValueError):
+        hours = 6.0
+    if hours <= 0:
+        hours = 6.0
+    return int(hours * 3600)
+
+
+_RETRY_WAIT_RE = re.compile(
+    r"(?:retry-after|try again in|please retry in|retry after)"
+    r"\s*[:=]?\s*(\d+(?:\.\d+)?)\s*"
+    r"(ms|milliseconds|s|sec|secs|seconds|m|min|mins|minutes)?",
+    re.IGNORECASE,
+)
+
+
+def _suggested_retry_seconds(err: Exception) -> Optional[float]:
+    """Seconds the provider asked us to wait, from the body or a Retry-After note."""
+    match = _RETRY_WAIT_RE.search(str(err or ""))
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    unit = (match.group(2) or "s").lower()
+    if unit.startswith("ms"):
+        return value / 1000.0
+    if unit.startswith("m"):
+        return value * 60.0
+    return value
+
+
+def _is_quota_billing_429(err: Exception) -> bool:
+    """429 whose text is a quota or plan/billing limit, not a few-second TPM pause."""
+    if not _is_rate_limited_error(err):
+        return False
+    msg = str(err).lower()
+    markers = (
+        "billing",
+        "quota",
+        "resource_exhausted",
+        "resource exhausted",
+        "exceeded your current quota",
+        "plan and billing",
+    )
+    return any(marker in msg for marker in markers)
+
+
+def _is_tpm_limit(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "tokens per minute" in msg or "tpm" in msg
+
+
+def _rate_limit_backoff(err: Exception) -> tuple[int, str]:
+    """Pick a cooldown for a 429. Brief TPM waits stay brief."""
+    suggested = _suggested_retry_seconds(err)
+    cap = short_rate_limit_cap_seconds()
+    if suggested is not None and suggested <= cap:
+        return max(1, int(math.ceil(suggested))), "short rate-limit (provider wait)"
+    if _is_quota_billing_429(err):
+        return quota_cooldown_seconds(), "quota/billing 429"
+    if _is_tpm_limit(err):
+        seconds = 60 if suggested is None else max(1, int(math.ceil(suggested)))
+        return min(seconds, cap), "short TPM rate-limit"
+    if suggested is not None:
+        return (
+            min(max(1, int(math.ceil(suggested))), rate_limit_cooldown_seconds()),
+            "rate-limit (Retry-After)",
+        )
+    return rate_limit_cooldown_seconds(), "rate-limit (429)"
 
 
 def _model_key(provider: str, model: str) -> str:
@@ -430,25 +571,73 @@ def _is_rate_limited_error(err: Exception) -> bool:
     )
 
 
+def _is_model_retired_error(err: Exception) -> bool:
+    """HTTP 410 / end-of-life. The model id is wrong; retrying soon will not help."""
+    msg = str(err).lower()
+    if "http 410" in msg or " 410:" in msg or "status 410" in msg or "410 gone" in msg:
+        return True
+    if "end of life" in msg or "end-of-life" in msg:
+        return True
+    if "retired" in msg and "model" in msg:
+        return True
+    return False
+
+
+def _is_hard_billing_error(err: Exception) -> bool:
+    """Payment failure that is not a 429. A quota 429 that mentions billing is separate."""
+    msg = str(err).lower()
+    if "429" in msg or "too many requests" in msg:
+        return False
+    if "402" in msg or "payment required" in msg:
+        return True
+    if "insufficient balance" in msg or "credit balance" in msg:
+        return True
+    if "billing" in msg or "payment" in msg:
+        return True
+    return False
+
+
 def _classify_cooldown(provider: str, err: Exception, model: str = ""):
     if model and _is_model_not_found_error(err):
         _suppress_model(provider, model, model_not_found_suppress_seconds(), "model-not-found")
         return
+    if _is_model_retired_error(err):
+        if model:
+            _suppress_model(provider, model, model_not_found_suppress_seconds(), "model-retired")
+        log.error(
+            "[LLM] %s/%s is a config error (HTTP 410 or end of life), not a short outage. "
+            "The provider is not on a retry cooldown. Set NVIDIA_LLAMA_MODEL "
+            "(or the matching model env) to a current id.",
+            provider,
+            model or "?",
+        )
+        return
     msg = str(err).lower()
     if "401" in msg or "authentication" in msg or "invalid x-api-key" in msg or "invalid api key" in msg:
         _cooldown_provider(provider, 24*3600, "auth/key error")
-    elif "insufficient balance" in msg or "payment" in msg or "billing" in msg:
-        _cooldown_provider(provider, 24*3600, "billing/balance error")
-    elif _is_rate_limited_error(err):
-        seconds = rate_limit_cooldown_seconds()
-        _cooldown_provider(provider, seconds, "rate-limit (429)")
+    elif _is_hard_billing_error(err):
+        seconds = billing_cooldown_seconds()
+        _cooldown_provider(provider, seconds, "billing/balance error")
         log.warning(
-            "[LLM] %s rate-limited — backing off %.0f min and skipping to the next tier.",
+            "[LLM] %s billing failure — backing off %.1f h. This is not a short rate limit.",
             provider,
-            seconds / 60,
+            seconds / 3600,
+        )
+    elif _is_rate_limited_error(err):
+        seconds, reason = _rate_limit_backoff(err)
+        _cooldown_provider(provider, seconds, reason)
+        log.warning(
+            "[LLM] %s rate-limited — backing off %.0fs (%s) and skipping to the next tier.",
+            provider,
+            seconds,
+            reason,
         )
     elif "capacity" in msg or "tokens per minute" in msg or "request too large" in msg:
-        _cooldown_provider(provider, 20*60, "rate/capacity/token-limit error")
+        if _is_tpm_limit(err) and "request too large" not in msg:
+            seconds, reason = _rate_limit_backoff(err)
+            _cooldown_provider(provider, seconds, reason)
+        else:
+            _cooldown_provider(provider, 20*60, "rate/capacity/token-limit error")
     elif "503" in msg or "unavailable" in msg or "high demand" in msg:
         _cooldown_provider(provider, 7*60, "temporary provider outage")
     else:
@@ -1358,8 +1547,22 @@ def _json_mode_rejected(body: str) -> bool:
     return any(marker in low for marker in markers)
 
 
+def _reasoning_text(message: dict) -> str:
+    parts = []
+    for key in ("reasoning", "reasoning_content"):
+        extra = message.get(key)
+        if isinstance(extra, str) and extra.strip():
+            parts.append(extra.strip())
+    return "\n".join(parts)
+
+
 def _message_text(data: dict) -> str:
-    """Assistant text. A separate reasoning field is used only when content is empty."""
+    """Assistant text, including JSON embedded in a reasoning field.
+
+    Content wins when it already parses as research or analysis. Otherwise the
+    reasoning trace is appended. gpt-oss often leaves prose in ``content`` and
+    the decision object in ``reasoning``. Dropping that field was an invalid parse.
+    """
     try:
         message = (data.get("choices") or [{}])[0].get("message") or {}
     except (AttributeError, IndexError, TypeError):
@@ -1373,13 +1576,42 @@ def _message_text(data: dict) -> str:
             for part in content
         )
     text = str(content or "")
+    reasoning = _reasoning_text(message)
+    if text.strip() and reasoning:
+        if _text_has_usable_payload(text):
+            return text
+        return text.rstrip() + "\n" + reasoning
     if text.strip():
         return text
-    for key in ("reasoning", "reasoning_content"):
-        extra = message.get(key)
-        if isinstance(extra, str) and extra.strip():
-            return extra
-    return text
+    return reasoning or text
+
+
+def _adjust_chat_payload(provider: str, model: str, payload: dict) -> dict:
+    """Give Groq gpt-oss enough completion budget to finish a JSON decision.
+
+    ``max_tokens`` of ~120 is spent on the reasoning trace, so the decision
+    object never arrives. ``reasoning_format`` is not sent: gpt-oss rejects it.
+    """
+    out = dict(payload)
+    if provider == "groq" and "gpt-oss" in (model or "").lower():
+        budget = max(int(out.get("max_tokens") or 0), 1024)
+        out["max_tokens"] = budget
+        out["max_completion_tokens"] = budget
+        out["reasoning_effort"] = "low"
+        out["include_reasoning"] = True
+    return out
+
+
+def _http_error_message(provider: str, response) -> str:
+    headers = getattr(response, "headers", None) or {}
+    retry_after = ""
+    try:
+        retry_after = headers.get("Retry-After") or headers.get("retry-after") or ""
+    except Exception:
+        retry_after = ""
+    body = (getattr(response, "text", None) or "")[:800]
+    suffix = f" Retry-After: {retry_after}" if str(retry_after).strip() else ""
+    return f"{provider} HTTP {response.status_code}: {body}{suffix}"
 
 
 def _recovered_llm_text(draft: str) -> bool:
@@ -1413,15 +1645,22 @@ def _call_chat_endpoint(provider: str, model: str, prompt: str, max_tokens: int,
                         url: str, api_key: str) -> str:
     if not api_key:
         raise RuntimeError(f"{provider.upper()}_API_KEY not set")
-    payload = {
+    payload = _adjust_chat_payload(provider, model, {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
-    }
+    })
 
     def _reject(response) -> None:
-        raise RuntimeError(f"{provider} HTTP {response.status_code}: {response.text[:300]}")
+        raise RuntimeError(_http_error_message(provider, response))
+
+    def _body_text(response) -> str:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        return _message_text(data if isinstance(data, dict) else {})
 
     r = _post_chat(url, api_key, payload)
     # A 429 is a backoff, not a prompt-format problem. Do not immediately POST again.
@@ -1430,11 +1669,31 @@ def _call_chat_endpoint(provider: str, model: str, prompt: str, max_tokens: int,
 
     text = None
     if r.status_code < 400:
-        try:
-            data = r.json()
-        except ValueError:
-            data = {}
-        text = _message_text(data if isinstance(data, dict) else {})
+        text = _body_text(r)
+        # HTTP 200 can still be a JSON-mode refusal: reasoning prose in content,
+        # decision object missing. One plain retry. Unusable output stays unusable.
+        if payload.get("response_format") and not _recovered_llm_text(text or ""):
+            log.info(
+                "[LLM] %s JSON-mode body had no schema-valid object; retrying once without response_format.",
+                provider,
+            )
+            r = _post_chat(url, api_key, _payload_without_json_mode(payload))
+            if r.status_code == 429:
+                _reject(r)
+            if r.status_code < 400:
+                text2 = _body_text(r)
+                if _recovered_llm_text(text2 or ""):
+                    text = text2
+                elif (text2 or "").strip():
+                    text = ((text or "").rstrip() + "\n" + text2).strip()
+            else:
+                draft = _failed_generation_text(r.text)
+                if _recovered_llm_text(draft):
+                    log.info(
+                        "[LLM] %s plain retry was rejected; recovered a parseable draft from the error body.",
+                        provider,
+                    )
+                    text = draft
     elif payload.get("response_format") and _json_mode_rejected(r.text):
         draft = _failed_generation_text(r.text)
         if _recovered_llm_text(draft):
@@ -1492,7 +1751,7 @@ def _call_gemini(model: str, prompt: str, max_tokens: int = 600, agent_tag: str 
     }
     r = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=45)
     if r.status_code >= 400:
-        raise RuntimeError(f"gemini HTTP {r.status_code}: {r.text[:300]}")
+        raise RuntimeError(_http_error_message("gemini", r))
     data = r.json()
     text = ""
     candidates = data.get("candidates") or []
@@ -1888,9 +2147,9 @@ def _prepare_llm_json_text(text: str) -> str:
     return _strip_llm_preamble(_strip_code_fences(_strip_llm_preamble(cleaned)))
 
 
-def _extract_balanced_json(text: str) -> str:
+def _extract_balanced_json(text: str, *, prepare: bool = True) -> str:
     """Extract the first balanced JSON object or array from a messy LLM response."""
-    s = _prepare_llm_json_text(text)
+    s = _prepare_llm_json_text(text) if prepare else (text or "").strip()
     start_positions = [i for i in (s.find("{"), s.find("[")) if i >= 0]
     if not start_positions:
         return s
@@ -1927,12 +2186,16 @@ def _repair_json_text(clean: str) -> str:
 
 
 def _scan_top_level_json(text: str) -> list:
-    """Decode successive top-level JSON values. Do not walk into a broken value."""
+    """Decode successive top-level JSON values.
+
+    A prose ``{`` that is not JSON used to stop the scan, hiding a later
+    decision object. Skip that start and keep looking.
+    """
     decoder = json.JSONDecoder()
     found = []
     idx = 0
     s = text or ""
-    while True:
+    while idx < len(s):
         while idx < len(s) and s[idx] not in "{[":
             idx += 1
         if idx >= len(s):
@@ -1940,7 +2203,8 @@ def _scan_top_level_json(text: str) -> list:
         try:
             obj, end = decoder.raw_decode(s, idx)
         except json.JSONDecodeError:
-            break
+            idx += 1
+            continue
         found.append(obj)
         idx = end
     return found
@@ -2037,7 +2301,7 @@ def _should_salvage_research(text: str, parsed) -> bool:
 
 
 _ANALYSIS_ACTION_RE = re.compile(
-    r'"(?:decision|action)"\s*:\s*"(BUY|SELL|HOLD|SKIP)"',
+    r"""["'](?:decision|action)["']\s*:\s*["'](BUY|SELL|HOLD|SKIP)["']""",
     re.IGNORECASE,
 )
 
@@ -2074,6 +2338,21 @@ def _should_salvage_analysis(text: str, parsed) -> bool:
     return bool(_ANALYSIS_ACTION_RE.search(text or ""))
 
 
+def _text_has_usable_payload(text: str) -> bool:
+    """True when text already contains a research or analysis object. Does not log."""
+    if not (text or "").strip():
+        return False
+    parsed = _payload_from_fragment(_prepare_llm_json_text(text))
+    if not _parsed_payload_is_usable(parsed):
+        parsed = _payload_from_fragment(text)
+    if _parsed_payload_is_usable(parsed):
+        return True
+    if _should_salvage_analysis(text, parsed):
+        salvaged = _salvage_analysis_json(text)
+        return bool(salvaged and _analysis_payload_is_valid(salvaged))
+    return False
+
+
 def _parse_json(text: str):
     """Parse an LLM reply. Clean JSON is unchanged; preambles and fences are stripped first.
 
@@ -2082,10 +2361,20 @@ def _parse_json(text: str):
     present, and `_salvage_research_json` pulls ticker/reason pairs otherwise.
     The same salvage runs when parse succeeds but the object is not a usable
     research or analysis payload.
+
+    JSON inside a reasoning trace is kept. Stripping ``<think>`` must not throw
+    away a decision object that lives only in that trace. Prose with no
+    decision still returns None so analysis can fail closed.
     """
     if not text:
         return None
     parsed = _payload_from_fragment(_prepare_llm_json_text(text))
+    if not _parsed_payload_is_usable(parsed):
+        raw_parsed = _payload_from_fragment(text)
+        if _parsed_payload_is_usable(raw_parsed) or (
+            not isinstance(parsed, dict) and isinstance(raw_parsed, dict)
+        ):
+            parsed = raw_parsed
     if not isinstance(parsed, dict):
         repaired = _repair_json_text(_extract_balanced_json(text))
         try:
@@ -2093,6 +2382,14 @@ def _parse_json(text: str):
         except Exception as e:
             log.error("[LLM] JSON parse failed: %s | text[:150]: %r", e, (text or "")[:150])
             parsed = None
+        if not _parsed_payload_is_usable(parsed):
+            raw_repaired = _repair_json_text(_extract_balanced_json(text, prepare=False))
+            try:
+                raw_parsed = _payload_from_fragment(raw_repaired)
+            except Exception:
+                raw_parsed = None
+            if _parsed_payload_is_usable(raw_parsed):
+                parsed = raw_parsed
     if _parsed_payload_is_usable(parsed):
         return parsed
     if _should_salvage_analysis(text, parsed):

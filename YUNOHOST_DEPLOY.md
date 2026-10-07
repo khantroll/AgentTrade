@@ -109,6 +109,8 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_MODEL=openrouter/free
 NVIDIA_API_KEY=
 NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+# Override if you do not want the built-in current NIM model.
+NVIDIA_LLAMA_MODEL=nvidia/nemotron-3-super-120b-a12b
 LLM_TIERED_AUTO_FAILOVER=1
 ```
 
