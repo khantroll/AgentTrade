@@ -28,6 +28,7 @@ import logging
 
 import agent_config as cfg
 from account_sync import reserved_open_buy_notional
+from buy_lock import is_buy_locked
 from agenttrade import db as ledger
 from agenttrade.risk import CycleRiskState, quote_buy_notional, _is_cash_block
 from buckets import Bucket
@@ -148,8 +149,11 @@ def risk_agent(
     """Five-brake risk gate (bucket guardrails; executable sizing is Tier 2)."""
     log.info("[%s/Risk] %d decisions (aggression=%s)", bucket.name, len(decisions), cfg.STRATEGY_AGGRESSION)
 
-    if buy_lock and buy_lock.get("active"):
-        log.warning("[%s/Risk] BUY blocked: recent sell cooldown active", bucket.name)
+    # A symbol lock blocks only that name (SOLUSD and SOL/USD match).
+    # It must not reject the rest of the book. BUYING_ENABLED=false is
+    # still a global block, handled below.
+    if buy_lock and buy_lock.get("scope") == "global" and buy_lock.get("active"):
+        log.warning("[%s/Risk] BUY blocked: %s", bucket.name, buy_lock.get("message") or "buy lock")
         return []
 
     if ledger.trading_paused():
@@ -244,6 +248,17 @@ def risk_agent(
         action = str(d.get("action") or d.get("decision", "SKIP")).upper()
         price = float(d.get("current_price") or d.get("price") or 0)
         if action != "BUY" or price <= 0:
+            continue
+
+        locked, lock_reason, _lock = is_buy_locked(
+            symbol=ticker,
+            asset_class=getattr(bucket, "asset_class", None),
+            bucket=bucket.name,
+            buy_lock=buy_lock,
+        )
+        if locked:
+            d["blocked_reason"] = f"symbol_lock:{lock_reason}"
+            log.info("[%s/Risk] %s blocked: %s", bucket.name, ticker, d["blocked_reason"])
             continue
 
         if buys_this_cycle >= cfg.MAX_BUYS_PER_BUCKET:

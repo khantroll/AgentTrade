@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # =============================================================================
 # update_deploy.sh â€” AgentTrade incremental update (SQLite ledger + reconciliation)
 # =============================================================================
@@ -75,9 +75,11 @@ Options:
   -h, --help          Show this help
 
 The plain command is: sudo bash update_deploy.sh -y
-It copies code onto the app dir, skips same-file copies, and does not import
-agent_state.json into an existing SQLite ledger. Runtime files (.env, sqlite,
-llm_health.json, agent_state.json, logs, trade logs) are never overwritten.
+It copies the repository file set onto the app dir, skips same-file copies,
+and does not import agent_state.json into an existing SQLite ledger. Runtime
+files (.env, sqlite, llm_health.json, agent_state.json, logs, trade logs,
+config.json) are never overwritten. After the copy, every application module
+is imported. A failed import rolls the copy back and exits non-zero.
 EOF
 }
 
@@ -106,6 +108,23 @@ done
 if [[ -n "$SOURCE_DIR" ]]; then
     [[ -d "$SOURCE_DIR" ]] || error "Source dir not found: $SOURCE_DIR"
     SRC="$(cd "$SOURCE_DIR" && pwd)"
+fi
+
+# The file set is the git index, or a walk of the same kinds of files when
+# this tree was copied without .git. Runtime state is excluded by
+# deploy_manifest.py and again by is_runtime_rel below.
+if [[ ! -f "$SRC/deploy_manifest.py" ]]; then
+    error "Missing deploy_manifest.py in $SRC — sync the repo first"
+fi
+DEPLOY_LIST_FILE="$(mktemp)"
+if ! python3 "$SRC/deploy_manifest.py" --list --root "$SRC" >"$DEPLOY_LIST_FILE"; then
+    rm -f "$DEPLOY_LIST_FILE"
+    error "Could not build the deploy file list from $SRC"
+fi
+mapfile -t DEPLOY_FILES < "$DEPLOY_LIST_FILE"
+rm -f "$DEPLOY_LIST_FILE"
+if [[ "${#DEPLOY_FILES[@]}" -eq 0 ]]; then
+    error "Deploy file list is empty ($SRC)"
 fi
 
 prompt() {
@@ -138,34 +157,8 @@ confirm() {
     [[ "$reply" =~ ^[Yy] ]]
 }
 
-# â”€â”€ Files touched by SQLite ledger + reconciliation update â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-UPDATE_PY=(
-    agent.py agent_config.py alpaca_client.py cycle.py config_server.py
-    account_sync.py buy_guard.py buy_lock.py order_utils.py
-    buckets.py margin_correction.py
-    confidence_engine.py signal_attribution.py agreement_engine.py signal_performance.py
-    screener.py screener_cache.py
-)
-UPDATE_AGENTS=(
-    agents/execution.py agents/risk.py agents/position_review.py
-    agents/research.py agents/analysis.py
-)
-UPDATE_AGENTTRADE=(
-    agenttrade/__init__.py agenttrade/__main__.py agenttrade/db.py
-    agenttrade/reconciliation.py agenttrade/risk.py agenttrade/migrate_state.py
-    agenttrade/publish.py agenttrade/recording.py agenttrade/verify_ledger.py
-    agenttrade/buy_guard.py agenttrade/indicators.py agenttrade/reset_pause.py
-    agenttrade/backtest.py agenttrade/replay.py agenttrade/compare_modes.py
-    agenttrade/performance.py agenttrade/signal_report.py agenttrade/walk_forward.py
-    agenttrade/strategy_modes.py
-    agenttrade/ledger.py agenttrade/rebuild_ledger.py
-)
-UPDATE_WEB=(
-    dashboard.html
-)
-UPDATE_SCRIPTS=(
-    update_deploy.sh verify_ledger_deploy.sh write_deploy_sha.sh
-)
+# Application files come from DEPLOY_FILES (deploy_manifest.py), not a
+# hard-coded copy list. ENV_KEYS are appended to an existing .env only.
 ENV_KEYS=(
     AGENTTRADE_DB_PATH
     MAX_RISK_PER_TRADE_PCT
@@ -205,7 +198,7 @@ fi
 # â”€â”€ Preflight â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 section "Preflight checks"
 MISSING=0
-for f in "${UPDATE_PY[@]}" "${UPDATE_AGENTS[@]}" "${UPDATE_AGENTTRADE[@]}"; do
+for f in "${DEPLOY_FILES[@]}"; do
     if [[ ! -f "$SRC/$f" ]]; then
         warn "Missing in source: $f"
         MISSING=$((MISSING + 1))
@@ -220,7 +213,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     if [[ "$IN_PLACE" -eq 1 ]]; then
         info "In-place: source and app dir are the same; file copies will be skipped"
     else
-        info "Would copy code files from the source tree into the app dir"
+        info "Would copy ${#DEPLOY_FILES[@]} files from the repository file list into the app dir"
     fi
     info "Runtime files are never overwritten: .env, agenttrade.sqlite3, llm_health.json, agent_state.json, token_usage.json, config.json, bucket_tags.json, trade_log.jsonl, performance_history.jsonl, *.log"
     if [[ "$RUN_MIGRATE" -eq 1 ]]; then
@@ -291,7 +284,7 @@ backup_if_exists() {
     fi
 }
 
-for f in "${UPDATE_PY[@]}" "${UPDATE_AGENTS[@]}" "${UPDATE_AGENTTRADE[@]}"; do
+for f in "${DEPLOY_FILES[@]}"; do
     backup_if_exists "$f"
 done
 [[ -f "$APP_DIR/.env" ]] && cp -a "$APP_DIR/.env" "$BACKUP_DIR/.env"
@@ -344,31 +337,80 @@ copy_file() {
     info "  ✓ $rel"
 }
 
-for f in "${UPDATE_PY[@]}"; do copy_file "$f"; done
-for f in "${UPDATE_AGENTS[@]}"; do copy_file "$f"; done
-for f in "${UPDATE_AGENTTRADE[@]}"; do copy_file "$f"; done
-for f in "${UPDATE_SCRIPTS[@]}"; do
-    [[ -f "$SRC/$f" ]] && copy_file "$f" && chmod +x "$APP_DIR/$f" 2>/dev/null || true
+NEW_FILES=()
+for f in "${DEPLOY_FILES[@]}"; do
+    if [[ ! -e "$APP_DIR/$f" ]]; then
+        NEW_FILES+=("$f")
+    fi
 done
 
-if [[ -f "$SRC/requirements.txt" ]]; then
-    copy_file "requirements.txt"
-fi
+rollback_deploy() {
+    warn "Import smoke failed — restoring the previous app files"
+    if [[ -d "${BACKUP_DIR:-}" ]]; then
+        while IFS= read -r -d '' backed; do
+            local rel="${backed#./}"
+            mkdir -p "$APP_DIR/$(dirname "$rel")"
+            cp -a "$BACKUP_DIR/$rel" "$APP_DIR/$rel"
+        done < <(cd "$BACKUP_DIR" && find . -type f -print0)
+    fi
+    if [[ "${#NEW_FILES[@]}" -gt 0 ]]; then
+        local rel
+        for rel in "${NEW_FILES[@]}"; do
+            rm -f "$APP_DIR/$rel"
+        done
+    fi
+}
 
-if [[ "$LOCAL_ONLY" -eq 0 && -d "$WEB_DIR" && -f "$SRC/dashboard.html" ]]; then
-    cp "$SRC/dashboard.html" "$WEB_DIR/index.html"
+for f in "${DEPLOY_FILES[@]}"; do
+    copy_file "$f"
+    if [[ "$f" == *.sh ]]; then
+        chmod +x "$APP_DIR/$f" 2>/dev/null || true
+    fi
+done
+
+success "Files deployed"
+
+# Import every application module before publishing the dashboard or
+# exiting 0. A stale trading_day.py or market_data.py fails here.
+section "Import verification"
+SMOKE_PY="$PY"
+if [[ ! -x "$SMOKE_PY" ]]; then
+    SMOKE_PY="python3"
+fi
+SMOKE_DB="$(mktemp)"
+set +e
+PYTHONDONTWRITEBYTECODE=1 AGENTTRADE_DB_PATH="$SMOKE_DB" PYTHONPATH="" \
+    "$SMOKE_PY" "$APP_DIR/deploy_manifest.py" --import-smoke --root "$APP_DIR"
+SMOKE_RC=$?
+set -e
+rm -f "$SMOKE_DB"
+if [[ "$SMOKE_RC" -ne 0 ]]; then
+    rollback_deploy
+    error "Import smoke failed — deploy rolled back. Fix the source tree and re-run."
+fi
+success "Import smoke passed"
+
+if [[ "$LOCAL_ONLY" -eq 0 && -d "$WEB_DIR" && -f "$APP_DIR/dashboard.html" ]]; then
+    cp "$APP_DIR/dashboard.html" "$WEB_DIR/index.html"
     chmod 644 "$WEB_DIR/index.html" 2>/dev/null || true
-    success "dashboard.html â†’ $WEB_DIR/index.html"
-    # Deploy JS modules (required since 2026-06-25 refactor)
-    if [[ -d "$SRC/js" ]]; then
+    success "dashboard.html → $WEB_DIR/index.html"
+    if [[ -f "$APP_DIR/settings.html" ]]; then
+        cp "$APP_DIR/settings.html" "$WEB_DIR/settings.html"
+        chmod 644 "$WEB_DIR/settings.html" 2>/dev/null || true
+        success "settings.html → $WEB_DIR/settings.html"
+    fi
+    if [[ -f "$APP_DIR/api.php" ]]; then
+        cp "$APP_DIR/api.php" "$WEB_DIR/api.php"
+        chmod 644 "$WEB_DIR/api.php" 2>/dev/null || true
+        success "api.php → $WEB_DIR/api.php"
+    fi
+    if [[ -d "$APP_DIR/js" ]]; then
         mkdir -p "$WEB_DIR/js"
-        cp "$SRC/js"/at-*.js "$WEB_DIR/js/"
+        cp "$APP_DIR/js"/at-*.js "$WEB_DIR/js/"
         chmod 644 "$WEB_DIR/js"/at-*.js 2>/dev/null || true
         success "js/at-*.js → $WEB_DIR/js/"
     fi
 fi
-
-success "Files deployed"
 
 # One commit, both filenames. Do not hand-edit only one of them.
 if [[ -f "$APP_DIR/write_deploy_sha.sh" ]]; then
@@ -381,32 +423,6 @@ fi
 if [[ "$LOCAL_ONLY" -eq 0 && -d "$WEB_DIR" && -f "$APP_DIR/DEPLOY_SHA.txt" ]]; then
     cp "$APP_DIR/DEPLOY_SHA.txt" "$WEB_DIR/DEPLOY_SHA.txt"
     cp "$APP_DIR/DEPLOY_SHA.txt" "$WEB_DIR/DEPLOY_SHA"
-fi
-
-# Verify critical modules import from deployed app dir
-section "Import verification"
-IMPORT_FAIL=0
-DEPLOY_IMPORTS=(
-    confidence_engine
-    signal_attribution
-    signal_performance
-    agreement_engine
-    screener
-    cycle
-)
-cd "$APP_DIR"
-for mod in "${DEPLOY_IMPORTS[@]}"; do
-    if "$PY" -c "import ${mod}" 2>/dev/null; then
-        info "  import ok: ${mod}"
-    else
-        warn "  import FAILED: ${mod}"
-        IMPORT_FAIL=$((IMPORT_FAIL + 1))
-    fi
-done
-if [[ "$IMPORT_FAIL" -gt 0 ]]; then
-    warn "$IMPORT_FAIL module(s) failed import check — cycle may crash until files are synced"
-else
-    success "All deploy-critical modules import successfully"
 fi
 
 # â”€â”€ Merge .env keys â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

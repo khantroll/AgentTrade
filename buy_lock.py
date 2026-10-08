@@ -58,6 +58,120 @@ _LOCK_PERSIST_KEYS = (
 )
 
 
+def _symbol_forms(symbol: str) -> set[str]:
+    """``SOL``, ``SOLUSD``, and ``SOL/USD`` are one pair for cooldown matching."""
+    try:
+        from order_utils import _CRYPTO_USD_BASES, crypto_symbol_forms
+        forms = crypto_symbol_forms(symbol)
+    except Exception:
+        _CRYPTO_USD_BASES = frozenset()
+        forms = []
+    found = {str(item).upper() for item in forms if item}
+    text = "".join(str(symbol or "").upper().split())
+    if text:
+        found.add(text)
+    bare = text.replace("/", "")
+    if bare.endswith("USD") and len(bare) > 3:
+        found.add(bare[:-3])
+    elif text in _CRYPTO_USD_BASES:
+        found.add(f"{text}USD")
+        found.add(f"{text}/USD")
+    return {item for item in found if item}
+
+
+def symbols_match(left: str, right: str) -> bool:
+    return bool(_symbol_forms(left) & _symbol_forms(right))
+
+
+def sell_fill_is_agenttrade(fill: dict) -> bool:
+    """True when this sell was submitted by AgentTrade, including a manual close.
+
+    ``agenttrade-`` and ``agenttrade-manual-`` are ours. A CryptoAgent or
+    operator order on the shared account is not, and must not start a cooldown.
+    """
+    cid = str(fill.get("client_order_id") or "").strip()
+    if not cid:
+        raw = fill.get("raw_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                raw = {}
+        if isinstance(raw, dict):
+            cid = str(raw.get("client_order_id") or "").strip()
+    if cid.startswith("agenttrade-"):
+        return True
+    oid = str(fill.get("order_id") or fill.get("alpaca_order_id") or "").strip()
+    if not oid:
+        return False
+    try:
+        from agenttrade.db import get_connection
+
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT client_order_id FROM orders WHERE alpaca_order_id=? LIMIT 1",
+                (oid,),
+            ).fetchone()
+    except Exception:
+        return False
+    return bool(row and str(row["client_order_id"] or "").startswith("agenttrade-"))
+
+
+def symbol_has_agenttrade_order(symbol: str) -> bool:
+    """True when the ledger has an AgentTrade order for this symbol.
+
+    Used to drop cooldown locks that were created from a foreign fill.
+    A manual ``agenttrade-manual-`` close counts, so that symbol stays locked.
+    """
+    forms = _symbol_forms(symbol)
+    if not forms:
+        return False
+    try:
+        from agenttrade.db import get_connection
+
+        with get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, client_order_id FROM orders
+                WHERE client_order_id IS NOT NULL
+                  AND client_order_id LIKE 'agenttrade-%'
+                """
+            ).fetchall()
+    except Exception:
+        # Can't tell. Keep the lock rather than clearing a real AgentTrade sell.
+        return True
+    for row in rows:
+        if str(row["client_order_id"] or "").startswith("agenttrade-") and (
+            _symbol_forms(row["symbol"]) & forms
+        ):
+            return True
+    return False
+
+
+def drop_foreign_symbol_locks(ctx: dict) -> dict:
+    """Remove symbol locks that are not backed by an AgentTrade order.
+
+    The shared account's PEPE sell is the case this clears on the next load.
+    """
+    ctx = dict(ctx or {})
+    kept = []
+    dropped = []
+    for lock in list(ctx.get("symbol_locks") or []):
+        sym = str(lock.get("symbol") or "")
+        if sym and not symbol_has_agenttrade_order(sym):
+            dropped.append(sym)
+            continue
+        kept.append(lock)
+    if dropped:
+        log.info("[BuyLock] Cleared foreign sell lock(s): %s", ", ".join(dropped))
+    ctx["symbol_locks"] = kept
+    ctx["last_sell_symbols"] = [
+        sym for sym in (ctx.get("last_sell_symbols") or [])
+        if symbol_has_agenttrade_order(sym)
+    ]
+    return ctx
+
+
 def load_prior_state() -> dict:
     """Load buy-lock continuity from SQLite; JSON is non-authoritative fallback."""
     sqlite_state: dict = {}
@@ -83,7 +197,7 @@ def load_prior_state() -> dict:
     for key in _LOCK_PERSIST_KEYS:
         if key in sqlite_state and sqlite_state[key] not in (None,):
             out[key] = sqlite_state[key]
-    return out
+    return drop_foreign_symbol_locks(out)
 
 
 def _today_key(now: datetime) -> str:
@@ -155,7 +269,7 @@ def _upsert_symbol_lock(
 
     merged = False
     for lock in locks:
-        if lock.get("symbol") != sym:
+        if not symbols_match(lock.get("symbol") or "", sym):
             continue
         existing_unlock = _parse_iso(lock.get("unlock_at"))
         if existing_unlock and unlock_at > existing_unlock:
@@ -231,8 +345,14 @@ def sync_sell_fills(ctx: dict, fills: list, now: Optional[datetime] = None) -> d
         fid = _fill_id(fill)
         if fid in seen:
             continue
-
         seen.add(fid)
+        if not sell_fill_is_agenttrade(fill):
+            log.info(
+                "[BuyLock] Ignoring foreign sell fill %s — no AgentTrade cooldown",
+                fill.get("ticker") or fill.get("symbol") or fid,
+            )
+            continue
+
         daily_sells += 1
         sym = fill.get("ticker") or fill.get("symbol") or ""
         sym_u = str(sym).upper()
@@ -387,7 +507,7 @@ def is_buy_locked(
     # Symbol-level lock
     if sym:
         for lock in active:
-            if lock.get("symbol") == sym:
+            if symbols_match(lock.get("symbol") or "", sym):
                 return True, lock.get("reason") or "recent_sell", lock
 
     # Bucket-level lock (only locks with scope=bucket and matching bucket, no symbol)
