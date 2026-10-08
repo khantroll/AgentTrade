@@ -2241,16 +2241,25 @@ def get_fill_by_id(fill_id: int) -> Optional[dict]:
 
 
 def get_open_lots_for_symbol(symbol: str) -> list:
-    """Return OPEN buy lots for symbol ordered oldest-first (FIFO)."""
+    """Return OPEN buy lots for symbol ordered oldest-first (FIFO).
+
+    ``LINKUSD`` and ``LINK/USD`` are the same pair. A sell under one spelling
+    matches a lot stored under the other.
+    """
+    from order_utils import crypto_symbol_forms
+
+    forms = crypto_symbol_forms(symbol) or [symbol]
     _ensure_db()
+    placeholders = ",".join("?" for _ in forms)
     with get_connection() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT * FROM trade_lots
-            WHERE symbol=? AND status='OPEN' AND side='buy' AND remaining_qty > 1e-9
+            WHERE symbol IN ({placeholders})
+              AND status='OPEN' AND side='buy' AND remaining_qty > 1e-9
             ORDER BY opened_at ASC, id ASC
             """,
-            (symbol,),
+            tuple(forms),
         ).fetchall()
         return [dict(r) for r in rows]
 

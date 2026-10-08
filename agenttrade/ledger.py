@@ -222,13 +222,21 @@ def _process_sell_fill(fill: dict, fill_id: int, symbol: str,
     open_lots = _db.get_open_lots_for_symbol(symbol)
 
     if not open_lots:
-        msg = f"No open lots for {symbol} — sell fill {fill_id} has no cost basis"
-        log.error("[Ledger] %s", msg)
-        _db.insert_risk_event(
-            None, "critical", "LEDGER_UNMATCHED_SELL",
-            f"{symbol}: sell fill {fill_id} qty={qty} — no open lots",
+        # Positions opened before lot tracking (SOL, LINK) and hand closes
+        # such as agenttrade-manual-stop- have no cost basis. Record that
+        # and continue; do not raise a critical ledger fault.
+        manual = _manual_close_client_id(fill)
+        msg = (
+            f"No open lots for {symbol} — sell fill {fill_id} has no cost basis"
+            + (f" (manual close {manual})" if manual else "")
+            + "; realized P/L left unmatched"
         )
-        return _result(False, "unmatched_sell", fill_id,
+        log.warning("[Ledger] %s", msg)
+        _db.insert_risk_event(
+            None, "warn", "LEDGER_SELL_NO_COST_BASIS",
+            f"{symbol}: sell fill {fill_id} qty={qty} — no open lots; realized P/L not computed",
+        )
+        return _result(True, "sell_no_cost_basis", fill_id,
                        unmatched_qty=qty, message=msg)
 
     remaining = qty
@@ -314,6 +322,32 @@ def _process_sell_fill(fill: dict, fill_id: int, symbol: str,
         message=f"Matched {matches_created} lots for {symbol}, P/L ${total_pl:+.2f}"
                 + (f", UNMATCHED {unmatched_qty:.4f}" if unmatched_qty > 1e-9 else ""),
     )
+
+
+def _manual_close_client_id(fill: dict) -> str:
+    """Client order id of a hand close, when the fill carries one.
+
+    The live LINK close used ``agenttrade-manual-stop-``. That prefix is
+    still an AgentTrade order (it starts with ``agenttrade-``), so the
+    daily-trade filter keeps it as an exit. It is not a new entry and it
+    does not invent a cost basis.
+    """
+    raw = fill.get("raw_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    client_id = str(
+        fill.get("client_order_id")
+        or raw.get("client_order_id")
+        or ""
+    ).strip()
+    if client_id.startswith("agenttrade-manual-stop-"):
+        return client_id
+    return ""
 
 
 def _get_total_pl_for_fill(fill_id: int) -> float:

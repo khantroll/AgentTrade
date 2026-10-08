@@ -125,6 +125,11 @@ def run_rebuild(dry_run: bool = False, fetch_alpaca: bool = False) -> dict:
                         f"Fill {fill_id} ({fill_row['symbol']}): "
                         f"unmatched qty {result['unmatched_qty']:.4f}"
                     )
+            elif action == "sell_no_cost_basis":
+                summary["unmatched_sells"] += 1
+                summary["warnings"].append(
+                    f"Fill {fill_id} ({fill_row['symbol']}): {result.get('message')}"
+                )
             elif action == "already_processed":
                 summary["duplicate_fills_skipped"] += 1
             elif not result.get("ok"):

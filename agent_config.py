@@ -5,9 +5,12 @@ Loaded once at startup; refreshed via refresh_config() at each cycle.
 """
 
 import json
+import logging
 import os
 
 from dotenv import load_dotenv
+
+log = logging.getLogger(__name__)
 
 from buckets import BucketManager
 from config_server import apply_config_to_env
@@ -72,6 +75,29 @@ def _env_float(key: str, default: float) -> float:
         return float(os.getenv(key, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _post_sell_cooldown_hours() -> float:
+    """Hours to lock a symbol after a sell.
+
+    ``POST_SELL_COOLDOWN_HOURS`` is the current name. ``POST_SELL_COOLDOWN``
+    is the legacy .env key and is still accepted.
+    """
+    current = os.getenv("POST_SELL_COOLDOWN_HOURS")
+    legacy = os.getenv("POST_SELL_COOLDOWN")
+    if current is None or str(current).strip() == "":
+        if legacy is not None and str(legacy).strip() != "":
+            log.warning(
+                "[Config] POST_SELL_COOLDOWN=%s is deprecated; set POST_SELL_COOLDOWN_HOURS",
+                legacy,
+            )
+            current = legacy
+        else:
+            current = "24"
+    try:
+        return float(current)
+    except (TypeError, ValueError):
+        return 24.0
 
 
 # Milestone C. Drawdown pause and invested-capital cap are risk-gate knobs.
@@ -147,10 +173,7 @@ def refresh_config() -> None:
     BUYING_ENABLED = env_bool("BUYING_ENABLED", "true")
     SELLING_ENABLED = env_bool("SELLING_ENABLED", "true")
     ALLOW_SAME_DAY_REBUY = env_bool("ALLOW_SAME_DAY_REBUY", "false")
-    try:
-        POST_SELL_COOLDOWN_HOURS = float(os.getenv("POST_SELL_COOLDOWN_HOURS", "24"))
-    except ValueError:
-        POST_SELL_COOLDOWN_HOURS = 24.0
+    POST_SELL_COOLDOWN_HOURS = _post_sell_cooldown_hours()
     EMERGENCY_REBALANCE_BUY_LOCK = env_bool("EMERGENCY_REBALANCE_BUY_LOCK", "true")
     try:
         MIN_CASH_RESERVE = float(os.getenv("MIN_CASH_RESERVE", "5000"))

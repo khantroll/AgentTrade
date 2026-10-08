@@ -243,7 +243,15 @@ class BucketManager:
         Tagged by the bucket name stored in a local state file.
         """
         tags = self._load_tags()
-        return [p for p in all_positions if tags.get(p["symbol"]) == bucket.name]
+        return [p for p in all_positions if self.tag_for_symbol(p.get("symbol"), tags) == bucket.name]
+
+    def tag_for_symbol(self, symbol: str, tags: dict = None) -> Optional[str]:
+        """Bucket name for an Alpaca symbol, including ``SOLUSD`` vs ``SOL/USD``."""
+        from order_utils import lookup_tag
+
+        if tags is None:
+            tags = self._load_tags()
+        return lookup_tag(symbol, tags)
 
     def tag_position(self, ticker: str, bucket_name: str):
         """Record which bucket a ticker was bought into."""
@@ -252,9 +260,18 @@ class BucketManager:
         self._save_tags(tags)
 
     def untag_position(self, ticker: str):
-        """Remove tag when a position is fully closed."""
+        """Remove tag when a position is fully closed.
+
+        Clears every spelling of a crypto pair so a ``SOLUSD`` exit drops a
+        ``SOL/USD`` tag.
+        """
+        from order_utils import crypto_symbol_forms
+
         tags = self._load_tags()
-        tags.pop(ticker, None)
+        forms = set(crypto_symbol_forms(ticker))
+        for key in list(tags):
+            if key == ticker or forms.intersection(crypto_symbol_forms(str(key))):
+                tags.pop(key, None)
         self._save_tags(tags)
 
     def rebalance_report(self, all_positions: list, portfolio_value: float) -> dict:
@@ -279,7 +296,10 @@ class BucketManager:
         report = {}
 
         for bucket in self.active_buckets():
-            b_positions = [p for p in all_positions if tags.get(p["symbol"]) == bucket.name]
+            b_positions = [
+                p for p in all_positions
+                if self.tag_for_symbol(p.get("symbol"), tags) == bucket.name
+            ]
             current_val = sum(float(p.get("market_value", 0)) for p in b_positions)
             target_val  = self.bucket_capital(bucket, portfolio_value)
             drift       = current_val - target_val

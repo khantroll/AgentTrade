@@ -360,10 +360,27 @@ def run_trading_cycle() -> None:
         # This runs before any buys so we exit losers first and free up cash.
         # Covers: stop-loss, take-profit, and bucket overweight trimming.
         review_sells = review_positions(positions, account, rebalance, market_open)
-        if review_sells:
-            lock_ctx = record_sells_placed(lock_ctx, review_sells)
+        review_placed = [o for o in review_sells if o.get("status") == "placed"]
+        review_failed = [o for o in review_sells if o.get("status") == "failed"]
+        if review_placed:
+            lock_ctx = record_sells_placed(lock_ctx, review_placed)
             buy_lock = evaluate_buy_lock(lock_ctx)
-            log.info("[Cycle] Position review placed %d sell order(s)", len(review_sells))
+            log.info("[Cycle] Position review placed %d sell order(s)", len(review_placed))
+        if review_failed:
+            log.error(
+                "[Cycle] Position review failed %d exit(s); will retry next cycle: %s",
+                len(review_failed),
+                ", ".join(
+                    f"{o.get('ticker')}: {o.get('error')}" for o in review_failed
+                ),
+            )
+        if review_sells:
+            if _CYCLE_RUN_ID:
+                try:
+                    from agenttrade import db as _ledger
+                    _ledger.insert_funnel_events(_CYCLE_RUN_ID, "ORDER", review_sells)
+                except Exception as funnel_e:
+                    log.warning("[Cycle] could not persist review exits: %s", funnel_e)
             try:
                 append_order_meta(review_sells, llm_mode=mode, decisions=[])
             except Exception as rv_e:

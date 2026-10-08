@@ -20,6 +20,8 @@ from market_data import is_crypto_bucket
 from order_utils import (
     build_equity_buy_payload,
     format_qty_for_asset,
+    is_crypto_symbol,
+    order_time_in_force,
     plan_equity_buy_vs_open_orders,
 )
 
@@ -211,12 +213,14 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
             _atr_pct = float(d.get("atr_pct") or 0.5)
             _p = float(d.get("current_price") or d.get("price") or 0)
 
-            if is_crypto:
+            crypto_order = is_crypto or is_crypto_symbol(ticker)
+            tif = order_time_in_force(ticker, bucket_is_crypto=crypto_order)
+            if crypto_order:
                 payload = {
                     "symbol": ticker,
                     "side": "buy",
                     "type": "market",
-                    "time_in_force": "gtc",
+                    "time_in_force": tif,
                     "notional": str(round(float(notional), 2)),
                 }
                 _ot = "market(crypto)"
@@ -225,7 +229,7 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                     "symbol": ticker,
                     "side": "buy",
                     "type": "market",
-                    "time_in_force": "day",
+                    "time_in_force": tif,
                 }
                 _ot = "market"
             else:
@@ -235,11 +239,11 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                     "side": "buy",
                     "type": "limit",
                     "limit_price": str(_lp),
-                    "time_in_force": "day",
+                    "time_in_force": tif,
                 }
                 _ot = f"limit@{_lp}"
 
-            if is_crypto:
+            if crypto_order:
                 if not notional:
                     log.warning("[%s/Execution] %s: no notional for crypto order — skipping", bucket.name, ticker)
                     results.append({
@@ -276,8 +280,8 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                     })
                     continue
 
-            order_notional = float(notional or 0) if is_crypto else float(shares or 0) * float(_p or d.get("current_price") or 0)
-            ac = "crypto" if is_crypto else "us_equity"
+            order_notional = float(notional or 0) if crypto_order else float(shares or 0) * float(_p or d.get("current_price") or 0)
+            ac = "crypto" if crypto_order else "us_equity"
             allowed, block_reason, cash_ctx = check_buy_allowed(
                 order_notional,
                 snapshot=snapshot,
@@ -330,7 +334,7 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
 
             # Equity buys: whole-share qty, stop below the market, take-profit above it.
             # A resting unfilled buy is canceled first so this submit is a replace.
-            if not is_crypto and shares:
+            if not crypto_order and shares:
                 plan = _resolve_equity_open_order_plan(ticker, snapshot if isinstance(snapshot, dict) else {})
                 if plan.get("action") == "skip":
                     reason = plan.get("reason") or "open_buy_conflict"
@@ -396,7 +400,7 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                 bucket.name,
                 ticker,
                 _ot,
-                "$" + str(notional) if is_crypto else "×" + str(shares),
+                "$" + str(notional) if crypto_order else "×" + str(shares),
                 order["id"],
             )
             cfg.increment_daily_trades()
@@ -408,7 +412,7 @@ def execution_agent(approved: list, bucket: Bucket, buy_lock: dict = None,
                 "notional_usd": round(float(order_notional), 2),
                 "estimated_notional": round(float(order_notional), 2),
                 "current_price": _p or d.get("current_price"),
-                "asset_class": "crypto" if is_crypto else "us_equity",
+                "asset_class": "crypto" if crypto_order else "us_equity",
                 "bucket": bucket.name,
                 "order_id": order["id"],
                 "client_order_id": broker_body.get("client_order_id"),
@@ -506,11 +510,16 @@ def hard_rebalance_agent(
                 cfg.MAX_DAILY_TRADES,
             )
             break
-        if not plan.get("is_crypto") and not market_open:
-            log.info("[HardRebalance] Skip %s — market closed (equity)", plan["symbol"])
+        sym = plan["symbol"]
+        crypto_order = (
+            bool(plan.get("is_crypto"))
+            or str(plan.get("asset_class") or "").lower() == "crypto"
+            or is_crypto_symbol(sym)
+        )
+        if not crypto_order and not market_open:
+            log.info("[HardRebalance] Skip %s — market closed (equity)", sym)
             continue
 
-        sym = plan["symbol"]
         if has_pending_sell_order(sym, open_orders):
             log.info("[HardRebalance] %s: pending sell order already open — skipping", sym)
             continue
@@ -518,13 +527,13 @@ def hard_rebalance_agent(
         try:
             asset = {
                 "symbol": sym,
-                "asset_class": plan.get("asset_class") or ("crypto" if plan.get("is_crypto") else "us_equity"),
+                "asset_class": "crypto" if crypto_order else (plan.get("asset_class") or "us_equity"),
             }
             payload = {
                 "symbol": sym,
                 "side": "sell",
                 "type": "market",
-                "time_in_force": "gtc" if plan.get("is_crypto") else "day",
+                "time_in_force": order_time_in_force(asset, bucket_is_crypto=crypto_order),
                 "qty": format_qty_for_asset(qty, asset),
             }
             from trading_day import new_client_order_id
