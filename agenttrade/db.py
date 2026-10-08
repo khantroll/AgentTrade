@@ -188,6 +188,15 @@ CREATE TABLE IF NOT EXISTS system_flags (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS position_entry_scores (
+    symbol TEXT PRIMARY KEY,
+    entry_score REAL NOT NULL,
+    entry_at TEXT NOT NULL,
+    last_score REAL,
+    last_sentiment REAL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -300,6 +309,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_reddit_trends_sym_period
         ON reddit_sentiment_trends(symbol, period_days, captured_at);
+
+    CREATE TABLE IF NOT EXISTS position_entry_scores (
+        symbol TEXT PRIMARY KEY,
+        entry_score REAL NOT NULL,
+        entry_at TEXT NOT NULL,
+        last_score REAL,
+        last_sentiment REAL,
+        updated_at TEXT NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS signal_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

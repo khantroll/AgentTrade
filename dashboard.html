@@ -631,6 +631,25 @@ function renderRebalance(s) {
   } else {
     html += '<div class="mini" style="margin-top:8px">Soft rebalance only — enable HARD_REBALANCE in Settings</div>';
   }
+  const opp = s.opportunity_rebalance;
+  if (opp) {
+    if (opp.enabled === false) {
+      html += '<div class="mini" style="margin-top:8px">Opportunity rebalance off — holdings are not compared to new candidates</div>';
+    } else {
+      const decisions = Array.isArray(opp.decisions) ? opp.decisions : [];
+      html += '<div class="mini" style="margin-top:8px;color:var(--yellow)">Opportunity rebalance</div>';
+      if (!decisions.length) {
+        html += '<div class="mini">No holdings compared this cycle</div>';
+      }
+      decisions.forEach(d => {
+        const held = (d.score === null || d.score === undefined) ? '—' : Number(d.score).toFixed(1);
+        const entry = (d.entry_score === null || d.entry_score === undefined) ? '—' : Number(d.entry_score).toFixed(1);
+        const cand = d.candidate ? (' → ' + esc(d.candidate) + ' ' + ((d.candidate_score === null || d.candidate_score === undefined) ? '—' : Number(d.candidate_score).toFixed(1))) : '';
+        html += '<div class="mini">' + esc(d.symbol || '—') + ' · ' + esc(d.action || '') +
+          ' · score ' + held + ' / entry ' + entry + cand + ' · ' + esc(d.reason || '') + '</div>';
+      });
+    }
+  }
   document.getElementById('rebalance').innerHTML = html;
 }
 
