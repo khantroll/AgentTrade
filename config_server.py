@@ -977,6 +977,8 @@ def create_app():
                 else:
                     qty_str = str(int(qty_raw))
 
+            from trading_day import new_manual_client_order_id
+            client_order_id = new_manual_client_order_id(symbol)
             order = alpaca_post("/v2/orders", {
                 "symbol":        symbol,
                 "qty":           qty_str,
@@ -984,7 +986,22 @@ def create_app():
                 "type":          "stop",
                 "time_in_force": "gtc",
                 "stop_price":    str(round(stop_price, 4)),
+                "client_order_id": client_order_id,
             })
+            try:
+                from buy_lock import record_exit_order
+                record_exit_order({
+                    "symbol": symbol,
+                    "side": "sell",
+                    "status": "placed",
+                    "order_id": order.get("id"),
+                    "client_order_id": client_order_id,
+                    "qty": qty_str,
+                    "type": "stop",
+                    "source": "manual-stop",
+                })
+            except Exception as rec_err:
+                log.warning("[SetStop] Could not record stop order: %s", rec_err)
 
             # Durable manual override belongs in SQLite; agent_state.json is projection-only.
             try:
@@ -1165,24 +1182,49 @@ def create_app():
             if not symbol or side not in ("buy", "sell"):
                 return jsonify({"ok": False, "message": "symbol and side (buy/sell) required"}), 400
             import agent_config as cfg
-            from alpaca_client import alpaca_post, close_position
+            from alpaca_client import alpaca_post, close_position, get_positions
             cfg.refresh_config()
             qty      = body.get("qty")
             notional = body.get("notional")
-            # Full close: no qty/notional specified → use Alpaca's liquidate endpoint
+            # Full close still goes out as an AgentTrade order so the client id
+            # is on the fill. Liquidate only if the position qty cannot be read.
             if not qty and not notional and side == "sell":
-                result = close_position(symbol)
-                return jsonify({"ok": True, "message": f"{symbol} full position closed", "order": result})
+                try:
+                    positions = get_positions()
+                    pos = next((p for p in positions if str(p.get("symbol") or "").upper() == symbol), None)
+                    qty = pos.get("qty") if pos else None
+                except Exception:
+                    qty = None
+                if not qty:
+                    result = close_position(symbol)
+                    return jsonify({"ok": True, "message": f"{symbol} full position closed", "order": result})
             from order_utils import order_time_in_force
+            from trading_day import new_manual_client_order_id
             order = {
                 "symbol": symbol, "side": side,
                 "type": "market", "time_in_force": order_time_in_force(symbol),
             }
+            if side == "sell":
+                order["client_order_id"] = new_manual_client_order_id(symbol)
             if qty:
                 order["qty"] = str(qty)
             elif notional:
                 order["notional"] = str(notional)
             result = alpaca_post("/v2/orders", order)
+            if side == "sell":
+                try:
+                    from buy_lock import record_exit_order
+                    record_exit_order({
+                        "symbol": symbol,
+                        "side": "sell",
+                        "status": "placed",
+                        "order_id": result.get("id"),
+                        "client_order_id": order.get("client_order_id"),
+                        "qty": qty,
+                        "source": "manual-stop",
+                    })
+                except Exception as rec_err:
+                    log.warning("[ManualTrade] Could not record sell: %s", rec_err)
             return jsonify({"ok": True, "message": f"{side.upper()} order placed for {symbol}", "order": result})
         except Exception as e:
             log.exception("[Action] manual-trade failed")
