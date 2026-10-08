@@ -403,6 +403,16 @@ input[type=range]{flex:1;accent-color:var(--accent)}
         <div class="hint">When a bucket exceeds target by ≥ drift threshold, sells smallest position(s) to trim ~50% of excess. Counts toward daily trade limit.</div>
       </div>
       <div class="field-group">
+        <div class="field-label">Opportunity Rebalance</div>
+        <div class="field-row">
+          <select class="field-select" id="OPPORTUNITY_REBALANCE" onchange="saveKey('OPPORTUNITY_REBALANCE')">
+            <option value="true" selected>On — compare holdings to new candidates (default)</option>
+            <option value="false">Off — stop and target exits only</option>
+          </select>
+        </div>
+        <div class="hint">Each cycle rescores AgentTrade holdings on the same scale as new candidates. A fading name can be trimmed or closed, and a much stronger same-bucket candidate can replace the weakest holding. Sells do not count toward the daily trade cap. Buys still respect the cash reserve, bucket limits, and the post-sell cooldown.</div>
+      </div>
+      <div class="field-group">
         <div class="field-label">Hard Rebalance Drift Threshold</div>
         <div class="field-row">
           <select class="field-select" id="HARD_REBALANCE_DRIFT_PCT" onchange="saveKey('HARD_REBALANCE_DRIFT_PCT')">
@@ -641,6 +651,13 @@ function populateFields() {
   const hardReb = document.getElementById('HARD_REBALANCE');
   if (hardReb && config.HARD_REBALANCE !== undefined) hardReb.value = String(config.HARD_REBALANCE).toLowerCase() === 'true' ? 'true' : 'false';
 
+  const oppReb = document.getElementById('OPPORTUNITY_REBALANCE');
+  if (oppReb) {
+    const raw = config.OPPORTUNITY_REBALANCE;
+    const off = raw !== undefined && String(raw).trim() !== '' && String(raw).toLowerCase() === 'false';
+    oppReb.value = off ? 'false' : 'true';
+  }
+
   const hardDrift = document.getElementById('HARD_REBALANCE_DRIFT_PCT');
   if (hardDrift && config.HARD_REBALANCE_DRIFT_PCT) hardDrift.value = config.HARD_REBALANCE_DRIFT_PCT;
 
@@ -710,7 +727,7 @@ async function saveAll() {
   const allKeys = [
     'ALPACA_API_KEY','ALPACA_SECRET_KEY','ALPACA_PAPER',
     'ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL','OPENROUTER_API_KEY','OPENROUTER_BASE_URL','OPENROUTER_MODEL',
-    'LLM_MODE','DAILY_TOKEN_BUDGET','MAX_DAILY_TRADES','HARD_REBALANCE','HARD_REBALANCE_DRIFT_PCT','SCREENER_CACHE','SCREENER_CACHE_TTL_MINUTES',
+    'LLM_MODE','DAILY_TOKEN_BUDGET','MAX_DAILY_TRADES','HARD_REBALANCE','HARD_REBALANCE_DRIFT_PCT','OPPORTUNITY_REBALANCE','SCREENER_CACHE','SCREENER_CACHE_TTL_MINUTES',
     'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT',
     'NEWS_API_KEY','QUIVER_API_KEY',
   ];
@@ -772,6 +789,7 @@ function saveLLMConfig() {
   saveKey('MAX_DAILY_TRADES');
   saveKey('HARD_REBALANCE');
   saveKey('HARD_REBALANCE_DRIFT_PCT');
+  saveKey('OPPORTUNITY_REBALANCE');
   saveKey('SCREENER_CACHE');
   saveKey('SCREENER_CACHE_TTL_MINUTES');
 }
@@ -847,7 +865,7 @@ function exportEnv(overridePayload) {
   const keys = [
     'ALPACA_API_KEY','ALPACA_SECRET_KEY','ALPACA_PAPER',
     'ANTHROPIC_API_KEY','OPENAI_API_KEY','GEMINI_API_KEY','MISTRAL_API_KEY','DEEPSEEK_API_KEY','GROQ_API_KEY','NVIDIA_API_KEY','NIM_API_KEY','NVIDIA_BASE_URL','OPENROUTER_API_KEY','OPENROUTER_BASE_URL','OPENROUTER_MODEL',
-    'LLM_MODE','DAILY_TOKEN_BUDGET','MAX_DAILY_TRADES','HARD_REBALANCE','HARD_REBALANCE_DRIFT_PCT','SCREENER_CACHE','SCREENER_CACHE_TTL_MINUTES',
+    'LLM_MODE','DAILY_TOKEN_BUDGET','MAX_DAILY_TRADES','HARD_REBALANCE','HARD_REBALANCE_DRIFT_PCT','OPPORTUNITY_REBALANCE','SCREENER_CACHE','SCREENER_CACHE_TTL_MINUTES',
     'REDDIT_CLIENT_ID','REDDIT_CLIENT_SECRET','REDDIT_USER_AGENT',
     'NEWS_API_KEY','QUIVER_API_KEY',
   ];

@@ -115,6 +115,7 @@ DEFAULT_CONFIG = {
     "STRATEGY_AGGRESSION":  "balanced",
     "HARD_REBALANCE":       "false",
     "HARD_REBALANCE_DRIFT_PCT": "0.10",
+    "OPPORTUNITY_REBALANCE": "true",
     "SCREENER_CACHE":       "true",
     "SCREENER_CACHE_TTL_MINUTES": "240",
     "NEWS_API_KEY":         "",

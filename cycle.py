@@ -2,7 +2,7 @@
 
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import agent_config as cfg
 from account_sync import (
@@ -172,6 +172,7 @@ def _save_state(state: dict) -> None:
 def run_trading_cycle() -> None:
     global _CYCLE_RUN_ID
     cfg.refresh_config()
+    cycle_started_at = datetime.now(timezone.utc)
 
     from agenttrade.db import init_db, finish_cycle_run, start_cycle_run
     from agenttrade.publish import build_dashboard_state, publish_dashboard_state
@@ -401,6 +402,8 @@ def run_trading_cycle() -> None:
         all_candidates = []
         all_decisions = []
         all_blocked = []
+        all_attributions = {}
+        pending_entries = []
         bucket_research = {}
 
         # One ledger for every bucket. Approvals reserve cash and held names
@@ -564,7 +567,66 @@ def run_trading_cycle() -> None:
                 from agenttrade import db as _ledger
                 _ledger.insert_funnel_events(_CYCLE_RUN_ID, "DECISION", decisions, bucket=bucket.name)
                 record_decision_snapshots(_CYCLE_RUN_ID, decisions, attribution_map)
+            for _sym, _attr in (attribution_map or {}).items():
+                all_attributions[str(_sym).upper()] = _attr
+            # Risk and buys wait until opportunity sells have freed cash.
+            pending_entries.append({"bucket": bucket, "decisions": decisions})
 
+        # Opportunity sells run after every bucket is scored and before buys.
+        # They do not increment MAX_DAILY_TRADES. The replacement buy, if any,
+        # still goes through the cash reserve, bucket limits, and sell cooldown.
+        opportunity = {"enabled": False, "decisions": [], "orders": []}
+        try:
+            from opportunity_rebalance import run_opportunity_cycle, snapshot_with_sell_proceeds
+
+            cash_before_opportunity = float(account.get("cash") or 0)
+            opportunity = run_opportunity_cycle(
+                positions=positions,
+                decisions=all_decisions,
+                attributions=all_attributions,
+                tags=cfg.bucket_manager._load_tags(),
+                buy_lock=buy_lock,
+                market_open=market_open,
+                cycle_started_at=cycle_started_at,
+            )
+            opp_orders = list(opportunity.get("orders") or [])
+            all_orders.extend(opp_orders)
+            if _CYCLE_RUN_ID and opp_orders:
+                from agenttrade import db as _ledger
+                _ledger.insert_funnel_events(
+                    _CYCLE_RUN_ID, "ORDER", opp_orders, bucket="opportunity_rebalance",
+                )
+            lock_ctx = record_sells_placed(lock_ctx, opp_orders)
+            buy_lock = evaluate_buy_lock(lock_ctx)
+            placed_opp = [
+                o for o in opp_orders
+                if str(o.get("side") or "").lower() == "sell" and o.get("status") == "placed"
+            ]
+            if placed_opp:
+                try:
+                    snapshot = sync_ledger_from_alpaca(_CYCLE_RUN_ID, "post_opportunity_rebalance")
+                except Exception as sync_e:
+                    log.warning("[Opportunity] ledger sync after sells failed: %s", sync_e)
+                    snapshot = refresh_alpaca_snapshot()
+                snapshot = snapshot_with_sell_proceeds(snapshot, opp_orders, cash_before_opportunity)
+                account = snapshot["account"]
+                positions = snapshot["positions"]
+                pv = float(account["portfolio_value"])
+                cash = float(account["cash"])
+                rebalance = cfg.bucket_manager.rebalance_report(positions, pv)
+                cycle_risk = CycleRiskState.from_snapshot(snapshot, positions)
+                log.info(
+                    "💼 After opportunity sells: $%s cash (proceeds credited $%s) | %d positions",
+                    f"{cash:,.2f}",
+                    f"{float(snapshot.get('opportunity_sell_proceeds') or 0):,.2f}",
+                    len(positions),
+                )
+        except Exception as opp_e:
+            log.error("[Opportunity] step failed — buys continue without it: %s", opp_e)
+
+        for entry in pending_entries:
+            bucket = entry["bucket"]
+            decisions = entry["decisions"]
             approved = risk_agent(
                 decisions, account, positions, bucket, rebalance,
                 buy_lock=buy_lock, account_snapshot=snapshot,
@@ -706,6 +768,12 @@ def run_trading_cycle() -> None:
                 "plans": hard_plans,
                 "orders": [o for o in all_orders if o.get("hard_rebalance")],
             },
+            "opportunity_rebalance": {
+                "enabled": bool(opportunity.get("enabled")),
+                "decisions": opportunity.get("decisions") or [],
+                "orders": opportunity.get("orders") or [],
+                "knobs": opportunity.get("knobs") or {},
+            },
             "buckets": cfg.bucket_manager.to_dict(),
             "universes": all_universes,
             "screener_sources": all_sources,
@@ -722,7 +790,7 @@ def run_trading_cycle() -> None:
         state = merge_snapshot_into_state(state, snapshot, source="cycle")
         if _CYCLE_RUN_ID:
             from agenttrade import db as _ledger
-            for _key in ("universes", "screener_sources", "token_usage", "rebalance", "hard_rebalance", "buy_lock", "llm_mode", "last_run", "research_status", "cash_gate", "deploy_sha"):
+            for _key in ("universes", "screener_sources", "token_usage", "rebalance", "hard_rebalance", "opportunity_rebalance", "buy_lock", "llm_mode", "last_run", "research_status", "cash_gate", "deploy_sha"):
                 _ledger.upsert_cycle_artifact(_CYCLE_RUN_ID, _key, state.get(_key))
         from agenttrade.publish import build_dashboard_state, publish_dashboard_state
         state = build_dashboard_state(cached_funnel=state, live_snapshot=snapshot)
