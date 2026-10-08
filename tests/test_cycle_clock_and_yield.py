@@ -42,6 +42,20 @@ def test_previous_day_gap_is_about_18_hours_not_22(monkeypatch):
     assert "check cron" in row["message"]
 
 
+def test_naive_eastern_stamp_is_not_read_as_chicago(monkeypatch):
+    """11:32 ET is 10:32 CT. A Chicago process zone must not display 11:32 CT."""
+    monkeypatch.setattr(trading_day, "host_local_timezone", lambda: ZoneInfo("America/Chicago"))
+
+    def _hours(dt, moment=None):
+        return trading_day.hours_since(dt, datetime(2026, 10, 8, 16, 0, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(health_check, "_hours_ago", _hours)
+    row = health_check._last_cycle_check({"last_run": "2026-10-08T11:32:00"})
+    assert "10:32 CT" in row["message"]
+    assert "11:32 CT" not in row["message"]
+    assert row["hours"] == pytest.approx(28 / 60, abs=0.02)
+
+
 def test_aware_utc_stamp_displays_in_chicago_without_a_second_shift(monkeypatch):
     _freeze_host_eastern(monkeypatch, datetime(2026, 10, 8, 14, 0, tzinfo=timezone.utc))
     row = health_check._last_cycle_check({"last_run": "2026-10-08T13:41:00+00:00"})

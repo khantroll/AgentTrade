@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -117,15 +118,62 @@ def sell_fill_is_agenttrade(fill: dict) -> bool:
     return bool(row and str(row["client_order_id"] or "").startswith("agenttrade-"))
 
 
-def symbol_has_agenttrade_order(symbol: str) -> bool:
-    """True when the ledger has an AgentTrade order for this symbol.
+_LOCK_MATCH_WINDOW = timedelta(hours=36)
 
-    Used to drop cooldown locks that were created from a foreign fill.
-    A manual ``agenttrade-manual-`` close counts, so that symbol stays locked.
+
+def _client_id_kind(client_order_id: str) -> Optional[str]:
+    """``ours``, ``foreign``, or None when the id is missing."""
+    text = str(client_order_id or "").strip()
+    if not text:
+        return None
+    if text.startswith("agenttrade-"):
+        return "ours"
+    return "foreign"
+
+
+def _parse_moment(value) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        from trading_day import parse_cycle_timestamp
+        return parse_cycle_timestamp(value)
+    except Exception:
+        return None
+
+
+def _order_near_lock(order: dict, lock_time: Optional[datetime]) -> bool:
+    if lock_time is None:
+        return True
+    moments = []
+    for key in ("filled_at", "submitted_at", "created_at", "updated_at", "time", "locked_at"):
+        moment = _parse_moment(order.get(key))
+        if moment is not None:
+            moments.append(moment)
+    if not moments:
+        return True
+    window = _LOCK_MATCH_WINDOW.total_seconds()
+    return any(abs((moment - lock_time).total_seconds()) <= window for moment in moments)
+
+
+def fetch_closed_orders() -> Optional[list]:
+    """Recent closed Alpaca orders, or None when the broker cannot be read.
+
+    None means "don't know". An empty list means the broker had no rows.
+    A missing sqlite order must not be treated as a foreign sell.
     """
-    forms = _symbol_forms(symbol)
-    if not forms:
-        return False
+    if not (os.getenv("ALPACA_API_KEY") or getattr(cfg, "ALPACA_API_KEY", None)):
+        return None
+    try:
+        from alpaca_client import get_open_orders
+        data = get_open_orders(status="closed", limit=500)
+    except Exception as exc:
+        log.info("[BuyLock] Closed orders unavailable (%s); keeping unresolved locks", exc)
+        return None
+    return data if isinstance(data, list) else None
+
+
+def _sqlite_order_signals(symbol: str) -> set[str]:
+    signals: set[str] = set()
     try:
         from agenttrade.db import get_connection
 
@@ -133,41 +181,137 @@ def symbol_has_agenttrade_order(symbol: str) -> bool:
             rows = conn.execute(
                 """
                 SELECT symbol, client_order_id FROM orders
-                WHERE client_order_id IS NOT NULL
-                  AND client_order_id LIKE 'agenttrade-%'
+                WHERE client_order_id IS NOT NULL AND client_order_id != ''
                 """
             ).fetchall()
     except Exception:
-        # Can't tell. Keep the lock rather than clearing a real AgentTrade sell.
-        return True
+        return signals
     for row in rows:
-        if str(row["client_order_id"] or "").startswith("agenttrade-") and (
-            _symbol_forms(row["symbol"]) & forms
-        ):
-            return True
-    return False
+        if not symbols_match(row["symbol"] or "", symbol):
+            continue
+        kind = _client_id_kind(row["client_order_id"])
+        if kind:
+            signals.add(kind)
+    return signals
 
 
-def drop_foreign_symbol_locks(ctx: dict) -> dict:
-    """Remove symbol locks that are not backed by an AgentTrade order.
+def _jsonl_rows(path: str) -> list:
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError:
+        return []
+    return rows
 
-    The shared account's PEPE sell is the case this clears on the next load.
+
+def _trade_log_signals(symbol: str, lock_time: Optional[datetime]) -> set[str]:
+    """Client ids in trade_log.jsonl, plus order_meta.jsonl rows we wrote."""
+    signals: set[str] = set()
+    root = getattr(cfg, "APP_DIR", ".")
+    for row in _jsonl_rows(os.path.join(root, "trade_log.jsonl")):
+        sym = row.get("symbol") or row.get("ticker") or ""
+        if not symbols_match(sym, symbol) or not _order_near_lock(row, lock_time):
+            continue
+        kind = _client_id_kind(row.get("client_order_id"))
+        if kind:
+            signals.add(kind)
+    for row in _jsonl_rows(os.path.join(root, "order_meta.jsonl")):
+        sym = row.get("ticker") or row.get("symbol") or ""
+        if symbols_match(sym, symbol):
+            signals.add("ours")
+    return signals
+
+
+def _closed_order_signals(symbol: str, lock_time: Optional[datetime], closed_orders: Optional[list]) -> set[str]:
+    if closed_orders is None:
+        return set()
+    signals: set[str] = set()
+    for order in closed_orders:
+        if not isinstance(order, dict):
+            continue
+        sym = order.get("symbol") or order.get("ticker") or ""
+        if str(order.get("side") or "sell").lower() not in ("sell", ""):
+            continue
+        if not symbols_match(sym, symbol) or not _order_near_lock(order, lock_time):
+            continue
+        kind = _client_id_kind(order.get("client_order_id"))
+        if kind:
+            signals.add(kind)
+    return signals
+
+
+def classify_lock(lock: dict, closed_orders: Optional[list] = None) -> str:
+    """``ours``, ``foreign``, or ``unknown``.
+
+    Unknown keeps the lock. Only a positive non-AgentTrade client id drops it.
+    Sqlite is one source. A sell that never landed in ``orders`` can still be
+    ours via the lock record, trade_log.jsonl, or the Alpaca order.
+    """
+    lock = lock or {}
+    symbol = str(lock.get("symbol") or "")
+    if not symbol:
+        return "unknown"
+    signals: set[str] = set()
+    own_id = _client_id_kind(lock.get("client_order_id"))
+    if own_id:
+        signals.add(own_id)
+    lock_time = _parse_moment(lock.get("locked_at") or lock.get("last_sell_at"))
+    signals |= _sqlite_order_signals(symbol)
+    signals |= _trade_log_signals(symbol, lock_time)
+    signals |= _closed_order_signals(symbol, lock_time, closed_orders)
+    if "ours" in signals:
+        return "ours"
+    if "foreign" in signals:
+        return "foreign"
+    return "unknown"
+
+
+def symbol_has_agenttrade_order(symbol: str) -> bool:
+    """True when this symbol must stay locked.
+
+    Missing evidence is not a foreign sell. Callers that only want to drop a
+    lock should use ``classify_lock``.
+    """
+    kind = classify_lock({"symbol": symbol})
+    return kind != "foreign"
+
+
+def drop_foreign_symbol_locks(ctx: dict, closed_orders: Optional[list] = None) -> dict:
+    """Drop a symbol lock only when a source shows a non-AgentTrade client id.
+
+    SOL and the manual LINK close are absent from sqlite. Their Alpaca client
+    ids still start with ``agenttrade-``, so they stay. PEPE does not.
     """
     ctx = dict(ctx or {})
+    if closed_orders is None:
+        closed_orders = fetch_closed_orders()
     kept = []
     dropped = []
     for lock in list(ctx.get("symbol_locks") or []):
         sym = str(lock.get("symbol") or "")
-        if sym and not symbol_has_agenttrade_order(sym):
+        if sym and classify_lock(lock, closed_orders) == "foreign":
             dropped.append(sym)
             continue
         kept.append(lock)
     if dropped:
         log.info("[BuyLock] Cleared foreign sell lock(s): %s", ", ".join(dropped))
     ctx["symbol_locks"] = kept
+    dropped_forms: set[str] = set()
+    for sym in dropped:
+        dropped_forms |= _symbol_forms(sym)
     ctx["last_sell_symbols"] = [
         sym for sym in (ctx.get("last_sell_symbols") or [])
-        if symbol_has_agenttrade_order(sym)
+        if not (_symbol_forms(sym) & dropped_forms)
     ]
     return ctx
 
@@ -253,6 +397,8 @@ def _upsert_symbol_lock(
     scope: str = "symbol",
     bucket: Optional[str] = None,
     locked_at: Optional[datetime] = None,
+    client_order_id: Optional[str] = None,
+    order_id: Optional[str] = None,
 ) -> dict:
     """Add or extend a scoped lock for one symbol."""
     ctx = dict(ctx or {})
@@ -279,6 +425,10 @@ def _upsert_symbol_lock(
         lock["asset_class"] = ac
         if bucket:
             lock["bucket"] = bucket
+        if client_order_id:
+            lock["client_order_id"] = client_order_id
+        if order_id:
+            lock["order_id"] = order_id
         merged = True
         break
 
@@ -293,10 +443,73 @@ def _upsert_symbol_lock(
         }
         if bucket:
             entry["bucket"] = bucket
+        if client_order_id:
+            entry["client_order_id"] = client_order_id
+        if order_id:
+            entry["order_id"] = order_id
         locks.append(entry)
 
     ctx["symbol_locks"] = locks[-_LOCK_CAP:]
     return ctx
+
+
+def record_exit_order(order: dict, strategy_name: str = "") -> None:
+    """Persist an AgentTrade exit so a later load can see its client id."""
+    if not isinstance(order, dict):
+        return
+    if str(order.get("side") or "").lower() != "sell":
+        return
+    if str(order.get("status") or "placed") not in ("placed", "filled", "accepted", "new"):
+        return
+    order_id = order.get("order_id") or order.get("id") or order.get("alpaca_order_id")
+    client_order_id = order.get("client_order_id")
+    if not order_id and not client_order_id:
+        return
+    try:
+        from agenttrade.db import record_submitted_order
+
+        record_submitted_order(
+            order.get("cycle_run_id"),
+            {
+                "order_id": order_id,
+                "symbol": order.get("ticker") or order.get("symbol"),
+                "side": "sell",
+                "qty": order.get("shares") or order.get("qty"),
+                "status": order.get("status") or "placed",
+                "client_order_id": client_order_id,
+                "submitted_at": order.get("submitted_at") or order.get("filled_at"),
+                "type": order.get("type") or order.get("order_type"),
+                "time_in_force": order.get("time_in_force"),
+            },
+            strategy_name=strategy_name or order.get("bucket") or order.get("source") or "exit",
+        )
+    except Exception as exc:
+        log.info("[BuyLock] Could not record exit %s: %s", order.get("ticker") or order.get("symbol"), exc)
+
+
+def _client_id_on_fill(fill: dict, closed_orders: Optional[list]) -> str:
+    cid = str(fill.get("client_order_id") or "").strip()
+    if cid:
+        return cid
+    raw = fill.get("raw_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = {}
+    if isinstance(raw, dict):
+        cid = str(raw.get("client_order_id") or "").strip()
+        if cid:
+            return cid
+    oid = str(fill.get("order_id") or fill.get("alpaca_order_id") or "").strip()
+    if not oid or not closed_orders:
+        return ""
+    for order in closed_orders:
+        if not isinstance(order, dict):
+            continue
+        if str(order.get("id") or order.get("order_id") or "") == oid:
+            return str(order.get("client_order_id") or "").strip()
+    return ""
 
 
 def _add_sell_locks_from_symbols(
@@ -338,6 +551,12 @@ def sync_sell_fills(ctx: dict, fills: list, now: Optional[datetime] = None) -> d
     last_sell_at = ctx.get("last_sell_at")
     last_sell_symbols: list[str] = list(ctx.get("last_sell_symbols") or [])
     cooldown = timedelta(hours=cfg.POST_SELL_COOLDOWN_HOURS)
+    closed_orders = None
+    if any(
+        str(fill.get("side", "")).lower() == "sell" and not fill.get("client_order_id")
+        for fill in (fills or [])
+    ):
+        closed_orders = fetch_closed_orders()
 
     for fill in fills or []:
         if str(fill.get("side", "")).lower() != "sell":
@@ -346,7 +565,11 @@ def sync_sell_fills(ctx: dict, fills: list, now: Optional[datetime] = None) -> d
         if fid in seen:
             continue
         seen.add(fid)
-        if not sell_fill_is_agenttrade(fill):
+        client_order_id = _client_id_on_fill(fill, closed_orders)
+        judged = dict(fill)
+        if client_order_id:
+            judged["client_order_id"] = client_order_id
+        if not sell_fill_is_agenttrade(judged):
             log.info(
                 "[BuyLock] Ignoring foreign sell fill %s — no AgentTrade cooldown",
                 fill.get("ticker") or fill.get("symbol") or fid,
@@ -366,6 +589,7 @@ def sync_sell_fills(ctx: dict, fills: list, now: Optional[datetime] = None) -> d
 
         ac = fill.get("asset_class") or infer_asset_class(sym_u)
         unlock_at = fill_time + cooldown
+        order_id = fill.get("order_id") or fill.get("alpaca_order_id")
         ctx = _upsert_symbol_lock(
             ctx,
             symbol=sym_u,
@@ -374,7 +598,19 @@ def sync_sell_fills(ctx: dict, fills: list, now: Optional[datetime] = None) -> d
             reason="recent_sell",
             scope="symbol",
             locked_at=fill_time,
+            client_order_id=client_order_id or None,
+            order_id=str(order_id) if order_id else None,
         )
+        record_exit_order({
+            "ticker": sym_u,
+            "side": "sell",
+            "status": "filled",
+            "order_id": order_id,
+            "client_order_id": client_order_id,
+            "submitted_at": fill_iso,
+            "shares": fill.get("shares") or fill.get("qty"),
+            "source": "sell_fill",
+        })
 
         log.info(
             "[BuyLock] Sell fill detected: %s (%s) qty=%s — symbol lock until %s",
@@ -410,18 +646,28 @@ def record_sells_placed(ctx: dict, orders: list, now: Optional[datetime] = None)
 
     symbols: list[str] = []
     buckets: dict[str, str] = {}
+    unlock_at = now + timedelta(hours=cfg.POST_SELL_COOLDOWN_HOURS)
     for o in placed:
         sym = o.get("ticker") or o.get("symbol") or ""
         sym_u = str(sym).upper()
-        if sym_u:
-            symbols.append(sym_u)
-            if o.get("bucket"):
-                buckets[sym_u] = o["bucket"]
-
-    unlock_at = now + timedelta(hours=cfg.POST_SELL_COOLDOWN_HOURS)
-    ctx = _add_sell_locks_from_symbols(
-        ctx, symbols, now=now, reason="recent_sell", unlock_at=unlock_at, buckets=buckets,
-    )
+        if not sym_u:
+            continue
+        symbols.append(sym_u)
+        if o.get("bucket"):
+            buckets[sym_u] = o["bucket"]
+        ctx = _upsert_symbol_lock(
+            ctx,
+            symbol=sym_u,
+            asset_class=infer_asset_class(sym_u),
+            unlock_at=unlock_at,
+            reason="recent_sell",
+            scope="symbol",
+            bucket=o.get("bucket") or _lookup_bucket(sym_u),
+            locked_at=now,
+            client_order_id=o.get("client_order_id"),
+            order_id=str(o.get("order_id") or "") or None,
+        )
+        record_exit_order(o)
 
     last_sell_symbols = list(ctx.get("last_sell_symbols") or [])
     for sym in symbols:

@@ -216,40 +216,122 @@ def test_fill_without_client_id_uses_the_sqlite_order(monkeypatch):
     assert not any(buy_lock.symbols_match(sym, "PEPEUSD") for sym in symbols)
 
 
-def test_load_drops_foreign_pepe_lock_and_keeps_ours():
+def _closed_sell(order_id, symbol, client_order_id, when):
+    return {
+        "id": order_id,
+        "symbol": symbol,
+        "side": "sell",
+        "status": "filled",
+        "client_order_id": client_order_id,
+        "filled_at": when,
+    }
+
+
+def test_sol_and_link_stay_locked_when_missing_from_sqlite(monkeypatch):
+    """Today's SOL stop and manual LINK close are not in the orders table."""
     from agenttrade import db
     import buy_lock
 
     db.init_db()
-    cycle_id = db.start_cycle_run("paper")
-    db.record_submitted_order(cycle_id, {
-        "order_id": "ord-sol-keep",
-        "symbol": "SOLUSD",
-        "side": "sell",
-        "status": "filled",
-        "client_order_id": "agenttrade-stop-sol",
-    })
-    db.record_submitted_order(cycle_id, {
-        "order_id": "ord-link-keep",
-        "symbol": "LINKUSD",
-        "side": "sell",
-        "status": "filled",
-        "client_order_id": "agenttrade-manual-stop-link",
-    })
-    unlock = _unlock()
+    when = datetime.now().isoformat()
+    closed = [
+        _closed_sell("2d8ac276", "SOLUSD", "agenttrade-8ff5e799", when),
+        _closed_sell("49472a42", "LINK/USD", "agenttrade-manual-stop-link-1", when),
+        _closed_sell("pepe-foreign", "PEPE/USD", "cryptoagent-pepe", when),
+    ]
+    monkeypatch.setattr(buy_lock, "fetch_closed_orders", lambda: closed)
     db.set_buy_lock_state({
-        "symbol_locks": [_lock("LINKUSD"), _lock("PEPEUSD"), _lock("SOLUSD")],
-        "last_sell_symbols": ["LINKUSD", "PEPEUSD", "SOLUSD"],
-        "last_sell_at": datetime.now().isoformat(),
+        "symbol_locks": [_lock("SOLUSD"), _lock("LINK/USD"), _lock("PEPE/USD")],
+        "last_sell_symbols": ["SOLUSD", "LINK/USD", "PEPE/USD"],
+        "last_sell_at": when,
     })
     loaded = buy_lock.load_prior_state()
     symbols = {row["symbol"] for row in loaded["symbol_locks"]}
-    assert "PEPEUSD" not in symbols
     assert "SOLUSD" in symbols
-    assert "LINKUSD" in symbols
-    assert "PEPEUSD" not in loaded["last_sell_symbols"]
+    assert "LINK/USD" in symbols
+    assert "PEPE/USD" not in symbols
+    assert "PEPE/USD" not in loaded["last_sell_symbols"]
     assert "SOLUSD" in loaded["last_sell_symbols"]
-    assert unlock  # lock rows carry a future unlock; load does not expire them
+
+
+def test_unknown_lock_is_kept_when_ownership_cannot_be_read(monkeypatch):
+    from agenttrade import db
+    import buy_lock
+
+    db.init_db()
+    monkeypatch.setattr(buy_lock, "fetch_closed_orders", lambda: None)
+    db.set_buy_lock_state({
+        "symbol_locks": [_lock("DOGEUSD")],
+        "last_sell_symbols": ["DOGEUSD"],
+    })
+    loaded = buy_lock.load_prior_state()
+    assert [row["symbol"] for row in loaded["symbol_locks"]] == ["DOGEUSD"]
+    assert loaded["last_sell_symbols"] == ["DOGEUSD"]
+
+
+def test_trade_log_client_id_keeps_sol_and_drops_pepe(monkeypatch, tmp_path):
+    import json
+    from agenttrade import db
+    import agent_config as cfg
+    import buy_lock
+
+    db.init_db()
+    monkeypatch.setattr(cfg, "APP_DIR", str(tmp_path))
+    monkeypatch.setattr(buy_lock, "fetch_closed_orders", lambda: [])
+    when = datetime.now().isoformat()
+    (tmp_path / "trade_log.jsonl").write_text(
+        json.dumps({
+            "symbol": "SOL/USD", "side": "sell",
+            "client_order_id": "agenttrade-8ff5e799", "time": when,
+        }) + "\n" + json.dumps({
+            "symbol": "PEPEUSD", "side": "sell",
+            "client_order_id": "cryptoagent-pepe", "time": when,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    db.set_buy_lock_state({
+        "symbol_locks": [_lock("SOLUSD"), _lock("PEPE/USD")],
+        "last_sell_symbols": ["SOLUSD", "PEPE/USD"],
+    })
+    loaded = buy_lock.load_prior_state()
+    symbols = {row["symbol"] for row in loaded["symbol_locks"]}
+    assert "SOLUSD" in symbols
+    assert "PEPE/USD" not in symbols
+
+
+def test_placed_exit_records_the_client_id_on_the_lock_and_in_sqlite():
+    from agenttrade import db
+    import buy_lock
+
+    db.init_db()
+    now = datetime.now()
+    ctx = buy_lock.record_sells_placed({}, [{
+        "ticker": "SOLUSD",
+        "side": "sell",
+        "status": "placed",
+        "order_id": "2d8ac276",
+        "client_order_id": "agenttrade-8ff5e799",
+        "source": "position_review",
+    }], now=now)
+    assert ctx["symbol_locks"][0]["client_order_id"] == "agenttrade-8ff5e799"
+    assert ctx["symbol_locks"][0]["order_id"] == "2d8ac276"
+    with db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT symbol, client_order_id, side FROM orders WHERE alpaca_order_id=?",
+            ("2d8ac276",),
+        ).fetchone()
+    assert row["symbol"] == "SOLUSD"
+    assert row["side"] == "sell"
+    assert row["client_order_id"] == "agenttrade-8ff5e799"
+
+
+def test_manual_client_id_is_ours_and_fits_alpaca():
+    from trading_day import client_order_id_is_ours, new_manual_client_order_id
+
+    cid = new_manual_client_order_id("LINK/USD")
+    assert cid.startswith("agenttrade-manual-stop-linkusd-")
+    assert client_order_id_is_ours(cid)
+    assert len(cid) <= 48
 
 
 def test_filled_exit_replaces_the_sqlite_position_book():

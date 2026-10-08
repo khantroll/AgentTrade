@@ -123,6 +123,8 @@ def test_deploy_skips_inplace_copy_and_keeps_runtime_files(tmp_path):
     (app / ".env").write_text("SECRET=live\nALPACA_PAPER=true\n", encoding="utf-8")
     (app / "agent_state.json").write_text('{"equity": 1, "marker": "live"}', encoding="utf-8")
     (app / "llm_health.json").write_text('{"groq": {"cooldown_until": 1}}', encoding="utf-8")
+    (app / "config.json").write_text('{"ALPACA_PAPER": "true"}', encoding="utf-8")
+    (app / "bucket_tags.json").write_text('{"AAPL": "Growth"}', encoding="utf-8")
     (app / "trade_log.jsonl").write_text("LIVE-TRADE\n", encoding="utf-8")
     (app / "trading_agent.log").write_text("LIVE-LOG\n", encoding="utf-8")
     (app / "agenttrade.sqlite3").write_bytes(b"SQLITE-LIVE")
@@ -142,6 +144,13 @@ def test_deploy_skips_inplace_copy_and_keeps_runtime_files(tmp_path):
     assert (app / "trading_agent.log").read_text(encoding="utf-8") == "LIVE-LOG\n"
     assert (app / "agenttrade.sqlite3").read_bytes() == b"SQLITE-LIVE"
     assert (app / "cycle.py").is_file()
+    backups = list((app / "backups").glob("update-*"))
+    assert backups
+    backup = backups[0]
+    assert (backup / "config.json").read_text(encoding="utf-8").startswith("{")
+    assert (backup / "llm_health.json").read_text(encoding="utf-8").startswith('{"groq"')
+    assert "Growth" in (backup / "bucket_tags.json").read_text(encoding="utf-8")
+    assert (backup / "trade_log.jsonl").read_text(encoding="utf-8") == "LIVE-TRADE\n"
     script = (ROOT / "update_deploy.sh").read_text(encoding="utf-8")
     assert "grep -q reconciliation" not in script
     assert "Pre-Cycle Health" in script

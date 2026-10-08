@@ -552,9 +552,11 @@ def hard_rebalance_agent(
                 "shares": qty,
                 "bucket": plan.get("bucket"),
                 "order_id": order.get("id"),
+                "client_order_id": payload["client_order_id"],
                 "status": "placed",
                 "side": "sell",
                 "rationale": plan.get("reason"),
+                "source": "hard_rebalance",
                 "hard_rebalance": True,
             })
         except Exception as e:

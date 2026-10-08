@@ -20,6 +20,10 @@ from zoneinfo import ZoneInfo
 
 TRADING_TIMEZONE_NAME = "America/Chicago"
 TRADING_TZ = ZoneInfo(TRADING_TIMEZONE_NAME)
+# Cron and run_cycle.sh force this zone. Naive last_run stamps are that clock,
+# even when the config server process is in another zone.
+CYCLE_CLOCK_TIMEZONE_NAME = "America/New_York"
+CYCLE_CLOCK_TZ = ZoneInfo(CYCLE_CLOCK_TIMEZONE_NAME)
 
 # Alpaca client_order_id is limited to 48 characters. The prefix plus a
 # 32-char hex uuid is 43.
@@ -110,9 +114,9 @@ def parse_cycle_timestamp(value) -> Optional[datetime]:
     """Parse a cycle clock as an aware UTC instant.
 
     New stamps include an offset. Older ``last_run`` values were written with
-    ``datetime.now().isoformat()``, which is naive host-local time. On the
-    paper host that clock is US Eastern, so reading it as UTC made the
-    health age about four hours too high.
+    ``datetime.now().isoformat()`` under ``TZ=America/New_York`` (cron and
+    ``run_cycle.sh``). The config server does not set that variable. Reading
+    11:32 Eastern as Chicago displays 11:32 CT instead of 10:32 CT.
     """
     if isinstance(value, datetime):
         dt = value
@@ -126,7 +130,7 @@ def parse_cycle_timestamp(value) -> Optional[datetime]:
         except ValueError:
             return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=host_local_timezone())
+        dt = dt.replace(tzinfo=CYCLE_CLOCK_TZ)
     return dt.astimezone(timezone.utc)
 
 
@@ -149,6 +153,18 @@ def hours_since(dt: datetime, now=None) -> float:
 def new_client_order_id() -> str:
     """Client order id Alpaca will store for an AgentTrade submission."""
     return CLIENT_ORDER_PREFIX + uuid.uuid4().hex
+
+
+def new_manual_client_order_id(symbol: str) -> str:
+    """Client id for an operator close. Alpaca allows 48 characters.
+
+    ``agenttrade-manual-`` still counts as ours for the sell cooldown.
+    """
+    slug = "".join(ch for ch in str(symbol or "").lower() if ch.isalnum())[:12] or "exit"
+    prefix = f"{CLIENT_ORDER_PREFIX}manual-stop-{slug}-"
+    room = 48 - len(prefix)
+    token = uuid.uuid4().hex[: max(4, min(8, room))]
+    return (prefix + token)[:48]
 
 
 def client_order_id_is_ours(value) -> bool:

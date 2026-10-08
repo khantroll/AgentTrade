@@ -381,6 +381,7 @@ def _place_sell(
             "shares":    qty,
             "bucket":    bucket.name if bucket else "unknown",
             "order_id":  order.get("id"),
+            "client_order_id": payload["client_order_id"],
             "status":    "placed",
             "side":      "sell",
             "rationale": reason,

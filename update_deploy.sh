@@ -289,6 +289,10 @@ for f in "${DEPLOY_FILES[@]}"; do
 done
 [[ -f "$APP_DIR/.env" ]] && cp -a "$APP_DIR/.env" "$BACKUP_DIR/.env"
 [[ -f "$APP_DIR/agent_state.json" ]] && cp -a "$APP_DIR/agent_state.json" "$BACKUP_DIR/agent_state.json"
+[[ -f "$APP_DIR/config.json" ]] && cp -a "$APP_DIR/config.json" "$BACKUP_DIR/config.json"
+[[ -f "$APP_DIR/llm_health.json" ]] && cp -a "$APP_DIR/llm_health.json" "$BACKUP_DIR/llm_health.json"
+[[ -f "$APP_DIR/bucket_tags.json" ]] && cp -a "$APP_DIR/bucket_tags.json" "$BACKUP_DIR/bucket_tags.json"
+[[ -f "$APP_DIR/trade_log.jsonl" ]] && cp -a "$APP_DIR/trade_log.jsonl" "$BACKUP_DIR/trade_log.jsonl"
 [[ -f "$APP_DIR/agenttrade.sqlite3" ]] && cp -a "$APP_DIR/agenttrade.sqlite3" "$BACKUP_DIR/agenttrade.sqlite3" || true
 success "Backup saved to $BACKUP_DIR"
 

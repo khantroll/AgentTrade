@@ -283,10 +283,34 @@ function applyDailyTradeStrip(used, limit) {
   if (risk) risk.textContent = n(used) + '/' + lim;
 }
 function money(v) { const x = n(v); return '$' + x.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function legacyEasternDate(ts) {
+  // Naive cycle stamps are US Eastern. Cron and run_cycle.sh set TZ=America/New_York.
+  // new Date() would read them in the browser zone and show 11:32 CT for 10:32 CT.
+  const text = String(ts).trim();
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) return new Date(text);
+  const utcGuess = Date.UTC(+match[1], +match[2] - 1, +match[3], +match[4], +match[5], +(match[6] || 0));
+  const offsetMinutes = (instant) => {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York', hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    }).formatToParts(new Date(instant));
+    const get = (type) => (parts.find(p => p.type === type) || {}).value || '0';
+    const asUtc = Date.UTC(+get('year'), +get('month') - 1, +get('day'), +get('hour') % 24, +get('minute'), +get('second'));
+    return (asUtc - instant) / 60000;
+  };
+  let offset = offsetMinutes(utcGuess);
+  const adjusted = utcGuess - offset * 60000;
+  offset = offsetMinutes(adjusted);
+  return new Date(utcGuess - offset * 60000);
+}
 function formatChicago(ts) {
   if (!ts) return '';
-  const d = new Date(ts);
-  if (isNaN(d.getTime())) return String(ts).slice(0, 16).replace('T', ' ');
+  const raw = String(ts).trim();
+  const hasOffset = /(?:Z|[+-]\d{2}:?\d{2})$/.test(raw);
+  const d = hasOffset ? new Date(raw) : legacyEasternDate(raw);
+  if (isNaN(d.getTime())) return raw.slice(0, 16).replace('T', ' ');
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', hour12: false,
