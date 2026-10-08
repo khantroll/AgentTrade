@@ -454,8 +454,10 @@ def build_dashboard_state(cached_funnel: Optional[dict] = None, live_snapshot: O
         for pos in state.get("positions") or []:
             if not pos.get("bucket"):
                 sym = pos.get("symbol") or pos.get("ticker") or ""
-                if sym and bucket_tags.get(sym):
-                    pos["bucket"] = bucket_tags[sym]
+                from order_utils import lookup_tag
+                tagged = lookup_tag(sym, bucket_tags) if sym else None
+                if tagged:
+                    pos["bucket"] = tagged
 
     _log_signals_publish_summary(state, cached)
     return state

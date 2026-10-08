@@ -44,6 +44,59 @@ def is_crypto_symbol(symbol: str) -> bool:
     return False
 
 
+# Alpaca rejects crypto orders with time_in_force=day (HTTP 422).
+# Crypto market and limit orders accept gtc or ioc. Equity stays day.
+CRYPTO_TIME_IN_FORCE = "gtc"
+EQUITY_TIME_IN_FORCE = "day"
+
+
+def order_time_in_force(asset: AssetRef, *, bucket_is_crypto: bool = False) -> str:
+    """Time in force Alpaca will accept for this order.
+
+    A crypto symbol is crypto even when its bucket tag is missing or stored
+    under the other spelling (``LINKUSD`` vs ``LINK/USD``).
+    """
+    if bucket_is_crypto or is_crypto_asset(asset):
+        return CRYPTO_TIME_IN_FORCE
+    return EQUITY_TIME_IN_FORCE
+
+
+def crypto_symbol_forms(symbol: str) -> list[str]:
+    """Spellings that refer to one Alpaca crypto pair.
+
+    Positions come back as ``LINKUSD``. Bucket tags are often ``LINK/USD``.
+    Equity tickers return a single-item list.
+    """
+    sym = "".join((symbol or "").upper().split())
+    if not sym:
+        return []
+    forms = [sym]
+    if "/" in sym:
+        compact = sym.replace("/", "")
+        if compact not in forms:
+            forms.append(compact)
+    elif is_crypto_symbol(sym) and sym.endswith("USD") and len(sym) > 3:
+        slash = f"{sym[:-3]}/USD"
+        if slash not in forms:
+            forms.append(slash)
+    return forms
+
+
+def lookup_tag(symbol: str, tags: Optional[dict]) -> Optional[str]:
+    """Bucket name for a symbol, matching ``XXXUSD`` and ``XXX/USD`` tags."""
+    if not tags or not symbol:
+        return None
+    for form in crypto_symbol_forms(symbol):
+        name = tags.get(form)
+        if name:
+            return name
+    wanted = set(crypto_symbol_forms(symbol))
+    for key, name in tags.items():
+        if wanted.intersection(crypto_symbol_forms(str(key))):
+            return name
+    return None
+
+
 def format_qty_for_asset(qty: Union[int, float, str], asset: AssetRef) -> str:
     """Format quantity for Alpaca — fractional for crypto, whole shares for equity.
 
@@ -150,7 +203,7 @@ def build_equity_buy_payload(
         "qty": format_qty_for_asset(shares, symbol),
         "side": "buy",
         "type": "limit" if order_type == "limit" else "market",
-        "time_in_force": "day",
+        "time_in_force": order_time_in_force(symbol),
     }
     rounded_limit = None
     if payload["type"] == "limit":

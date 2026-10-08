@@ -19,21 +19,52 @@ from typing import Optional
 import agent_config as cfg
 from alpaca_client import alpaca_post, get_open_orders, has_pending_sell_order
 from buckets import Bucket
-from order_utils import format_qty_for_asset, stop_already_breached
+from order_utils import (
+    format_qty_for_asset,
+    is_crypto_asset,
+    order_time_in_force,
+    stop_already_breached,
+)
 
 log = logging.getLogger(__name__)
 
 
 def _bucket_for_position(symbol: str, buckets: list) -> Optional[Bucket]:
-    """Find which bucket a symbol belongs to via bucket_tags."""
-    tags = cfg.bucket_manager._load_tags()
-    bucket_name = tags.get(symbol)
+    """Find which bucket a symbol belongs to via bucket_tags.
+
+    Alpaca reports ``LINKUSD`` while tags are often stored as ``LINK/USD``.
+    """
+    bucket_name = cfg.bucket_manager.tag_for_symbol(symbol)
     if not bucket_name:
         return None
     for b in buckets:
         if b.name == bucket_name:
             return b
     return None
+
+
+def _crypto_bucket(buckets: list) -> Optional[Bucket]:
+    for b in buckets or []:
+        if (
+            getattr(b, "is_crypto", False)
+            or getattr(b, "asset_class", "") == "crypto"
+            or getattr(b, "mode", "") == "crypto"
+        ):
+            return b
+    return None
+
+
+def _position_is_crypto(pos: dict, bucket: Optional[Bucket]) -> bool:
+    """Crypto by Alpaca asset_class, USD pair symbol, or a crypto bucket tag."""
+    if is_crypto_asset(pos):
+        return True
+    if bucket and (
+        getattr(bucket, "is_crypto", False)
+        or getattr(bucket, "asset_class", "") == "crypto"
+        or getattr(bucket, "mode", "") == "crypto"
+    ):
+        return True
+    return False
 
 
 def _get_alpaca_stops(symbol: str, open_orders: list) -> dict:
@@ -184,7 +215,8 @@ def review_positions(
     portfolio_value = float(account.get("portfolio_value", 10000))
     all_buckets = cfg.bucket_manager.buckets
     sells_placed = []
-    sells_attempted = 0
+    exits_failed = 0
+    exits_deferred = 0
 
     log.info("[PositionReview] Checking %d positions for exit conditions...", len(positions))
 
@@ -209,9 +241,12 @@ def review_positions(
             continue
 
         bucket = _bucket_for_position(symbol, all_buckets)
+        is_crypto = _position_is_crypto(pos, bucket)
+        if bucket is None and is_crypto:
+            # Untagged crypto still uses the crypto stop, not the equity 7%.
+            bucket = _crypto_bucket(all_buckets)
         if bucket is None:
-            # Untagged position — use conservative defaults
-            sl_pct = 0.07
+            sl_pct = 0.08 if is_crypto else 0.07
             tp_pct = 0.15
         else:
             sl_pct = bucket.stop_loss_pct
@@ -236,11 +271,20 @@ def review_positions(
 
         if exit_reason:
             log.info("[PositionReview] %s: %s — SELL %s shares", symbol, exit_reason, qty)
-            order = _place_sell(symbol, qty, exit_reason, bucket, market_open)
+            order = _place_sell(symbol, qty, exit_reason, bucket, market_open, is_crypto=is_crypto)
             if order and order.get("status") == "placed":
                 cfg.bucket_manager.untag_position(symbol)
                 sells_placed.append(order)
-                sells_attempted += 1
+            elif order and order.get("status") == "failed":
+                sells_placed.append(order)
+                exits_failed += 1
+                log.error(
+                    "[PositionReview] EXIT FAILED %s — will retry next cycle: %s",
+                    symbol,
+                    order.get("error"),
+                )
+            else:
+                exits_deferred += 1
             continue
 
         # Soft trim: bucket overweight — sell partial position
@@ -256,24 +300,47 @@ def review_positions(
                     f" — trimming {trim_qty} of {qty:.0f} shares"
                 )
                 log.info("[PositionReview] %s: %s", symbol, reason)
-                order = _place_sell(symbol, trim_qty, reason, bucket, market_open)
-                if order:
+                order = _place_sell(symbol, trim_qty, reason, bucket, market_open, is_crypto=is_crypto)
+                if order and order.get("status") == "placed":
                     sells_placed.append(order)
-                    sells_attempted += 1
+                elif order and order.get("status") == "failed":
+                    sells_placed.append(order)
+                    exits_failed += 1
+                    log.error(
+                        "[PositionReview] EXIT FAILED %s — will retry next cycle: %s",
+                        symbol,
+                        order.get("error"),
+                    )
+                elif order is None:
+                    exits_deferred += 1
 
-    if sells_attempted == 0:
+    placed = [o for o in sells_placed if o.get("status") == "placed"]
+    if not placed and exits_failed == 0 and exits_deferred == 0:
         log.info("[PositionReview] No exit conditions triggered.")
-    else:
-        log.info("[PositionReview] %d sell order(s) placed.", sells_attempted)
+    if placed:
+        log.info("[PositionReview] %d sell order(s) placed.", len(placed))
+    if exits_failed:
+        log.error(
+            "[PositionReview] %d exit(s) FAILED and will be retried next cycle.",
+            exits_failed,
+        )
+    if exits_deferred:
+        log.info("[PositionReview] %d exit(s) deferred until the market is open.", exits_deferred)
 
     return sells_placed
 
 
-def _place_sell(symbol: str, qty, reason: str, bucket: Optional[Bucket], market_open: bool) -> Optional[dict]:
+def _place_sell(
+    symbol: str,
+    qty,
+    reason: str,
+    bucket: Optional[Bucket],
+    market_open: bool,
+    is_crypto: Optional[bool] = None,
+) -> Optional[dict]:
     """Submit a market sell order to Alpaca."""
-    is_crypto = bucket and (
-        getattr(bucket, "asset_class", "") == "crypto" or bucket.mode == "crypto"
-    )
+    if is_crypto is None:
+        is_crypto = _position_is_crypto({"symbol": symbol}, bucket)
 
     if not is_crypto and not market_open:
         log.info("[PositionReview] %s: market closed — deferring sell until next open", symbol)
@@ -296,7 +363,7 @@ def _place_sell(symbol: str, qty, reason: str, bucket: Optional[Bucket], market_
             "qty":           qty_str,
             "side":          "sell",
             "type":          "market",
-            "time_in_force": "gtc" if is_crypto else "day",
+            "time_in_force": order_time_in_force(asset, bucket_is_crypto=is_crypto),
         }
         from trading_day import new_client_order_id
         payload["client_order_id"] = new_client_order_id()
@@ -316,7 +383,15 @@ def _place_sell(symbol: str, qty, reason: str, bucket: Optional[Bucket], market_
         }
     except Exception as e:
         log.error("[PositionReview] ❌ SELL %s failed: %s", symbol, e)
+        # Leave the position tagged and the stop in place so the next cycle retries.
         return {
-            "ticker": symbol, "shares": qty, "side": "sell",
-            "status": "failed", "error": str(e), "source": "position_review",
+            "ticker": symbol,
+            "shares": qty,
+            "bucket": bucket.name if bucket else "unknown",
+            "side": "sell",
+            "status": "failed",
+            "error": str(e),
+            "rationale": f"{reason} — FAILED: {e}",
+            "source": "position_review",
+            "retry_next_cycle": True,
         }

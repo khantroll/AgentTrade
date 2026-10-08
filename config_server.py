@@ -1141,9 +1141,10 @@ def create_app():
             if not qty and not notional and side == "sell":
                 result = close_position(symbol)
                 return jsonify({"ok": True, "message": f"{symbol} full position closed", "order": result})
+            from order_utils import order_time_in_force
             order = {
                 "symbol": symbol, "side": side,
-                "type": "market", "time_in_force": "day",
+                "type": "market", "time_in_force": order_time_in_force(symbol),
             }
             if qty:
                 order["qty"] = str(qty)
