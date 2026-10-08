@@ -96,6 +96,56 @@ def chicago_trading_date(now=None):
     return start.astimezone(TRADING_TZ).date()
 
 
+def host_local_timezone():
+    """Timezone of naive ``datetime.now()`` stamps on this host."""
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def aware_now_iso() -> str:
+    """UTC timestamp with an explicit offset. Safe to store and compare."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_cycle_timestamp(value) -> Optional[datetime]:
+    """Parse a cycle clock as an aware UTC instant.
+
+    New stamps include an offset. Older ``last_run`` values were written with
+    ``datetime.now().isoformat()``, which is naive host-local time. On the
+    paper host that clock is US Eastern, so reading it as UTC made the
+    health age about four hours too high.
+    """
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        text = text.replace("Z", "+00:00").replace(" ", "T")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=host_local_timezone())
+    return dt.astimezone(timezone.utc)
+
+
+def format_chicago(dt: datetime) -> str:
+    """Operator-facing clock. Always America/Chicago, labeled CT."""
+    return dt.astimezone(TRADING_TZ).strftime("%Y-%m-%d %H:%M CT")
+
+
+def hours_since(dt: datetime, now=None) -> float:
+    """Elapsed hours between an aware instant and ``now`` (default: UTC now)."""
+    if now is None:
+        moment = datetime.now(timezone.utc)
+    elif isinstance(now, datetime):
+        moment = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    else:
+        moment = parse_cycle_timestamp(now) or datetime.now(timezone.utc)
+    return (moment.astimezone(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600
+
+
 def new_client_order_id() -> str:
     """Client order id Alpaca will store for an AgentTrade submission."""
     return CLIENT_ORDER_PREFIX + uuid.uuid4().hex

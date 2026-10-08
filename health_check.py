@@ -28,20 +28,18 @@ def _load_json(path: str) -> dict:
 
 
 def _parse_dt(ts: str) -> Optional[datetime]:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except ValueError:
-        return None
+    """Parse a cycle timestamp. Naive values are host-local, not UTC."""
+    from trading_day import parse_cycle_timestamp
+
+    return parse_cycle_timestamp(ts)
 
 
-def _hours_ago(dt: Optional[datetime]) -> Optional[float]:
+def _hours_ago(dt: Optional[datetime], now=None) -> Optional[float]:
     if not dt:
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    from trading_day import hours_since
+
+    return hours_since(dt, now)
 
 
 def _check(status: str, check_id: str, label: str, message: str, **extra) -> dict:
@@ -156,8 +154,10 @@ def _last_cycle_check(state: dict) -> dict:
     if not dt:
         return _check("warn", "last_cycle", "Last cycle", "No completed cycle in SQLite ledger")
 
+    from trading_day import format_chicago
+
     age = f"{hours:.1f}h ago" if hours is not None else "unknown"
-    msg = f"{dt.strftime('%Y-%m-%d %H:%M')} ({age})"
+    msg = f"{format_chicago(dt)} ({age})"
     if hours is not None and hours > 36:
         return _check("error", "last_cycle", "Last cycle", msg + " · stale", hours=hours)
     if hours is not None and hours > 12:

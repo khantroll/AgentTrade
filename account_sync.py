@@ -199,7 +199,8 @@ def refresh_alpaca_snapshot() -> dict:
         1 for o in open_orders if str(o.get("side", "")).lower() == "sell"
     )
 
-    now = datetime.now().isoformat()
+    from trading_day import aware_now_iso
+    now = aware_now_iso()
     daily_trades_live = _count_trades_today(recent_fills, open_orders)
 
     snapshot = {
@@ -268,7 +269,8 @@ def merge_snapshot_into_state(state: dict, snapshot: dict, *, source: str = "cyc
     if snapshot.get("daily_trades_live") is not None:
         state["daily_trades"] = snapshot["daily_trades_live"]
 
-    now = datetime.now().isoformat()
+    from trading_day import aware_now_iso
+    now = aware_now_iso()
     state["last_state_refresh_at"] = now
     if source == "cycle":
         state["last_trading_cycle_at"] = now

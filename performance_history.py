@@ -247,15 +247,13 @@ def build_cycle_snapshot(account: dict, positions: list, state: dict) -> dict:
     decisions = state.get("decisions") or []
     buys = sum(1 for d in decisions if str(d.get("action", "")).upper() == "BUY")
 
-    ts = state.get("last_run") or datetime.now().isoformat()
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except ValueError:
-        dt = datetime.now()
+    from trading_day import aware_now_iso, format_chicago, parse_cycle_timestamp
+    ts = state.get("last_run") or aware_now_iso()
+    dt = parse_cycle_timestamp(ts) or parse_cycle_timestamp(aware_now_iso())
 
     return {
         "ts": ts,
-        "date": dt.date().isoformat(),
+        "date": format_chicago(dt)[:10],
         "portfolio_value": round(equity, 2),
         "cash": round(cash, 2),
         "last_equity": round(last_equity, 2) if last_equity else None,
