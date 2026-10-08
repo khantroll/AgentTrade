@@ -253,6 +253,14 @@ def test_buy_lock_state_round_trips_sqlite():
     import buy_lock
 
     db.init_db()
+    cycle_id = db.start_cycle_run("paper")
+    db.record_submitted_order(cycle_id, {
+        "symbol": "TSLA",
+        "side": "sell",
+        "status": "filled",
+        "client_order_id": "agenttrade-stop-tsla",
+        "order_id": "ord-tsla-lock",
+    })
     ctx = {
         "symbol_locks": [{
             "symbol": "TSLA",

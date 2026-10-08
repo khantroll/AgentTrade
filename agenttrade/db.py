@@ -713,10 +713,20 @@ def insert_fill(cycle_run_id: int, fill: dict) -> None:
 
 
 def insert_positions(cycle_run_id: int, source: str, positions: list) -> int:
+    """Replace this cycle's position picture for ``source``.
+
+    A later sync in the same cycle is the broker's current book. Leaving the
+    earlier rows in place kept a filled exit (SOLUSD) visible after Alpaca
+    no longer had it.
+    """
     _ensure_db()
     captured = utc_now()
     count = 0
     with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM positions WHERE cycle_run_id=? AND source=?",
+            (cycle_run_id, source),
+        )
         for p in positions or []:
             qty = _f(p.get("qty"))
             side = "short" if qty < 0 else "long"
@@ -963,9 +973,24 @@ def get_latest_positions() -> list:
         snap = conn.execute("SELECT cycle_run_id FROM account_snapshots ORDER BY id DESC LIMIT 1").fetchone()
         if not snap:
             return []
-        rows = conn.execute(
-            "SELECT * FROM positions WHERE cycle_run_id=? ORDER BY symbol",
+        latest = conn.execute(
+            """
+            SELECT captured_at FROM positions
+            WHERE cycle_run_id=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
             (snap["cycle_run_id"],),
+        ).fetchone()
+        if not latest:
+            return []
+        rows = conn.execute(
+            """
+            SELECT * FROM positions
+            WHERE cycle_run_id=? AND captured_at=?
+            ORDER BY symbol
+            """,
+            (snap["cycle_run_id"], latest["captured_at"]),
         ).fetchall()
         return [dict(r) for r in rows]
 
