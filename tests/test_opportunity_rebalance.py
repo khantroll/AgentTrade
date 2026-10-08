@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -183,6 +184,34 @@ def test_swap_hysteresis_min_hold_same_cycle_cap_and_lock():
         locked_symbols={"MSFT"},
     )
     assert "swap_sell" not in _actions(locked)
+
+
+def test_saved_config_wins_and_a_filled_default_does_not_clobber_env(monkeypatch, tmp_path):
+    import config_server
+    from opportunity_rebalance import load_settings
+
+    path = tmp_path / "config.json"
+    path.write_text('{"MAX_DAILY_TRADES": "5"}')
+    monkeypatch.setattr(config_server, "CONFIG_FILE", str(path))
+    monkeypatch.setenv("OPPORTUNITY_REBALANCE", "false")
+    monkeypatch.setenv("MAX_DAILY_TRADES", "9")
+
+    config_server.apply_config_to_env()
+    assert os.environ["OPPORTUNITY_REBALANCE"] == "false"
+    assert load_settings()["enabled"] is False
+    assert os.environ["MAX_DAILY_TRADES"] == "5"
+
+    path.write_text('{"OPPORTUNITY_REBALANCE": "true"}')
+    monkeypatch.setenv("OPPORTUNITY_REBALANCE", "false")
+    config_server.apply_config_to_env()
+    assert os.environ["OPPORTUNITY_REBALANCE"] == "true"
+    assert load_settings()["enabled"] is True
+
+    path.write_text('{"MAX_DAILY_TRADES": "5"}')
+    monkeypatch.delenv("OPPORTUNITY_REBALANCE", raising=False)
+    config_server.apply_config_to_env()
+    assert os.environ["OPPORTUNITY_REBALANCE"] == "true"
+    assert load_settings()["enabled"] is True
 
 
 def test_toggle_off_plans_nothing_to_sell():

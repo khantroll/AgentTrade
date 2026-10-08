@@ -410,7 +410,7 @@ input[type=range]{flex:1;accent-color:var(--accent)}
             <option value="false">Off — stop and target exits only</option>
           </select>
         </div>
-        <div class="hint">Each cycle rescores AgentTrade holdings on the same scale as new candidates. A fading name can be trimmed or closed, and a much stronger same-bucket candidate can replace the weakest holding. Sells do not count toward the daily trade cap. Buys still respect the cash reserve, bucket limits, and the post-sell cooldown.</div>
+        <div class="hint">Each cycle rescores AgentTrade holdings on the same scale as new candidates. A fading name can be trimmed or closed, and a much stronger same-bucket candidate can replace the weakest holding. Sells do not count toward the daily trade cap. Buys still respect the cash reserve, bucket limits, and the post-sell cooldown. Once you save this control, Settings is the source of truth and replaces .env. Until it is saved, an explicit OPPORTUNITY_REBALANCE in .env is kept. If neither is set, rebalancing stays on.</div>
       </div>
       <div class="field-group">
         <div class="field-label">Hard Rebalance Drift Threshold</div>

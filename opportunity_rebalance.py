@@ -18,8 +18,11 @@ from typing import Optional
 
 log = logging.getLogger(__name__)
 
-# Defaults. OPPORTUNITY_REBALANCE is also a Settings / config.json toggle.
-# The other knobs are env or config keys, read at cycle time.
+# Defaults. The on/off switch is Settings / config.json when that key is
+# saved there; that saved value wins over .env. A missing config.json key
+# does not overwrite an explicit OPPORTUNITY_REBALANCE in the environment.
+# If neither source sets it, rebalance stays on. The numeric knobs are
+# environment values and are not written into config.json by this default.
 DEFAULTS = {
     "enabled": True,
     "decay_score": 25.0,

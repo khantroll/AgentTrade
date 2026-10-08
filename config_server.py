@@ -267,12 +267,43 @@ def mask_config(config: dict) -> dict:
     return masked
 
 
+def stored_config_keys() -> set:
+    """Keys actually written in config.json.
+
+    ``load_config`` fills missing keys from ``DEFAULT_CONFIG`` for the
+    Settings form. Those filled-in values are not saved settings.
+    """
+    try:
+        with open(CONFIG_FILE) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return set()
+    except Exception:
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    return {str(key) for key in data.keys()}
+
+
 def apply_config_to_env() -> dict:
-    """Load config.json into os.environ. UI-saved config.json wins over .env."""
+    """Copy config into the process environment.
+
+    Settings / config.json is the source of truth for keys stored in the
+    file, and those values replace ``.env``. A key that is only present
+    because ``load_config`` filled it from ``DEFAULT_CONFIG`` is not a
+    saved setting: it must not replace an explicit environment value.
+    When neither the file nor the environment sets the key, the default
+    is applied. ``OPPORTUNITY_REBALANCE`` therefore stays on the ``.env``
+    value until Settings saves it, and stays on when neither source sets it.
+    """
     cfg = load_config()
-    for k, v in cfg.items():
-        if v is not None and str(v).strip() != "":
-            os.environ[k] = str(v)
+    explicit = stored_config_keys()
+    for key, value in cfg.items():
+        if value is None or str(value).strip() == "":
+            continue
+        if key not in explicit and os.environ.get(key, "").strip() != "":
+            continue
+        os.environ[key] = str(value)
     return cfg
 
 
