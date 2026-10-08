@@ -97,8 +97,46 @@ def _sma_slope(closes, period=50):
     return round((a - b) / b * 100, 3) if b else 0.0
 
 
+# Yahoo logs "$TICKER: possibly delisted" for these names every cycle.
+DELISTED_SYMBOLS = frozenset({
+    "NEWR", "HOLX", "NSA", "MMC", "SUMO", "JAMF", "CYBR", "NOVA", "MPW", "MMP",
+})
+
+
+def dividend_yield_fraction(raw, price=None, annual_dividend=None) -> float:
+    """Dividend yield as a fraction (0.0454 means 4.54%).
+
+    yfinance ``dividendYield`` is a fraction in some releases and a percent
+    in others (4.54, or 454 after a second ×100). The screener floor is
+    ``min_dividend_yield`` 0.02 and the log prints ``yield * 100``, so a
+    percent-scale value both admits sub-2% names and displays 454%.
+
+    Annual dividend dollars divided by price is the unambiguous yield.
+    Otherwise a value above 1 is treated as percent points and divided by
+    100 until it is a fraction.
+    """
+    try:
+        rate = float(annual_dividend or 0)
+        px = float(price or 0)
+    except (TypeError, ValueError):
+        rate, px = 0.0, 0.0
+    if rate > 0 and px > 0:
+        return rate / px
+    try:
+        y = float(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if y < 0:
+        return 0.0
+    while y > 1.0:
+        y /= 100.0
+    return y
+
+
 def fetch_stock_data(ticker: str) -> dict:
     """Lean pre-computed metrics — no raw arrays sent to LLM."""
+    if str(ticker or "").upper() in DELISTED_SYMBOLS:
+        return {}
     try:
         t = yf.Ticker(yfinance_symbol(ticker))
         hist = t.history(period="3mo")
@@ -155,7 +193,11 @@ def fetch_stock_data(ticker: str) -> dict:
             "profit_margin": info.get("profitMargins"),
             "revenue_growth": info.get("revenueGrowth"),
             "debt_to_equity": info.get("debtToEquity"),
-            "dividend_yield": info.get("dividendYield"),
+            "dividend_yield": dividend_yield_fraction(
+                info.get("dividendYield"),
+                price=price,
+                annual_dividend=info.get("dividendRate") or info.get("trailingAnnualDividendRate"),
+            ),
             "dividend_rate": info.get("dividendRate"),
             "payout_ratio": info.get("payoutRatio"),
             "ex_dividend_date": info.get("exDividendDate"),

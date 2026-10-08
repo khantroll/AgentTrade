@@ -74,16 +74,16 @@ SP500_SAMPLE = [
     "NFLX","TMO","ABT","WMT","LIN","AMD","QCOM","DHR","TXN","INTU",
     "PM","MS","GS","ISRG","SPGI","RTX","BLK","NOW","AMGN","SYK",
     "AXP","BKNG","PLD","ADI","GILD","MO","CB","ZTS","MDLZ","REGN",
-    "MMC","VRTX","TJX","ELV","SCHW","BSX","AON","HCA","C","SHW",
+    "VRTX","TJX","ELV","SCHW","BSX","AON","HCA","C","SHW",
     "UBER","ABNB","SNOW","PLTR","CRWD","PANW","DDOG","ZS","NET","MDB",
     "SHOP","COIN","RBLX","SOFI","RIVN","ENPH","FSLR","CELH","MNST","KDP",
-    "DXCM","PODD","ALGN","FTNT","CYBR","DT","ESTC","APPN","PEGA","PCTY",
+    "DXCM","PODD","ALGN","FTNT","DT","ESTC","APPN","PEGA","PCTY",
 ]
 
 RUSSELL_EXTRA = [
-    "SMCI","SEDG","RUN","ARRY","NOVA","STEM","HOLX","XRAY","HSIC",
-    "S","VRNS","TENB","QLYS","RDWR","CERT","JAMF","SUMO","NEWR",
-    "EXR","CUBE","NSA","REXR","EQR","UDR","CPT","ESS","MAA",
+    "SMCI","SEDG","RUN","ARRY","STEM","XRAY","HSIC",
+    "S","VRNS","TENB","QLYS","RDWR","CERT",
+    "EXR","CUBE","REXR","EQR","UDR","CPT","ESS","MAA",
     "WOLF","LAZR","LIDR","IONQ","RGTI","QBTS","SOUN","BBAI","GTLB","PATH",
 ]
 
@@ -93,16 +93,19 @@ DIVIDEND_UNIVERSE = [
     "JNJ","PG","KO","PEP","MCD","MMM","T","VZ","XOM","CVX",
     "MO","PM","ABBV","BMY","PFE","GILD","AMGN","AVGO","TXN","QCOM",
     # REITs (high yield)
-    "O","MAIN","STAG","EPR","WPC","NNN","ADC","VICI","IIPR","MPW",
+    "O","MAIN","STAG","EPR","WPC","NNN","ADC","VICI","IIPR",
     # Business Development Companies
     "ARCC","HTGC","GBDC","PSEC","GAIN","TPVG","FDUS","GLAD","SLRC","CSWC",
     # Utilities
     "NEE","DUK","SO","D","AEP","EXC","SRE","XEL","WEC","ES",
     # MLPs & Energy income
-    "ENB","ET","EPD","MMP","PAA","MPLX","WMB","KMI","OKE","LNG",
+    "ENB","ET","EPD","PAA","MPLX","WMB","KMI","OKE","LNG",
 ]
 
-ALL_CANDIDATES = list(set(SP500_SAMPLE + RUSSELL_EXTRA) - EXCLUSIONS)
+from market_data import DELISTED_SYMBOLS
+
+ALL_CANDIDATES = [t for t in (set(SP500_SAMPLE + RUSSELL_EXTRA) - EXCLUSIONS) if t not in DELISTED_SYMBOLS]
+DIVIDEND_UNIVERSE = [t for t in DIVIDEND_UNIVERSE if t not in DELISTED_SYMBOLS]
 
 # Alpaca crypto symbols to consider when bucket mode = crypto.
 DEFAULT_CRYPTO_SYMBOLS = [
@@ -636,12 +639,20 @@ def dividend_quality_screen(candidates: list, top_n: int = 25) -> list:
     scored = []
 
     for ticker in candidates:
+        if str(ticker).upper() in DELISTED_SYMBOLS:
+            continue
         try:
             info = yf.Ticker(yfinance_symbol(ticker)).info
-            yield_    = info.get("dividendYield") or 0
+            from market_data import dividend_yield_fraction
+            div_rate  = info.get("dividendRate") or info.get("trailingAnnualDividendRate") or 0
+            price     = info.get("regularMarketPrice") or info.get("currentPrice") or 0
+            yield_    = dividend_yield_fraction(
+                info.get("dividendYield"),
+                price=price,
+                annual_dividend=div_rate,
+            )
             payout    = info.get("payoutRatio")   or 1.0
             eps       = info.get("trailingEps")   or 0
-            div_rate  = info.get("dividendRate")  or 0
             ex_date   = info.get("exDividendDate")
 
             # Hard filters

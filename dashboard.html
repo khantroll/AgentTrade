@@ -283,6 +283,17 @@ function applyDailyTradeStrip(used, limit) {
   if (risk) risk.textContent = n(used) + '/' + lim;
 }
 function money(v) { const x = n(v); return '$' + x.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}); }
+function formatChicago(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return String(ts).slice(0, 16).replace('T', ' ');
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d);
+  const get = (type) => (parts.find(p => p.type === type) || {}).value || '';
+  return get('year') + '-' + get('month') + '-' + get('day') + ' ' + get('hour') + ':' + get('minute') + ' CT';
+}
 function pct(v) { const x = n(v); return (Math.abs(x) <= 1 ? x * 100 : x).toFixed(1) + '%'; }
 function cls(v) { return n(v) >= 0 ? 'pos' : 'neg'; }
 function val(o, ...ks) { for (const k of ks) { if (o && o[k] !== undefined && o[k] !== null && o[k] !== '') return o[k]; } return ''; }
@@ -654,7 +665,7 @@ function renderAll(s, silent) {
   const tokenPct = budget ? Math.min(100, (total / budget) * 100) : 0;
   renderModeIndicators(tokenPct);
   const deploySha = s.deploy_sha ? ' · deploy ' + s.deploy_sha : '';
-  document.getElementById('last-upd').textContent = (s.last_run ? 'Last run: ' + new Date(s.last_run).toLocaleString() : '') + deploySha;
+  document.getElementById('last-upd').textContent = (s.last_run ? 'Last run: ' + formatChicago(s.last_run) : '') + deploySha;
   document.getElementById('cash-util').textContent = pv ? pct(1 - (cash / pv)) : '—';
   document.getElementById('risk-pos').textContent = ps.length + '/15';
   renderBuckets(s);
@@ -800,7 +811,7 @@ function renderFunnel(s) {
   const note = document.getElementById('funnel-note');
   if (note) {
     const r = s.research_status || {};
-    const base = s.last_run ? 'From cycle at ' + new Date(s.last_run).toLocaleString() : 'From latest SQLite-backed cycle projection';
+    const base = s.last_run ? 'From cycle at ' + formatChicago(s.last_run) : 'From latest SQLite-backed cycle projection';
     let extra = '';
     if (r.status === 'failed') extra = ' · Research failed' + (r.entry_source === 'screener' ? ' (screener entries)' : '');
     else if (r.status === 'empty') extra = ' · Research empty' + (r.entry_source === 'screener' ? ' (screener entries)' : '');
@@ -1927,7 +1938,7 @@ function buildClientHealth(apiError) {
   });
   checks.push({
     id: 'agent_state', label: 'Agent state', status: s.last_run ? 'ok' : 'warn',
-    message: s.last_run ? ('Last run ' + String(s.last_run).slice(0, 19).replace('T', ' ')) : 'No state loaded yet',
+    message: s.last_run ? ('Last run ' + formatChicago(s.last_run)) : 'No state loaded yet',
   });
   checks.push({
     id: 'token_budget', label: 'Token budget', status: pct >= 100 ? 'error' : pct >= 80 ? 'warn' : 'ok',
@@ -1978,7 +1989,7 @@ function renderHealth(h) {
 
   if (overall) {
     const st = h.status || 'unknown';
-    overall.textContent = (h.summary || st) + (h.checked_at ? ' · ' + String(h.checked_at).slice(0, 19).replace('T', ' ') : '');
+    overall.textContent = (h.summary || st) + (h.checked_at ? ' · ' + formatChicago(h.checked_at) : '');
     overall.className = 'mini ' + (st === 'ready' ? 'pos' : st === 'blocked' ? 'error' : '');
   }
   const daily = checks.find(c => c.id === 'daily_trades');

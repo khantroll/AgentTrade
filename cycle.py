@@ -676,7 +676,8 @@ def run_trading_cycle() -> None:
         positions = snapshot["positions"]
 
         tok = usage_summary()
-        cycle_finished = datetime.now().isoformat()
+        from trading_day import aware_now_iso
+        cycle_finished = aware_now_iso()
         state = {
             "last_run": cycle_finished,
             "last_trading_cycle_at": cycle_finished,

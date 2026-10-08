@@ -100,13 +100,8 @@ def _get_stops_for_symbol(symbol: str, open_orders: list) -> dict:
         return alpaca_stops
     fallback = _get_stored_stops(symbol)
     if fallback:
-        log.warning(
+        log.info(
             "[PositionReview] %s: no Alpaca bracket/stop found — using SQLite/stored stop fallback",
-            symbol,
-        )
-    else:
-        log.warning(
-            "[PositionReview] %s: no Alpaca or stored stop data — using bucket %% defaults",
             symbol,
         )
     return fallback
@@ -217,6 +212,7 @@ def review_positions(
     sells_placed = []
     exits_failed = 0
     exits_deferred = 0
+    bucket_default_stops = []
 
     log.info("[PositionReview] Checking %d positions for exit conditions...", len(positions))
 
@@ -254,6 +250,8 @@ def review_positions(
 
         # Alpaca open orders first, then legacy JSON fallback
         stored = _get_stops_for_symbol(symbol, alpaca_open_orders)
+        if not stored.get("stop_loss_price") and not stored.get("take_profit_price"):
+            bucket_default_stops.append(symbol)
         stop_price = stored.get("stop_loss_price")
         take_price = stored.get("take_profit_price")
 
@@ -313,6 +311,13 @@ def review_positions(
                     )
                 elif order is None:
                     exits_deferred += 1
+
+    if bucket_default_stops:
+        log.info(
+            "[PositionReview] %d position(s) have no Alpaca or stored stop — using bucket %% defaults: %s",
+            len(bucket_default_stops),
+            ", ".join(bucket_default_stops),
+        )
 
     placed = [o for o in sells_placed if o.get("status") == "placed"]
     if not placed and exits_failed == 0 and exits_deferred == 0:
