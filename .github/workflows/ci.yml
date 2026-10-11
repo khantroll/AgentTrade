@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Recovery validation used CPython 3.12. 3.11 is the other
+        # supported runtime; the tree uses 3.10+ union syntax.
+        python-version: ["3.12", "3.11"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Run tests
+        env:
+          ALPACA_PAPER: "true"
+          ALPACA_API_KEY: test-key
+          ALPACA_SECRET_KEY: test-secret
+        run: python -m pytest -q
