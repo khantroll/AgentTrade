@@ -88,6 +88,47 @@ for _mod in (
     _stub_if_missing(_mod)
 
 
+def _block_outbound_network() -> None:
+    """GitHub Actions has no broker or LLM credentials. Fail closed if a test dials out."""
+    import socket
+
+    allowed = {"127.0.0.1", "::1", "localhost", "0.0.0.0"}
+    orig_connect = socket.socket.connect
+    orig_connect_ex = socket.socket.connect_ex
+    orig_getaddrinfo = socket.getaddrinfo
+
+    def _is_local(addr) -> bool:
+        if isinstance(addr, tuple) and addr:
+            return addr[0] in allowed
+        return False
+
+    def connect(self, addr):
+        if _is_local(addr):
+            return orig_connect(self, addr)
+        raise OSError(101, f"network blocked in CI: {addr}")
+
+    def connect_ex(self, addr):
+        if _is_local(addr):
+            return orig_connect_ex(self, addr)
+        return 101
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        if host in {None, "", *allowed}:
+            return orig_getaddrinfo(host, port, *args, **kwargs)
+        raise OSError(101, f"DNS blocked in CI: {host}")
+
+    socket.socket.connect = connect
+    socket.socket.connect_ex = connect_ex
+    socket.getaddrinfo = getaddrinfo
+
+
+if os.environ.get("CI", "").lower() == "true":
+    os.environ["ALPACA_PAPER"] = "true"
+    os.environ["ALPACA_API_KEY"] = "test-key"
+    os.environ["ALPACA_SECRET_KEY"] = "test-secret"
+    _block_outbound_network()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _never_mutate_recovered_sqlite():
     if not os.path.isfile(RECOVERED_SQLITE):
